@@ -1,0 +1,96 @@
+# ============================================================================
+# bot_btc_1hr_kalshi — Cloud Run service manifest (Knative spec)
+# ============================================================================
+# This file documents the service configuration. The canonical deploy path is
+# `gcloud run deploy` with the flags in docs/DEPLOYMENT.md §2.3 — this YAML is
+# for reference and for GitOps-style replay if we adopt one later.
+#
+# Apply: gcloud run services replace deploy/cloudrun.yaml --region=<REGION>
+# ============================================================================
+
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: bot-btc-1hr-kalshi
+  annotations:
+    # Only internal and LB traffic (no public internet).
+    run.googleapis.com/ingress: internal-and-cloud-load-balancing
+  labels:
+    app: bot-btc-1hr-kalshi
+    tier: trading
+spec:
+  template:
+    metadata:
+      annotations:
+        # Single-writer: exactly one instance.
+        autoscaling.knative.dev/minScale: "1"
+        autoscaling.knative.dev/maxScale: "1"
+
+        # CPU always allocated — event loop needs to run between HTTP requests.
+        run.googleapis.com/cpu-throttling: "false"
+
+        # Gen2 execution environment (full Linux compat for uvloop/numba).
+        run.googleapis.com/execution-environment: gen2
+
+        # Faster cold start on deploy.
+        run.googleapis.com/startup-cpu-boost: "true"
+    spec:
+      serviceAccountName: bot-btc-1hr-kalshi-runtime@PROJECT_ID.iam.gserviceaccount.com
+      timeoutSeconds: 3600
+      containerConcurrency: 10
+      containers:
+        - name: bot-btc-1hr-kalshi
+          image: REGION-docker.pkg.dev/PROJECT_ID/bot-btc-1hr-kalshi/bot-btc-1hr-kalshi:latest
+          ports:
+            - name: http1
+              containerPort: 8080
+          resources:
+            limits:
+              cpu: "2"
+              memory: "2Gi"
+
+          # Non-secret config — sync with deploy/env.example.yaml
+          env:
+            - name: BOT_BTC_1HR_KALSHI_MODE
+              value: paper
+            - name: BOT_BTC_1HR_KALSHI_ENV
+              value: prod
+            - name: BOT_BTC_1HR_KALSHI_GCP_PROJECT
+              value: PROJECT_ID
+            - name: BOT_BTC_1HR_KALSHI_GCP_REGION
+              value: REGION
+            # ... (rest populated from deploy/env.yaml at deploy time)
+
+            # Secrets mounted from Secret Manager
+            - name: BOT_BTC_1HR_KALSHI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: BOT_BTC_1HR_KALSHI_API_KEY
+                  key: latest
+            - name: BOT_BTC_1HR_KALSHI_API_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: BOT_BTC_1HR_KALSHI_API_SECRET
+                  key: latest
+            - name: BOT_BTC_1HR_KALSHI_ADMIN_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: BOT_BTC_1HR_KALSHI_ADMIN_TOKEN
+                  key: latest
+
+          startupProbe:
+            httpGet:
+              path: /readyz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 24   # allow up to 2 min for all feeds to connect
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            periodSeconds: 30
+            failureThreshold: 3
+  traffic:
+    - percent: 100
+      latestRevision: true

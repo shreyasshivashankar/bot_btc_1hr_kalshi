@@ -1,0 +1,277 @@
+# bot_btc_1hr_kalshi — GCP Deployment Guide
+
+End-to-end setup for running bot_btc_1hr_kalshi on Google Cloud Platform using only managed services. No VMs, no Kubernetes, no patching.
+
+Prerequisite knowledge: basic `gcloud` usage, a billing-enabled GCP project, and either the `gcloud` CLI installed locally or access to the Cloud Shell.
+
+---
+
+## 0. One-time: Set project and region
+
+```bash
+export BOT_BTC_1HR_KALSHI_GCP_PROJECT="your-project-id"
+export BOT_BTC_1HR_KALSHI_GCP_REGION="us-central1"          # or us-east1, europe-west1, etc.
+export BOT_BTC_1HR_KALSHI_SERVICE_NAME="bot-btc-1hr-kalshi"
+
+gcloud config set project $BOT_BTC_1HR_KALSHI_GCP_PROJECT
+gcloud config set run/region $BOT_BTC_1HR_KALSHI_GCP_REGION
+```
+
+Region choice: pick the closest to Kalshi's API ingress. Kalshi's endpoints are US-based, so `us-east1` or `us-east4` minimize WS round-trip. US-central is a reasonable default.
+
+---
+
+## 1. Run the bootstrap script
+
+All infra (APIs, IAM, secrets, log buckets, BigQuery dataset, GCS bucket) is created by one idempotent script. Run it and answer the prompts:
+
+```bash
+./deploy/setup_gcp.sh
+```
+
+What it does (in order):
+
+1. Enables required APIs: `run`, `secretmanager`, `logging`, `bigquery`, `cloudscheduler`, `artifactregistry`, `cloudbuild`.
+2. Creates a dedicated runtime service account `bot-btc-1hr-kalshi-runtime@$PROJECT.iam.gserviceaccount.com` with minimum-scope roles:
+   - `roles/secretmanager.secretAccessor` (read secrets at boot)
+   - `roles/logging.logWriter` (emit logs)
+   - `roles/bigquery.dataEditor` (bet-outcome log routing)
+   - `roles/storage.objectAdmin` (tick-archive bucket only, conditional IAM)
+3. Creates secrets in Secret Manager (you'll paste values interactively):
+   - `BOT_BTC_1HR_KALSHI_API_KEY`
+   - `BOT_BTC_1HR_KALSHI_API_SECRET`
+   - `BOT_BTC_1HR_KALSHI_ADMIN_TOKEN` (generated with `openssl rand -hex 32` if you press enter)
+4. Creates a **5-day retention log bucket** `bot-btc-1hr-kalshi-bets-5d` in your region.
+5. Creates the BigQuery dataset `bot_btc_1hr_kalshi_bet_outcomes` with `default_partition_expiration=432000` (5 days in seconds).
+6. Creates a log sink `bot-btc-1hr-kalshi-bet-outcomes-sink` routing `logName="projects/$PROJECT/logs/bot_btc_1hr_kalshi.bet_outcomes"` to:
+   - The `bot-btc-1hr-kalshi-bets-5d` bucket (Logs Explorer)
+   - The `bot_btc_1hr_kalshi_bet_outcomes.outcomes` BigQuery table (SQL queries)
+7. Adds an exclusion to the default `_Default` sink so bet-outcome logs aren't double-stored.
+8. Creates Artifact Registry repo `bot-btc-1hr-kalshi` for container images.
+9. Creates GCS bucket `bot-btc-1hr-kalshi-tick-archive-$PROJECT` (tick archive) with lifecycle: COLDLINE at 30d, delete at 365d.
+
+The script prints next steps on success. Rerun is safe.
+
+---
+
+## 2. Build & deploy the container
+
+### 2.1 Build via Cloud Build (no local Docker needed)
+
+```bash
+gcloud builds submit \
+  --tag "$BOT_BTC_1HR_KALSHI_GCP_REGION-docker.pkg.dev/$BOT_BTC_1HR_KALSHI_GCP_PROJECT/bot-btc-1hr-kalshi/bot-btc-1hr-kalshi:latest" \
+  --timeout=20m \
+  .
+```
+
+This uses `deploy/Dockerfile`. First build ~5 min; subsequent builds are cached.
+
+### 2.2 Review env vars
+
+Copy and edit the template:
+
+```bash
+cp deploy/env.example.yaml deploy/env.yaml
+# edit deploy/env.yaml — set BOT_BTC_1HR_KALSHI_MODE=paper to start
+```
+
+Review every variable. `BOT_BTC_1HR_KALSHI_MODE=paper` is the default; flipping to `live` requires the promotion gates in RUNBOOK (backtest → paper 48h → shadow 24h → live).
+
+### 2.3 Deploy the Cloud Run service
+
+```bash
+gcloud run deploy $BOT_BTC_1HR_KALSHI_SERVICE_NAME \
+  --image="$BOT_BTC_1HR_KALSHI_GCP_REGION-docker.pkg.dev/$BOT_BTC_1HR_KALSHI_GCP_PROJECT/bot-btc-1hr-kalshi/bot-btc-1hr-kalshi:latest" \
+  --service-account="bot-btc-1hr-kalshi-runtime@$BOT_BTC_1HR_KALSHI_GCP_PROJECT.iam.gserviceaccount.com" \
+  --region=$BOT_BTC_1HR_KALSHI_GCP_REGION \
+  --platform=managed \
+  --min-instances=1 \
+  --max-instances=1 \
+  --cpu=2 \
+  --memory=2Gi \
+  --cpu-boost \
+  --execution-environment=gen2 \
+  --no-cpu-throttling \
+  --ingress=internal-and-cloud-load-balancing \
+  --no-allow-unauthenticated \
+  --env-vars-file=deploy/env.yaml \
+  --set-secrets="BOT_BTC_1HR_KALSHI_API_KEY=BOT_BTC_1HR_KALSHI_API_KEY:latest,BOT_BTC_1HR_KALSHI_API_SECRET=BOT_BTC_1HR_KALSHI_API_SECRET:latest,BOT_BTC_1HR_KALSHI_ADMIN_TOKEN=BOT_BTC_1HR_KALSHI_ADMIN_TOKEN:latest" \
+  --timeout=3600
+```
+
+Flags explained:
+- `min=max=1`: exactly one instance, always running. Trading state is not horizontally scalable.
+- `--no-cpu-throttling`: CPU is always allocated, not just during HTTP requests. This is what keeps the event loop alive for WS consumption.
+- `--ingress=internal-and-cloud-load-balancing` + `--no-allow-unauthenticated`: no public internet access to admin endpoints.
+- `--timeout=3600`: max HTTP request time; trading loop uses WS, not HTTP, so this only affects admin endpoints.
+- `--set-secrets`: mounts Secret Manager values as env vars at container start.
+
+On successful deploy you'll get a service URL. Save it:
+
+```bash
+export BOT_BTC_1HR_KALSHI_SERVICE_URL=$(gcloud run services describe $BOT_BTC_1HR_KALSHI_SERVICE_NAME --region=$BOT_BTC_1HR_KALSHI_GCP_REGION --format='value(status.url)')
+```
+
+---
+
+## 3. Grant yourself admin access
+
+```bash
+gcloud run services add-iam-policy-binding $BOT_BTC_1HR_KALSHI_SERVICE_NAME \
+  --region=$BOT_BTC_1HR_KALSHI_GCP_REGION \
+  --member="user:your-email@example.com" \
+  --role="roles/run.invoker"
+```
+
+Verify:
+
+```bash
+./scripts/status.sh
+```
+
+Expected output:
+```json
+{
+  "mode": "paper",
+  "halt_state": "running",
+  "open_positions": 0,
+  "session_pnl_usd": 0.00,
+  "breakers": {"drawdown": "ok", "clock": "ok", "feeds": "ok"},
+  ...
+}
+```
+
+---
+
+## 4. Updating env vars via the Console (no redeploy)
+
+Non-secret env vars can be edited in the GCP Console without touching code:
+
+1. Cloud Run → services → `bot-btc-1hr-kalshi` → Edit & Deploy New Revision
+2. Variables & Secrets tab → Environment Variables
+3. Edit in place OR click "Reference Variables" → "Upload YAML" and upload your edited `deploy/env.yaml`
+4. Deploy — this creates a new revision and shifts traffic atomically
+
+**Secrets** (Kalshi keys, admin token): rotate via Secret Manager, then either:
+- Restart the container (new revision) to pick up new values, or
+- Use `gcloud run services update --set-secrets=...` if you're adding a new secret reference.
+
+---
+
+## 5. Start / Stop patterns
+
+There are two independent pause mechanisms. Pick the right one.
+
+### Soft pause — trading logic only (container keeps running)
+
+Use for: end-of-session, high-impact news, temporarily disabling trading without losing WS sessions.
+
+```bash
+./scripts/halt.sh      # no new entries; existing positions continue to exit
+./scripts/resume.sh    # re-enable entries
+```
+
+Cost: unchanged (container still running). Latency to resume: instant.
+
+### Hard stop — container scaled to zero (billing stops)
+
+Use for: overnight shutdowns, extended pauses, project hibernation.
+
+```bash
+./scripts/stop.sh       # refuses if any open positions; flatten first via scripts/flatten.sh
+./scripts/start.sh      # scale back up; ~20–40s cold start, feeds reconnect, broker reconciled
+```
+
+Cost: ~$0 while stopped. Latency to resume: 20–40s cold start.
+
+### Emergency flatten (Tier 1 human kill-switch)
+
+```bash
+./scripts/tier1_override.sh "exchange X halted trading"
+```
+
+Immediately fires the IOC escalation ladder on all open positions. Logs the reason. Enforces 2h stabilization window (no new entries).
+
+---
+
+## 6. Monitoring
+
+### Quick status
+```bash
+./scripts/status.sh
+```
+
+### Dashboards
+In GCP Console:
+- **Cloud Run → bot-btc-1hr-kalshi → Metrics**: instance count, CPU, memory, request latency.
+- **Cloud Logging → Logs Explorer**: filter `resource.type="cloud_run_revision" resource.labels.service_name="bot-btc-1hr-kalshi"` for live logs.
+- **Cloud Logging → Log Analytics**: for SQL-style queries on operational logs.
+- **BigQuery → bot_btc_1hr_kalshi_bet_outcomes.outcomes**: bet-outcome tuning queries (see RUNBOOK.md).
+
+### Alerting (recommended)
+
+Create Cloud Monitoring alert policies for:
+- Cloud Run instance count < 1 (should never happen with min=1)
+- Cloud Run 5xx rate > 1/min
+- No `bet_closed` events for > 90 minutes during market hours (bot silently broken)
+- `bot_btc_1hr_kalshi_circuit_breaker_state != 0` for any breaker
+
+Alert channels: email or SMS. Pager duties are operator-defined.
+
+---
+
+## 7. Log retention details
+
+| Log name                         | Destination                         | Retention | Cleanup             |
+| -------------------------------- | ----------------------------------- | --------- | ------------------- |
+| `bot_btc_1hr_kalshi.bet_outcomes`             | `bot-btc-1hr-kalshi-bets-5d` log bucket          | 5 days    | Automatic (bucket)  |
+| `bot_btc_1hr_kalshi.bet_outcomes`             | BigQuery `bot_btc_1hr_kalshi_bet_outcomes.outcomes` | 5 days (partition expiry) | Automatic (BQ) |
+| `bot_btc_1hr_kalshi.admin_audit`              | `_Default` bucket                   | 30 days   | Automatic (bucket)  |
+| `bot_btc_1hr_kalshi.market_data`, `bot_btc_1hr_kalshi.risk`, `bot_btc_1hr_kalshi.execution`, others | `_Default` bucket | 30 days | Automatic |
+| Tick archive (Parquet)           | GCS `bot-btc-1hr-kalshi-tick-archive-$PROJECT`   | 365 days, COLDLINE at 30d | Lifecycle rule |
+
+**Manual cleanup is never required for bet outcomes** — GCP enforces retention at both the log bucket and BigQuery partition level.
+
+If you need longer-than-5-days analysis, route a second sink to GCS as Parquet. Document rationale in a PR — the 5-day hot window is deliberate (forces the tuning loop to care about recent performance).
+
+---
+
+## 8. Cost estimate (rough)
+
+At `min=max=1, cpu=2, 2Gi, no CPU throttling`:
+- Cloud Run: ~$55–75/month (continuous 2-vCPU allocation)
+- Cloud Logging: free tier covers <50 GiB ingestion/month. Bet-outcome volume is tiny (~<100 records/day × <2 KB = negligible).
+- BigQuery: 5-day partitioned storage of outcomes is < 1 MiB. Query costs negligible at 5-day retention.
+- Secret Manager: $0.06 per secret per month.
+- Artifact Registry: first 0.5 GB free; container images typically fit.
+- GCS tick archive: depends on volume; Parquet-compressed BTC ticks ~2–5 GiB/month, COLDLINE after 30d → < $2/month.
+
+Total: ~$60–80/month for paper mode, similar for live (same compute profile).
+
+---
+
+## 9. Security notes
+
+- Admin endpoints gated by **two layers**: IAM `roles/run.invoker` + bearer token. Either alone is insufficient.
+- `BOT_BTC_1HR_KALSHI_ADMIN_TOKEN` is a random 32-byte hex string; rotate quarterly or after any suspected exposure.
+- Secrets never appear in logs, env YAML, or container images.
+- Cloud Run service has `--ingress=internal-and-cloud-load-balancing` — the public internet cannot reach `bot-btc-1hr-kalshi`. Admin calls originate from authenticated gcloud or a future internal load balancer.
+- Service account follows least privilege — it cannot read other GCP resources in the project, cannot impersonate users, cannot modify IAM.
+
+---
+
+## 10. Disaster recovery
+
+- **Container crash:** Cloud Run auto-restarts. On boot, the bot reads broker state first (§DESIGN 10), reconstructs local OMS, reconciles, then resumes. No data loss.
+- **Region outage:** not handled in v1 (single-region deployment). For multi-region active-passive, would require Kalshi key rotation + state sync to a second region. Out of scope until we hit AUM that justifies the complexity.
+- **Accidental `stop.sh` with open positions:** `stop.sh` refuses. If the refusal is bypassed via direct `gcloud` call and positions orphan, the hourly resolution still settles cash — but margin is locked and the bot can't adapt mid-hour. Recovery: `start.sh`, the bot reconciles from broker on startup and picks up where it left off.
+
+---
+
+## 11. What this does NOT set up (intentionally)
+
+- **No Cloud SQL / Firestore.** State lives in memory + Cloud Logging + BigQuery. Persistence beyond a container restart is recovered from Kalshi broker state, not a database.
+- **No load balancer.** Single-instance, internal-ingress only.
+- **No CI/CD pipeline.** Deploy is a manual `gcloud run deploy` — this is intentional gating for a trading system. Automate only after promotion gates are scripted and tested.
+- **No PubSub/Kafka.** `asyncio.Queue` is sufficient for single-process event flow.
