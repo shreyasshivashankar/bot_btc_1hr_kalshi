@@ -1,0 +1,116 @@
+"""Pydantic schemas for the records that leave the process boundary.
+
+Every DecisionRecord and BetOutcome emitted is validated here before it is
+logged/serialized. Schema drift vs the BigQuery table breaks tuning queries
+(hard rule #6 / CLAUDE.md "non-negotiable invariants").
+"""
+
+from __future__ import annotations
+
+from typing import Literal
+
+from pydantic import BaseModel, ConfigDict, Field
+
+# ---- Enums ------------------------------------------------------------------
+
+Side = Literal["YES", "NO"]
+RegimeTrend = Literal["up", "down", "flat"]
+RegimeVol = Literal["high", "normal", "low"]
+TrapName = Literal["floor_reversion", "ceiling_reversion", "cross_venue_lag"]
+ExitReason = Literal[
+    "settled",
+    "early_cashout_99",
+    "soft_stop",
+    "theta_net_target",
+    "abandoned_to_settlement",
+    "tier1_flatten",
+]
+
+# ---- Records ----------------------------------------------------------------
+
+
+class Features(BaseModel):
+    """Frozen snapshot of features at entry. Referenced from BetOutcome."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    regime_trend: RegimeTrend
+    regime_vol: RegimeVol
+    signal_confidence: float = Field(ge=0.0, le=1.0)
+    bollinger_pct_b: float
+    atr_cents: float = Field(ge=0.0)
+    book_depth_at_entry: float = Field(ge=0.0)
+    spread_cents: int = Field(ge=0)
+    spot_btc_usd: float = Field(gt=0.0)
+    minutes_to_settlement: float = Field(ge=0.0)
+
+
+class Sizing(BaseModel):
+    """Sizing inputs/output captured on the decision."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    kelly_fraction: float = Field(ge=0.0, le=1.0)
+    edge_cents: float
+    variance_estimate: float = Field(ge=0.0)
+    notional_usd: float = Field(ge=0.0)
+    contracts: int = Field(ge=0)
+
+
+class DecisionRecord(BaseModel):
+    """Emitted for every order decision — whether approved or rejected."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    decision_id: str
+    ts_ns: int = Field(ge=0)
+    market_id: str
+    trap: TrapName
+    side: Side
+    entry_price_cents: int = Field(ge=0, le=100)
+    features: Features
+    sizing: Sizing
+    approved: bool
+    reject_reason: str | None = None
+
+
+class Position(BaseModel):
+    """Open-position state. Broker is authoritative (hard rule #7) — this is
+    the local projection used for monitor/risk decisions between reconciles."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    position_id: str
+    decision_id: str
+    market_id: str
+    side: Side
+    entry_price_cents: int = Field(ge=0, le=100)
+    contracts: int = Field(gt=0)
+    opened_at_ns: int = Field(ge=0)
+
+
+class BetOutcome(BaseModel):
+    """Emitted once per closed bet to bot_btc_1hr_kalshi.bet_outcomes (BigQuery).
+
+    Frozen — never mutated after emit.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    bet_id: str
+    decision_id: str
+    market_id: str
+    trap: TrapName
+    side: Side
+    opened_at_ns: int = Field(ge=0)
+    closed_at_ns: int = Field(ge=0)
+    hold_duration_sec: float = Field(ge=0.0)
+    entry_price_cents: int = Field(ge=0, le=100)
+    exit_price_cents: int | None
+    contracts: int = Field(gt=0)
+    gross_pnl_usd: float
+    fees_usd: float = Field(ge=0.0)
+    net_pnl_usd: float
+    counterfactual_held_pnl_usd: float | None
+    exit_reason: ExitReason
+    features_at_entry: Features
