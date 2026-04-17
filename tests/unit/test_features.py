@@ -150,3 +150,25 @@ def test_std_dev_matches_population_formula() -> None:
     expected_var = sum((p - expected_mean) ** 2 for p in prices) / len(prices)
     expected_std = math.sqrt(expected_var)
     assert fe.stddev() == pytest.approx(expected_std)
+
+
+def test_running_sums_stay_in_sync_after_many_evictions() -> None:
+    """Regression: the O(1) stddev relies on running sums that track the
+    sliding window. A full sweep of prices well past `bollinger_period`
+    must still match a fresh two-pass computation over the current window
+    (within float tolerance)."""
+    import random
+
+    rng = random.Random(17)
+    period = 200
+    fe = _engine(period=period, std=2.0)
+    all_prices = [60_000.0 + rng.uniform(-500.0, 500.0) for _ in range(5_000)]
+    for p in all_prices:
+        fe.update_spot(p)
+
+    window = all_prices[-period:]
+    ref_mean = sum(window) / period
+    ref_std = math.sqrt(sum((p - ref_mean) ** 2 for p in window) / period)
+
+    assert fe.sma() == pytest.approx(ref_mean, rel=1e-9)
+    assert fe.stddev() == pytest.approx(ref_std, rel=1e-6)

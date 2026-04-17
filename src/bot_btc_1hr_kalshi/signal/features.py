@@ -1,7 +1,9 @@
 """Feature engine: rolling Bollinger, ATR, regime classification.
 
-Keeps deque-backed windows; O(window) per update is fine for the single
-BTC market. Numba-optimised hot paths land when we profile a bottleneck.
+Keeps deque-backed windows plus running sum & sum-of-squares so that `sma`
+and `stddev` are O(1) per query rather than O(window). This matters when
+the spot feed (Binance) bursts hundreds of ticks in a subsecond window and
+we compute features on every tick. Numba lands for ATR later if needed.
 """
 
 from __future__ import annotations
@@ -22,6 +24,8 @@ class FeatureEngine:
         "_bb_period",
         "_bb_std",
         "_last_price",
+        "_price_sum",
+        "_price_sum_sq",
         "_prices",
         "_true_ranges",
     )
@@ -49,13 +53,25 @@ class FeatureEngine:
         self._prices: deque[float] = deque(maxlen=bollinger_period)
         self._true_ranges: deque[float] = deque(maxlen=atr_period)
         self._last_price: float | None = None
+        # Running sums for O(1) Bollinger stats. Catastrophic cancellation at
+        # BTC prices ~60_000 with a ~400-period window gives variance error
+        # on the order of 1e-3 USD² — far below any threshold we act on.
+        self._price_sum: float = 0.0
+        self._price_sum_sq: float = 0.0
 
     def update_spot(self, price_usd: float) -> None:
         if price_usd <= 0:
             raise ValueError("price_usd must be > 0")
         if self._last_price is not None:
             self._true_ranges.append(abs(price_usd - self._last_price))
+        if len(self._prices) == self._bb_period:
+            # Window full — evict oldest before insert so sums stay in sync.
+            old = self._prices[0]
+            self._price_sum -= old
+            self._price_sum_sq -= old * old
         self._prices.append(price_usd)
+        self._price_sum += price_usd
+        self._price_sum_sq += price_usd * price_usd
         self._last_price = price_usd
 
     # ---- derived values ----
@@ -67,13 +83,14 @@ class FeatureEngine:
     def sma(self) -> float | None:
         if len(self._prices) < self._bb_period:
             return None
-        return sum(self._prices) / len(self._prices)
+        return self._price_sum / self._bb_period
 
     def stddev(self) -> float | None:
-        mean = self.sma()
-        if mean is None:
+        n = len(self._prices)
+        if n < self._bb_period:
             return None
-        variance = sum((p - mean) ** 2 for p in self._prices) / len(self._prices)
+        mean = self._price_sum / n
+        variance = max(0.0, self._price_sum_sq / n - mean * mean)
         return math.sqrt(variance)
 
     def bollinger_bands(self) -> tuple[float, float, float] | None:
