@@ -27,7 +27,7 @@ CONFIG_DIR = REPO_ROOT / "config"
 
 
 def _auth() -> dict[str, str]:
-    return {"Authorization": f"Bearer {TOKEN}"}
+    return {"X-Admin-Token": TOKEN}
 
 
 def _features() -> Features:
@@ -133,7 +133,7 @@ def test_admin_status_requires_token() -> None:
     app, _ = _build_app()
     with _client(app) as c:
         assert c.get("/admin/status").status_code == 401
-        assert c.get("/admin/status", headers={"Authorization": "Bearer wrong"}).status_code == 401
+        assert c.get("/admin/status", headers={"X-Admin-Token": "wrong"}).status_code == 401
 
 
 def test_admin_status_returns_operator_view() -> None:
