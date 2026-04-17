@@ -1,0 +1,49 @@
+# bot_btc_1hr_kalshi — DEV config.
+# Loaded when BOT_BTC_1HR_KALSHI_MODE=dev. All values here are safe defaults for
+# local iteration; overridden by env vars where present. Do NOT put secrets here
+# (hard rule #4 — secrets only via env vars / Secret Manager).
+
+mode: dev
+
+feeds:
+  kalshi:
+    ws_url_env:   BOT_BTC_1HR_KALSHI_WS_URL
+    rest_url_env: BOT_BTC_1HR_KALSHI_REST_URL
+    staleness_halt_ms: 2000
+  coinbase:
+    ws_url: wss://ws-feed.exchange.coinbase.com
+    staleness_halt_ms: 2000
+  binance:
+    ws_url: wss://stream.binance.com:9443/ws/btcusdt@trade
+    staleness_halt_ms: 2000
+
+risk:
+  kelly_fraction: 0.25           # sub-Kelly cap (hard rule #3 upstream)
+  max_position_notional_usd: 50
+  max_daily_loss_pct: 0.05
+  single_trade_drawdown_freeze_pct: 0.15   # 60-min API lockout
+  reconcile_interval_sec: 60
+  clock_drift_halt_ms: 250
+
+signal:
+  bollinger_period_bars: 20
+  bollinger_std_mult: 2.0
+  min_signal_confidence: 0.55
+
+monitor:
+  early_cashout_price_cents: 99
+  soft_stop:
+    base_fraction: 0.12
+    regime_multiplier_high_vol: 1.25
+    regime_multiplier_trending: 1.40
+    time_multiplier_late_window: 0.70
+  theta_net_book_depth_threshold: 0.5
+
+execution:
+  maker_only_entry: true
+  ioc_ladder_cents: [3, 6]       # bid-3¢ → bid-6¢ → any-bid → abandon
+
+telemetry:
+  bet_outcomes_logger: bot_btc_1hr_kalshi.bet_outcomes
+  bq_dataset: bot_btc_1hr_kalshi_bet_outcomes
+  bq_table: outcomes
