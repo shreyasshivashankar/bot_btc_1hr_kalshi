@@ -87,17 +87,61 @@ async def test_check_once_no_mismatch_no_halt() -> None:
     assert not app.trading_halted
 
 
-async def test_mismatch_exceeding_tolerance_halts() -> None:
+async def test_persistent_mismatch_halts_on_second_tick() -> None:
     broker = FakeBroker((BrokerPosition(market_id="M1", side="YES", contracts=8, avg_entry_price_cents=40),))
     app = _build_app(broker)
     _open_position(app.portfolio, position_id="p1", market="M1", contracts=5)  # delta=3 > 1
     rec = Reconciler(app=app, broker=broker, interval_sec=60)
-    result = await rec.check_once()
-    assert result.halted
-    assert len(result.mismatches) == 1
-    m = result.mismatches[0]
+
+    # First tick: mismatch observed but NOT yet halted (could be mid-fill race).
+    result1 = await rec.check_once()
+    assert not result1.halted
+    assert len(result1.mismatches) == 1
+    assert not app.trading_halted
+
+    # Second tick: same mismatch persists → real desync → halt.
+    result2 = await rec.check_once()
+    assert result2.halted
+    m = result2.mismatches[0]
     assert m.market_id == "M1" and m.local_contracts == 5 and m.broker_contracts == 8
     assert app.trading_halted
+
+
+async def test_transient_mismatch_resolves_before_halt() -> None:
+    """Regression: a mid-flight fill makes broker/local disagree for one tick
+    only. The persistence gate must absorb this without halting."""
+    # Tick 1: broker still shows 0 (fill processed but not yet in list_positions).
+    broker = FakeBroker(())
+    app = _build_app(broker)
+    _open_position(app.portfolio, position_id="p1", market="M1", contracts=5)
+    rec = Reconciler(app=app, broker=broker, interval_sec=60)
+
+    result1 = await rec.check_once()
+    assert not result1.halted
+    assert len(result1.mismatches) == 1
+    assert not app.trading_halted
+
+    # Tick 2: broker has caught up. Mismatch disappears.
+    broker.positions = (BrokerPosition(market_id="M1", side="YES", contracts=5, avg_entry_price_cents=40),)
+    result2 = await rec.check_once()
+    assert not result2.halted
+    assert result2.mismatches == ()
+    assert not app.trading_halted
+
+
+async def test_different_mismatch_each_tick_does_not_halt() -> None:
+    """Two separate transient mismatches on different markets — neither persists."""
+    broker = FakeBroker((BrokerPosition(market_id="M1", side="YES", contracts=3, avg_entry_price_cents=40),))
+    app = _build_app(broker)
+    # Local has nothing on M1 or M2; broker flips which market it reports.
+    rec = Reconciler(app=app, broker=broker, interval_sec=60)
+    result1 = await rec.check_once()
+    assert not result1.halted
+
+    broker.positions = (BrokerPosition(market_id="M2", side="YES", contracts=3, avg_entry_price_cents=40),)
+    result2 = await rec.check_once()
+    assert not result2.halted
+    assert not app.trading_halted
 
 
 async def test_tolerance_absorbs_off_by_one() -> None:
@@ -114,6 +158,7 @@ async def test_broker_only_position_detected() -> None:
     broker = FakeBroker((BrokerPosition(market_id="Mystery", side="YES", contracts=10, avg_entry_price_cents=50),))
     app = _build_app(broker)
     rec = Reconciler(app=app, broker=broker, interval_sec=60)
+    assert not (await rec.check_once()).halted  # first tick: pending
     result = await rec.check_once()
     assert result.halted
     assert result.mismatches[0].market_id == "Mystery"
@@ -124,6 +169,7 @@ async def test_local_only_position_detected() -> None:
     app = _build_app(broker)
     _open_position(app.portfolio, position_id="p1", market="M1", contracts=5)
     rec = Reconciler(app=app, broker=broker, interval_sec=60)
+    assert not (await rec.check_once()).halted  # first tick: pending
     result = await rec.check_once()
     assert result.halted
     assert result.mismatches[0].local_contracts == 5

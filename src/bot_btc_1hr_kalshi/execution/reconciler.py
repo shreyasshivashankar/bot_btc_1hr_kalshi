@@ -11,7 +11,15 @@ Semantics:
     hold the YES leg at entry) — but the reconciler is symmetric in
     anticipation of Slice 3.
   - Aggregate broker positions the same way.
-  - Any (market, side) whose |broker - local| > tolerance trips the halt.
+  - Any (market, side) whose |broker - local| > tolerance is flagged.
+
+Persistence gate: `list_positions()` is a slow REST call. While it is in
+flight an entry maker can fill (broker ledger moves before `on_entry_fill`
+runs) or an exit IOC can land (broker moves before `portfolio.close`), and
+either yields a transient mismatch that resolves itself on the next tick.
+To avoid halting on that race, a (market, side) must mismatch on TWO
+consecutive ticks before we trip the halt. A real broker/local desync
+persists; a timing artifact does not.
 
 On halt, `App.trading_halted = True` so no new entries are submitted; open
 positions still monitor-exit. Operators must investigate and manually
@@ -71,12 +79,16 @@ class Reconciler:
         self._broker = broker
         self._interval = interval_sec
         self._tolerance = tolerance_contracts
+        # Mismatched keys observed on the previous tick. A key must appear
+        # here AND in the current tick's mismatches to trigger a halt.
+        self._pending: set[tuple[str, Side]] = set()
 
     async def check_once(self) -> ReconcileResult:
         try:
             broker_positions = await self._broker.list_positions()
         except Exception as exc:
             _log.warning("reconciler.broker_call_failed", error=str(exc))
+            # No fresh evidence — don't discharge _pending either way.
             return ReconcileResult(mismatches=(), halted=False)
 
         local = _aggregate_local(self._app.portfolio.open_positions)
@@ -84,6 +96,7 @@ class Reconciler:
 
         keys = set(local) | set(broker)
         mismatches: list[ReconcileMismatch] = []
+        current_keys: set[tuple[str, Side]] = set()
         for k in keys:
             l_ct = local.get(k, 0)
             b_ct = broker.get(k, 0)
@@ -92,20 +105,35 @@ class Reconciler:
                     market_id=k[0], side=k[1],
                     local_contracts=l_ct, broker_contracts=b_ct,
                 ))
+                current_keys.add(k)
 
-        if mismatches:
+        persistent = [m for m in mismatches if (m.market_id, m.side) in self._pending]
+        transient = [m for m in mismatches if (m.market_id, m.side) not in self._pending]
+        self._pending = current_keys
+
+        if transient and not persistent:
+            _log.warning(
+                "reconciler.mismatch_pending",
+                mismatches=[
+                    {"market": m.market_id, "side": m.side,
+                     "local": m.local_contracts, "broker": m.broker_contracts}
+                    for m in transient
+                ],
+            )
+
+        if persistent:
             _log.error(
                 "reconciler.mismatch_halt",
                 mismatches=[
                     {"market": m.market_id, "side": m.side,
                      "local": m.local_contracts, "broker": m.broker_contracts}
-                    for m in mismatches
+                    for m in persistent
                 ],
             )
             self._app.halt()
             return ReconcileResult(mismatches=tuple(mismatches), halted=True)
 
-        return ReconcileResult(mismatches=(), halted=False)
+        return ReconcileResult(mismatches=tuple(mismatches), halted=False)
 
     async def run(self) -> None:
         """Main loop — kept simple. Cancel to stop."""
