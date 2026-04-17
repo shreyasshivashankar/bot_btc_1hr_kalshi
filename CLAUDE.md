@@ -74,3 +74,15 @@ make reconcile      # reconcile local OMS state vs Kalshi broker state
 - `asyncio` for I/O; `numpy`/`numba` for hot paths (book walking, VWAP).
 - Every module has a unit test. Every trap has a replay test against a canned scenario.
 - No new dependencies without updating `docs/DESIGN.md` § Appendix B (Dependencies).
+
+## Slice 5 — TODO (not implemented)
+
+Research tooling is **deferred**. The current codebase ships Slices 1-4 (feeds, signal/risk/execution, calendar, ops, Cloud Run deploy). `src/bot_btc_1hr_kalshi/research/replay.py` exists as a minimal tick-replay orchestrator used by unit tests, but the full research layer is not built yet.
+
+Still to do under Slice 5:
+- **Backtest engine**: tick-by-tick replay harness producing Sharpe / maxDD / hit-rate / per-trap PnL attribution. `make backtest` is a placeholder.
+- **Walk-forward param sweeps**: train/validate splits over the captured tick archive (`gs://bot-btc-1hr-kalshi-tick-archive-*`), with deterministic seeds.
+- **Shadow mode**: runs the live decision path against live market data but routes orders to a no-op broker; emits DecisionRecords only. Required by hard rule #2 (≥24h shadow before `make live`).
+- **Param config surface**: YAML-driven sweep definitions + a results table in BigQuery alongside `bet_outcomes`.
+
+Do not add any of these without reading `docs/DESIGN.md` §10 (Research & Validation) first — the walk-forward methodology is load-bearing for the risk-committee sign-off path.

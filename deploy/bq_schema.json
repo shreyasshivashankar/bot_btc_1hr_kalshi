@@ -1,0 +1,31 @@
+[
+  {"name": "bet_id", "type": "STRING", "mode": "REQUIRED"},
+  {"name": "decision_id", "type": "STRING", "mode": "REQUIRED"},
+  {"name": "market_id", "type": "STRING", "mode": "REQUIRED"},
+  {"name": "trap", "type": "STRING", "mode": "REQUIRED",
+   "description": "floor_reversion | ceiling_reversion | cross_venue_lag"},
+  {"name": "side", "type": "STRING", "mode": "REQUIRED", "description": "YES | NO"},
+  {"name": "opened_at_ns", "type": "INT64", "mode": "REQUIRED"},
+  {"name": "closed_at_ns", "type": "INT64", "mode": "REQUIRED"},
+  {"name": "hold_duration_sec", "type": "FLOAT64", "mode": "REQUIRED"},
+  {"name": "entry_price_cents", "type": "INT64", "mode": "REQUIRED"},
+  {"name": "exit_price_cents", "type": "INT64", "mode": "NULLABLE"},
+  {"name": "contracts", "type": "INT64", "mode": "REQUIRED"},
+  {"name": "gross_pnl_usd", "type": "FLOAT64", "mode": "REQUIRED"},
+  {"name": "fees_usd", "type": "FLOAT64", "mode": "REQUIRED"},
+  {"name": "net_pnl_usd", "type": "FLOAT64", "mode": "REQUIRED"},
+  {"name": "counterfactual_held_pnl_usd", "type": "FLOAT64", "mode": "NULLABLE"},
+  {"name": "exit_reason", "type": "STRING", "mode": "REQUIRED",
+   "description": "settled | early_cashout_99 | soft_stop | theta_net_target | abandoned_to_settlement | tier1_flatten"},
+  {"name": "features_at_entry", "type": "RECORD", "mode": "REQUIRED", "fields": [
+    {"name": "regime_trend", "type": "STRING", "mode": "REQUIRED"},
+    {"name": "regime_vol", "type": "STRING", "mode": "REQUIRED"},
+    {"name": "signal_confidence", "type": "FLOAT64", "mode": "REQUIRED"},
+    {"name": "bollinger_pct_b", "type": "FLOAT64", "mode": "REQUIRED"},
+    {"name": "atr_cents", "type": "FLOAT64", "mode": "REQUIRED"},
+    {"name": "book_depth_at_entry", "type": "FLOAT64", "mode": "REQUIRED"},
+    {"name": "spread_cents", "type": "INT64", "mode": "REQUIRED"},
+    {"name": "spot_btc_usd", "type": "FLOAT64", "mode": "REQUIRED"},
+    {"name": "minutes_to_settlement", "type": "FLOAT64", "mode": "REQUIRED"}
+  ]}
+]

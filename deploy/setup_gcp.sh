@@ -145,6 +145,20 @@ else
     "${BQ_DATASET}"
 fi
 
+# The log sink auto-creates the ${BQ_TABLE} table on first insert using the
+# JSON payload shape. If you want to pre-provision the table with an explicit
+# schema (so queries don't break on a freshly bootstrapped project before the
+# first bet outcome is emitted), run:
+#
+#   bq --project_id="$PROJECT" mk --table \
+#     --time_partitioning_type=DAY \
+#     --time_partitioning_expiration=432000 \
+#     "${PROJECT}:${BQ_DATASET}.${BQ_TABLE}" \
+#     deploy/bq_schema.json
+#
+# deploy/bq_schema.json tracks the BetOutcome pydantic model (see
+# src/bot_btc_1hr_kalshi/obs/schemas.py). Keep them in sync — hard rule #6.
+
 # ----------------------------------------------------------------------------
 # 6. Log sink: bot_btc_1hr_kalshi.bet_outcomes → log bucket + BigQuery
 # ----------------------------------------------------------------------------
