@@ -2,7 +2,9 @@
 
 Breakers:
   - drawdown_60min_freeze: single-trade ≥15% loss triggers a 60-minute API
-    lockout (hard rule #3 — no override).
+    lockout (hard rule #3 — no override). Persisted via `BreakerStore` so a
+    process restart inside the freeze window does not silently re-open the
+    gate.
   - feed_staleness: primary feed staleness > 2s → halt new entries.
   - clock_drift: wall-clock drift > 250ms vs NTP → halt.
 
@@ -11,7 +13,10 @@ All breaker state is checked by `risk.check()` before order submission.
 
 from __future__ import annotations
 
+from bot_btc_1hr_kalshi.risk.breaker_store import BreakerStore, NullBreakerStore
+
 DRAWDOWN_FREEZE_SEC = 3600
+_STATE_KEY_DRAWDOWN = "drawdown_frozen_until_ns"
 
 
 class BreakerState:
@@ -19,10 +24,16 @@ class BreakerState:
         "_clock_drift_halted",
         "_drawdown_frozen_until_ns",
         "_feed_staleness_halted",
+        "_store",
     )
 
-    def __init__(self) -> None:
-        self._drawdown_frozen_until_ns: int | None = None
+    def __init__(self, *, store: BreakerStore | None = None) -> None:
+        self._store: BreakerStore = store if store is not None else NullBreakerStore()
+        loaded = self._store.load()
+        drawdown = loaded.get(_STATE_KEY_DRAWDOWN)
+        self._drawdown_frozen_until_ns: int | None = (
+            drawdown if isinstance(drawdown, int) else None
+        )
         self._feed_staleness_halted: bool = False
         self._clock_drift_halted: bool = False
 
@@ -30,6 +41,7 @@ class BreakerState:
         if duration_sec <= 0:
             raise ValueError("duration_sec must be > 0")
         self._drawdown_frozen_until_ns = now_ns + duration_sec * 1_000_000_000
+        self._persist()
 
     def set_feed_halt(self, *, halted: bool) -> None:
         self._feed_staleness_halted = halted
@@ -55,3 +67,6 @@ class BreakerState:
         if self._clock_drift_halted:
             return "clock_drift"
         return "none"
+
+    def _persist(self) -> None:
+        self._store.save({_STATE_KEY_DRAWDOWN: self._drawdown_frozen_until_ns})

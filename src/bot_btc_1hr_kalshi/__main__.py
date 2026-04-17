@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import os
+import signal
 import sys
 
 import uvicorn
@@ -30,7 +31,10 @@ from bot_btc_1hr_kalshi.obs.clock import SystemClock
 from bot_btc_1hr_kalshi.obs.logging import configure as configure_logging
 from bot_btc_1hr_kalshi.obs.logging import get_logger
 from bot_btc_1hr_kalshi.portfolio.positions import Portfolio
+from bot_btc_1hr_kalshi.risk.breaker_store import JsonFileBreakerStore, NullBreakerStore
 from bot_btc_1hr_kalshi.risk.breakers import BreakerState
+
+BREAKER_STATE_PATH_ENV = "BOT_BTC_1HR_KALSHI_BREAKER_STATE_PATH"
 
 DEFAULT_ADMIN_TOKEN_ENV = "BOT_BTC_1HR_KALSHI_ADMIN_TOKEN"  # noqa: S105 — env var name, not a secret
 PAPER_LIVE_MODES: tuple[Mode, ...] = ("dev", "paper", "shadow", "live")
@@ -60,7 +64,9 @@ def build_app(
         config_dir=Path(config_dir) if config_dir else None,
     )
     clock = SystemClock()
-    breakers = BreakerState()
+    state_path = os.getenv(BREAKER_STATE_PATH_ENV)
+    store = JsonFileBreakerStore(state_path) if state_path else NullBreakerStore()
+    breakers = BreakerState(store=store)
     portfolio = Portfolio(bankroll_usd=bankroll)
     broker = PaperBroker(clock=clock)
     oms = OMS(
@@ -94,8 +100,39 @@ async def serve(app: App, *, admin_token: str, host: str, port: int) -> None:
         lifespan="on",
     )
     server = uvicorn.Server(cfg)
+
+    # Install our own SIGTERM/SIGINT handlers BEFORE uvicorn's so that Cloud
+    # Run's 10s shutdown grace period is spent halting trading first and
+    # letting in-flight exits drain, rather than killing mid-cycle.
+    # Uvicorn installs its handlers from inside .serve(); stub that out and
+    # forward to server.should_exit after we halt the app.
+    # uvicorn.Server installs its own SIGTERM/SIGINT handlers inside serve();
+    # disable that so ours are authoritative.
+    setattr(server, "install_signal_handlers", lambda: None)  # noqa: B010
+    loop = asyncio.get_running_loop()
+
+    def _on_term() -> None:
+        log.warning(
+            "shutdown.sigterm_received",
+            open_positions=len(app.portfolio.open_positions),
+            trading_halted_before=app.trading_halted,
+        )
+        app.halt()
+        server.should_exit = True
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(sig, _on_term)
+
     log.info("boot.serving", mode=app.settings.mode, host=host, port=port)
-    await server.serve()
+    try:
+        await server.serve()
+    finally:
+        if app.portfolio.open_positions:
+            log.error(
+                "shutdown.open_positions_remain",
+                count=len(app.portfolio.open_positions),
+                note="hard rule #10: container should not exit with open positions; run scripts/flatten.sh first",
+            )
 
 
 def main(argv: list[str] | None = None) -> int:
