@@ -54,6 +54,7 @@ class ReplayOrchestrator:
         clock: ManualClock,
         market_id: str,
         feature_engine: FeatureEngine,
+        strike_usd: float,
         minutes_to_settlement_fn: Any | None = None,
     ) -> None:
         self._app = app
@@ -61,6 +62,7 @@ class ReplayOrchestrator:
         self._clock = clock
         self._market_id = market_id
         self._features = feature_engine
+        self._strike_usd = strike_usd
         self._book = L2Book(market_id)
         self._app.register_book(self._book)
         self._broker.register_book(self._book)
@@ -171,6 +173,7 @@ class ReplayOrchestrator:
             features=features,
             spot_btc_usd=self._spot_price,
             minutes_to_settlement=features.minutes_to_settlement,
+            strike_usd=self._strike_usd,
         )
 
 

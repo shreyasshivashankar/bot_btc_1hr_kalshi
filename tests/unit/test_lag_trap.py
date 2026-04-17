@@ -49,13 +49,16 @@ def _snap(
     pct_b: float = 2.0,
     regime_vol: RegimeVol = "normal",
     valid: bool = True,
+    spot: float = 60_100.0,
+    strike: float = 60_000.0,
 ) -> MarketSnapshot:
     return MarketSnapshot(
         market_id="BTC-1H",
         book=_book(yes_ask=yes_ask, yes_bid=yes_bid, valid=valid),
         features=_features(pct_b=pct_b, regime_vol=regime_vol),
-        spot_btc_usd=60_000.0,
+        spot_btc_usd=spot,
         minutes_to_settlement=30.0,
+        strike_usd=strike,
     )
 
 
@@ -71,8 +74,11 @@ def test_fires_long_yes_on_extreme_positive_pct_b() -> None:
 
 def test_fires_long_no_on_extreme_negative_pct_b() -> None:
     # YES ask=50, yes_bid=48 → NO ask = 100-48 = 52 (in [40,60]); spot crashed → buy NO.
-    # NO bid = 100 - yes_ask = 50.
-    sig = detect_cross_venue_lag(_snap(yes_ask=50, yes_bid=48, pct_b=-2.0), min_confidence=0.3)
+    # NO bid = 100 - yes_ask = 50. Spot below strike so q_no > 0.5 and edge > 0.
+    sig = detect_cross_venue_lag(
+        _snap(yes_ask=50, yes_bid=48, pct_b=-2.0, spot=59_900.0),
+        min_confidence=0.3,
+    )
     assert sig is not None
     assert sig.side == "NO"
     assert sig.entry_price_cents == 50
@@ -86,6 +92,7 @@ def test_rejects_when_book_invalid() -> None:
         features=_features(pct_b=2.0),
         spot_btc_usd=60_000.0,
         minutes_to_settlement=30.0,
+        strike_usd=60_000.0,
     )
     assert detect_cross_venue_lag(snap, min_confidence=0.3) is None
 

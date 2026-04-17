@@ -28,11 +28,12 @@ def _snap(pct_b: float = -0.8) -> MarketSnapshot:
             atr_cents=10.0,
             book_depth_at_entry=200.0,
             spread_cents=2,
-            spot_btc_usd=60_000.0,
+            spot_btc_usd=60_100.0,
             minutes_to_settlement=30.0,
         ),
-        spot_btc_usd=60_000.0,
+        spot_btc_usd=60_100.0,
         minutes_to_settlement=30.0,
+        strike_usd=60_000.0,
     )
 
 

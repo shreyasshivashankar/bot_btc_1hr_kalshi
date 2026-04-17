@@ -42,13 +42,20 @@ def _features(
     )
 
 
-def _snap(ask_price: int = 35, **kwargs: object) -> MarketSnapshot:
+def _snap(
+    ask_price: int = 35,
+    *,
+    spot: float = 60_100.0,
+    strike: float = 60_000.0,
+    **kwargs: object,
+) -> MarketSnapshot:
     return MarketSnapshot(
         market_id="BTC-1H",
         book=_book(ask_price=ask_price, valid=bool(kwargs.pop("valid", True))),
         features=_features(**kwargs),  # type: ignore[arg-type]
-        spot_btc_usd=60_000.0,
+        spot_btc_usd=spot,
         minutes_to_settlement=30.0,
+        strike_usd=strike,
     )
 
 
@@ -72,6 +79,7 @@ def test_rejects_when_book_invalid() -> None:
         features=_features(pct_b=-0.8),
         spot_btc_usd=60_000.0,
         minutes_to_settlement=30.0,
+        strike_usd=60_000.0,
     )
     assert detect_floor_reversion(snap, min_confidence=0.3) is None
 

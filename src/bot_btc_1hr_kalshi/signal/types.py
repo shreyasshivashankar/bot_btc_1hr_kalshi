@@ -17,6 +17,7 @@ class MarketSnapshot:
     features: Features
     spot_btc_usd: float
     minutes_to_settlement: float
+    strike_usd: float
 
 
 @dataclass(frozen=True, slots=True)

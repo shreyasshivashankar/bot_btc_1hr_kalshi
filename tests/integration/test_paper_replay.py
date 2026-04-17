@@ -86,6 +86,7 @@ def _build_app_and_orch() -> tuple[App, ReplayOrchestrator]:
         clock=clock,
         market_id=MARKET,
         feature_engine=features,
+        strike_usd=60_000.0,
     )
     return app, orch
 

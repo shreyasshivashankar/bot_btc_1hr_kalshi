@@ -54,13 +54,16 @@ def _snap(
     pct_b: float = 0.8,
     regime_vol: RegimeVol = "normal",
     valid: bool = True,
+    spot: float = 60_000.0,
+    strike: float = 60_000.0,
 ) -> MarketSnapshot:
     return MarketSnapshot(
         market_id="BTC-1H",
         book=_book(yes_ask=yes_ask, yes_bid=yes_bid, valid=valid),
         features=_features(pct_b=pct_b, regime_vol=regime_vol),
-        spot_btc_usd=60_000.0,
+        spot_btc_usd=spot,
         minutes_to_settlement=30.0,
+        strike_usd=strike,
     )
 
 
@@ -84,6 +87,7 @@ def test_rejects_when_book_invalid() -> None:
         features=_features(pct_b=0.8),
         spot_btc_usd=60_000.0,
         minutes_to_settlement=30.0,
+        strike_usd=60_000.0,
     )
     assert detect_ceiling_reversion(snap, min_confidence=0.3) is None
 
