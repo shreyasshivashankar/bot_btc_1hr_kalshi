@@ -1,0 +1,58 @@
+"""Broker protocol + DTOs. Real and paper brokers both implement `Broker`.
+
+Hard rule #1: maker-only on entry. `OrderType.MAKER` must never cross.
+Hard rule #7: broker state is authoritative — OMS reconciles against `list_positions()`.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Literal, Protocol, runtime_checkable
+
+from bot_btc_1hr_kalshi.obs.schemas import Side
+
+OrderType = Literal["maker", "ioc"]
+OrderAction = Literal["BUY", "SELL"]
+OrderStatus = Literal["resting", "filled", "partially_filled", "rejected", "cancelled"]
+
+
+@dataclass(frozen=True, slots=True)
+class OrderRequest:
+    client_order_id: str
+    market_id: str
+    side: Side
+    action: OrderAction
+    limit_price_cents: int
+    contracts: int
+    order_type: OrderType
+
+
+@dataclass(frozen=True, slots=True)
+class Fill:
+    order_id: str
+    client_order_id: str
+    market_id: str
+    side: Side
+    action: OrderAction
+    price_cents: int
+    contracts: int
+    ts_ns: int
+    fees_usd: float
+
+
+@dataclass(frozen=True, slots=True)
+class OrderAck:
+    order_id: str
+    client_order_id: str
+    status: OrderStatus
+    filled_contracts: int
+    remaining_contracts: int
+    fills: tuple[Fill, ...]
+    reason: str | None = None
+
+
+@runtime_checkable
+class Broker(Protocol):
+    async def submit(self, req: OrderRequest) -> OrderAck: ...
+    async def cancel(self, order_id: str) -> bool: ...
+    async def list_open_orders(self) -> tuple[OrderAck, ...]: ...

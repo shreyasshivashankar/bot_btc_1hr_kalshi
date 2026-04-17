@@ -8,7 +8,6 @@ so the log sink can route them to BigQuery.
 from __future__ import annotations
 
 import logging
-import sys
 from typing import Any
 
 import structlog
@@ -36,8 +35,8 @@ def configure(level: str = "INFO", *, development: bool = False) -> None:
     structlog.configure(
         processors=[*shared_processors, renderer],
         wrapper_class=structlog.make_filtering_bound_logger(level_no),
-        logger_factory=structlog.PrintLoggerFactory(file=sys.stdout),
-        cache_logger_on_first_use=True,
+        logger_factory=structlog.PrintLoggerFactory(),
+        cache_logger_on_first_use=False,
     )
 
 
