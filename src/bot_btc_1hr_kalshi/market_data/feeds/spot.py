@@ -25,6 +25,7 @@ from bot_btc_1hr_kalshi.market_data.feeds.kalshi import SessionEndedError, WSCon
 from bot_btc_1hr_kalshi.market_data.feeds.staleness import StalenessTracker
 from bot_btc_1hr_kalshi.market_data.types import SpotTick, Venue
 from bot_btc_1hr_kalshi.obs.clock import Clock
+from bot_btc_1hr_kalshi.obs.money import usd_to_micros
 
 _log = structlog.get_logger("bot_btc_1hr_kalshi.feed.spot")
 
@@ -59,7 +60,12 @@ def parse_coinbase(raw: bytes | str, *, recv_ts_ns: int) -> SpotTick | None:
     except (KeyError, ValueError, TypeError) as exc:
         raise SpotParseError(f"missing price: {exc}") from exc
     ts_ns = _iso_to_ns(str(data.get("time", "")), fallback_ns=recv_ts_ns)
-    return SpotTick(ts_ns=ts_ns, venue="coinbase", price_usd=price, size=size)
+    return SpotTick(
+        ts_ns=ts_ns,
+        venue="coinbase",
+        price_micros=usd_to_micros(price),
+        size=size,
+    )
 
 
 def parse_binance(raw: bytes | str, *, recv_ts_ns: int) -> SpotTick | None:
@@ -81,7 +87,12 @@ def parse_binance(raw: bytes | str, *, recv_ts_ns: int) -> SpotTick | None:
     except (KeyError, ValueError, TypeError) as exc:
         raise SpotParseError(f"missing fields: {exc}") from exc
     ts_ns = trade_ms * 1_000_000 if trade_ms > 0 else recv_ts_ns
-    return SpotTick(ts_ns=ts_ns, venue="binance", price_usd=price, size=size)
+    return SpotTick(
+        ts_ns=ts_ns,
+        venue="binance",
+        price_micros=usd_to_micros(price),
+        size=size,
+    )
 
 
 def build_coinbase_subscribe(product_ids: list[str]) -> bytes:

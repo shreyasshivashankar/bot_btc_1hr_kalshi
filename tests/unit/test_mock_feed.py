@@ -4,6 +4,7 @@ import pytest
 
 from bot_btc_1hr_kalshi.market_data import BookLevel, BookUpdate, MockFeed, SpotTick
 from bot_btc_1hr_kalshi.obs import ManualClock
+from bot_btc_1hr_kalshi.obs.money import usd_to_micros
 
 
 def _book(seq: int, ts_ns: int) -> BookUpdate:
@@ -38,7 +39,7 @@ async def test_mock_feed_advances_injected_clock() -> None:
 async def test_mock_feed_mixed_event_types() -> None:
     events = [
         _book(1, 1_000),
-        SpotTick(ts_ns=2_000, venue="coinbase", price_usd=65_000.0, size=0.1),
+        SpotTick(ts_ns=2_000, venue="coinbase", price_micros=usd_to_micros(65_000.0), size=0.1),
         _book(2, 3_000),
     ]
     feed = MockFeed(events)

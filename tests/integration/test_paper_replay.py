@@ -18,6 +18,7 @@ from bot_btc_1hr_kalshi.execution.oms import OMS
 from bot_btc_1hr_kalshi.market_data.types import BookLevel, BookUpdate, FeedEvent, SpotTick, TradeEvent
 from bot_btc_1hr_kalshi.monitor.position_monitor import PositionMonitor
 from bot_btc_1hr_kalshi.obs.clock import ManualClock
+from bot_btc_1hr_kalshi.obs.money import usd_to_micros
 from bot_btc_1hr_kalshi.portfolio.positions import Portfolio
 from bot_btc_1hr_kalshi.research.replay import ReplayOrchestrator, replay
 from bot_btc_1hr_kalshi.risk.breakers import BreakerState
@@ -43,7 +44,12 @@ def _book_update(seq: int, ts_ns: int, *, best_bid: int, best_ask: int) -> BookU
 
 
 def _spot(ts_ns: int, price_usd: float) -> SpotTick:
-    return SpotTick(ts_ns=ts_ns, venue="coinbase", price_usd=price_usd, size=0.01)
+    return SpotTick(
+        ts_ns=ts_ns,
+        venue="coinbase",
+        price_micros=usd_to_micros(price_usd),
+        size=0.01,
+    )
 
 
 def _build_app_and_orch() -> tuple[App, ReplayOrchestrator]:

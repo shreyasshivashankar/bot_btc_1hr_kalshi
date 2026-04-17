@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
+from bot_btc_1hr_kalshi.obs.money import MICROS_PER_USD, Micros
 from bot_btc_1hr_kalshi.obs.schemas import Side
 
 Venue = Literal["kalshi", "coinbase", "binance"]
@@ -58,12 +59,23 @@ class TradeEvent:
 
 @dataclass(frozen=True, slots=True)
 class SpotTick:
-    """A trade print on a spot venue (Coinbase/Binance)."""
+    """A trade print on a spot venue (Coinbase/Binance).
+
+    Price is stored as integer micro-dollars (1 USD = 1_000_000 micros).
+    BTC-USD spot venues quote to cent precision; micros gives us 4 extra
+    decimals of headroom for sub-cent aggregations and keeps the feature
+    engine's rolling windows out of float space entirely. `price_usd` is
+    a read-only convenience property for logging and human-facing
+    telemetry — never use it inside arithmetic accumulations."""
 
     ts_ns: int
     venue: Venue
-    price_usd: float
+    price_micros: Micros
     size: float
+
+    @property
+    def price_usd(self) -> float:
+        return self.price_micros / MICROS_PER_USD
 
 
 FeedEvent = BookUpdate | TradeEvent | SpotTick
