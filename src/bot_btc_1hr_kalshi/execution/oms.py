@@ -69,6 +69,10 @@ class OMS:
         self._clock = clock
         self._log = get_logger("bot_btc_1hr_kalshi.oms")
         self._outcomes_log = get_logger(BET_OUTCOMES_LOGGER)
+        # Counter for partial-close bet_id suffixing. A position that fully
+        # closes after N partials will have emitted outcomes p1..pN plus a
+        # final unsuffixed outcome for the remainder.
+        self._partial_seq: dict[str, int] = {}
 
     async def consider_entry(
         self,
@@ -169,8 +173,10 @@ class OMS:
         if pos is None:
             raise ValueError(f"no open position: {position_id}")
 
+        # Nonce the client_order_id so that a retry after a lost ack doesn't
+        # double-execute against a broker that de-dupes by client_order_id.
         req = OrderRequest(
-            client_order_id=f"exit-{position_id}",
+            client_order_id=f"exit-{position_id}-{self._clock.now_ns()}",
             market_id=pos.market_id,
             side=pos.side,
             action="SELL",
@@ -189,6 +195,31 @@ class OMS:
                 exit_reason=exit_reason,
             )
             self._outcomes_log.info("bet_outcome", **bet_outcome.model_dump())
+            self._partial_seq.pop(position_id, None)
+        elif ack.status == "partially_filled" and len(ack.fills) > 0:
+            # Kalshi IOC cancels the remainder automatically, so there is no
+            # orphaned resting order — we close the filled slice and let the
+            # monitor decide whether to re-fire on the remaining contracts
+            # next tick.
+            exit_fill = _aggregate_sell_fill(ack.fills)
+            seq = self._partial_seq.get(position_id, 0) + 1
+            self._partial_seq[position_id] = seq
+            bet_outcome = self._portfolio.partial_close(
+                position_id=position_id,
+                exit_fill=exit_fill,
+                exit_reason=exit_reason,
+                partial_seq=seq,
+            )
+            self._outcomes_log.info("bet_outcome", **bet_outcome.model_dump())
+        elif ack.status in ("rejected", "cancelled"):
+            # No fills, no state change. Log so repeated rejections are visible;
+            # caller / monitor decides whether to retry.
+            self._log.warning(
+                "exit.non_fill",
+                position_id=position_id,
+                status=ack.status,
+                reason=ack.reason,
+            )
         return ExitResult(ack=ack, bet_outcome=bet_outcome)
 
 

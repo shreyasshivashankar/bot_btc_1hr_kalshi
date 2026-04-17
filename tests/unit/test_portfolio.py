@@ -209,6 +209,75 @@ def test_reset_daily_pnl() -> None:
     assert p.daily_realized_pnl_usd == 0.0
 
 
+def test_partial_close_shrinks_position_and_emits_proportional_outcome() -> None:
+    p = Portfolio(bankroll_usd=1000.0)
+    p.open_from_fill(
+        position_id="p1",
+        decision_id="d1",
+        fill=_buy(30, 100, fees=1.0),
+        trap="floor_reversion",
+        features_at_entry=_features(),
+    )
+    # Close 40 of 100 contracts at 50c with 0.40 exit fee.
+    partial = p.partial_close(
+        position_id="p1",
+        exit_fill=_sell(50, 40, fees=0.40),
+        exit_reason="theta_net_target",
+        partial_seq=1,
+    )
+    # Gross: 40 * (50 - 30) / 100 = $8.00
+    assert partial.gross_pnl_usd == pytest.approx(8.0)
+    # Entry fee share proportional: 1.0 * 40/100 = $0.40
+    assert partial.fees_usd == pytest.approx(0.80)
+    assert partial.net_pnl_usd == pytest.approx(7.20)
+    assert partial.bet_id == "p1-p1"
+    assert partial.contracts == 40
+
+    # Remaining position: 60 contracts, $0.60 entry fees left.
+    pos = p.get("p1")
+    assert pos is not None
+    assert pos.contracts == 60
+    assert pos.fees_paid_usd == pytest.approx(0.60)
+
+    # Bankroll: -$30 entry -$1 entry fee +(40 * 0.50 - 0.40) exit = -31 + 19.60
+    assert p.bankroll_usd == pytest.approx(1000.0 - 31.0 + 19.60)
+
+
+def test_partial_close_rejects_full_or_zero_slice() -> None:
+    p = Portfolio(bankroll_usd=1000.0)
+    p.open_from_fill(
+        position_id="p1",
+        decision_id="d1",
+        fill=_buy(30, 100),
+        trap="floor_reversion",
+        features_at_entry=_features(),
+    )
+    with pytest.raises(ValueError, match="partial close must be"):
+        p.partial_close(position_id="p1", exit_fill=_sell(50, 0), exit_reason="soft_stop", partial_seq=1)
+    with pytest.raises(ValueError, match="partial close must be"):
+        p.partial_close(position_id="p1", exit_fill=_sell(50, 100), exit_reason="soft_stop", partial_seq=1)
+
+
+def test_partial_then_full_close_sums_correctly() -> None:
+    p = Portfolio(bankroll_usd=1000.0)
+    p.open_from_fill(
+        position_id="p1",
+        decision_id="d1",
+        fill=_buy(30, 100, fees=1.0),
+        trap="floor_reversion",
+        features_at_entry=_features(),
+    )
+    p.partial_close(
+        position_id="p1", exit_fill=_sell(50, 40), exit_reason="theta_net_target", partial_seq=1,
+    )
+    final = p.close(position_id="p1", exit_fill=_sell(60, 60), exit_reason="soft_stop")
+    # Final leg: 60 * (60-30)/100 = $18 gross, minus remaining $0.60 entry share.
+    assert final.gross_pnl_usd == pytest.approx(18.0)
+    assert final.fees_usd == pytest.approx(0.60)
+    assert final.contracts == 60
+    assert p.get("p1") is None
+
+
 def test_bankroll_has_no_float_drift_over_many_small_fees() -> None:
     """Regression: 10_000 sequential $0.003 fee deductions must produce an
     exact $30.00 reduction. With plain float arithmetic this drifts in the

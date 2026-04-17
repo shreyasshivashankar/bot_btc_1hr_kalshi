@@ -157,6 +157,128 @@ async def test_full_lifecycle_entry_fill_exit_emits_outcome() -> None:
     assert portfolio.get(result.decision.decision_id) is None
 
 
+async def test_exit_client_order_id_is_nonced() -> None:
+    """Regression: an exit retry after a lost ack must not collide on
+    client_order_id — nonce it with the clock's ns timestamp."""
+    from bot_btc_1hr_kalshi.execution.broker.base import OrderRequest
+
+    oms, broker, _p, _book, _b, clock = _oms()
+    res = await oms.consider_entry(signal=_signal(), market_id=MARKET)
+    assert res.position_id is not None
+    clock.advance_ns(1_000_000)
+    trade = TradeEvent(
+        seq=2, ts_ns=clock.now_ns(), market_id=MARKET,
+        price_cents=29, size=res.decision.sizing.contracts,
+        aggressor="sell", taker_side="YES",
+    )
+    fills = await broker.match_trade(trade)
+    oms.on_entry_fill(
+        decision_id=res.decision.decision_id, fill=fills[0],
+        trap=res.decision.trap, features_at_entry=res.decision.features,
+    )
+
+    submitted: list[OrderRequest] = []
+    original_submit = broker.submit
+
+    async def capture(req: OrderRequest) -> object:
+        submitted.append(req)
+        return await original_submit(req)
+
+    broker.submit = capture  # type: ignore[method-assign]
+
+    # Both exits cancel (no bid >= 99) so the position survives for the
+    # second attempt; the nonce should still differ between them.
+    clock.advance_ns(1_000_000)
+    r1 = await oms.submit_exit(position_id=res.position_id, limit_price_cents=99, exit_reason="soft_stop")
+    clock.advance_ns(1_000_000)
+    r2 = await oms.submit_exit(position_id=res.position_id, limit_price_cents=99, exit_reason="soft_stop")
+
+    assert r1.ack.status == "cancelled"
+    assert r2.ack.status == "cancelled"
+    assert len(submitted) == 2
+    assert submitted[0].client_order_id != submitted[1].client_order_id
+    assert submitted[0].client_order_id.startswith(f"exit-{res.position_id}-")
+
+
+async def test_submit_exit_partial_fill_shrinks_position_and_emits_partial_outcome() -> None:
+    """The book can only absorb part of the exit; Kalshi returns partially_filled.
+    Portfolio must shrink, BetOutcome must tag as partial, position stays open
+    for the remainder."""
+    oms, broker, portfolio, book, _b, clock = _oms()
+    res = await oms.consider_entry(signal=_signal(), market_id=MARKET)
+    assert res.position_id is not None
+    clock.advance_ns(1_000_000)
+    trade = TradeEvent(
+        seq=2, ts_ns=clock.now_ns(), market_id=MARKET,
+        price_cents=29, size=res.decision.sizing.contracts,
+        aggressor="sell", taker_side="YES",
+    )
+    fills = await broker.match_trade(trade)
+    oms.on_entry_fill(
+        decision_id=res.decision.decision_id, fill=fills[0],
+        trap=res.decision.trap, features_at_entry=res.decision.features,
+    )
+    contracts = res.decision.sizing.contracts
+    assert contracts >= 10  # sanity — test depends on this
+
+    # Thin the book: only 1 contract available at the 28 bid for YES exit.
+    book.apply(BookUpdate(
+        seq=3, ts_ns=clock.now_ns(), market_id=MARKET,
+        bids=(BookLevel(28, 1),),
+        asks=(BookLevel(32, 200),),
+        is_snapshot=True,
+    ))
+
+    clock.advance_ns(60_000_000_000)
+    exit_result = await oms.submit_exit(
+        position_id=res.position_id, limit_price_cents=28, exit_reason="soft_stop",
+    )
+    assert exit_result.ack.status == "partially_filled"
+    assert exit_result.bet_outcome is not None
+    assert exit_result.bet_outcome.bet_id == f"{res.position_id}-p1"
+    assert exit_result.bet_outcome.contracts == 1
+
+    remaining = portfolio.get(res.position_id)
+    assert remaining is not None
+    assert remaining.contracts == contracts - 1
+
+
+async def test_submit_exit_rejected_does_not_mutate_portfolio() -> None:
+    """If the broker rejects the exit, no BetOutcome is emitted and the
+    portfolio position is unchanged — the monitor retries next tick."""
+    oms, broker, portfolio, book, _b, clock = _oms()
+    res = await oms.consider_entry(signal=_signal(), market_id=MARKET)
+    assert res.position_id is not None
+    clock.advance_ns(1_000_000)
+    trade = TradeEvent(
+        seq=2, ts_ns=clock.now_ns(), market_id=MARKET,
+        price_cents=29, size=res.decision.sizing.contracts,
+        aggressor="sell", taker_side="YES",
+    )
+    fills = await broker.match_trade(trade)
+    oms.on_entry_fill(
+        decision_id=res.decision.decision_id, fill=fills[0],
+        trap=res.decision.trap, features_at_entry=res.decision.features,
+    )
+    contracts_before = portfolio.get(res.position_id).contracts  # type: ignore[union-attr]
+
+    # Force a rejection: empty the book so the broker returns status=cancelled
+    # (IOC with no liquidity produces no fills and is cancelled).
+    book.apply(BookUpdate(
+        seq=3, ts_ns=clock.now_ns(), market_id=MARKET,
+        bids=(), asks=(BookLevel(32, 200),), is_snapshot=True,
+    ))
+    clock.advance_ns(60_000_000_000)
+    exit_result = await oms.submit_exit(
+        position_id=res.position_id, limit_price_cents=28, exit_reason="soft_stop",
+    )
+    assert exit_result.ack.status in ("cancelled", "rejected")
+    assert exit_result.bet_outcome is None
+    pos = portfolio.get(res.position_id)
+    assert pos is not None
+    assert pos.contracts == contracts_before
+
+
 async def test_submit_exit_on_unknown_position_raises() -> None:
     oms, _broker, _p, _book, _b, _c = _oms()
     with pytest.raises(ValueError):

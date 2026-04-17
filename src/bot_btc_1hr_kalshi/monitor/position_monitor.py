@@ -129,6 +129,11 @@ class PositionMonitor:
     async def _submit_exit(
         self, pos: OpenPosition, limit_price_cents: int, reason: ExitReason
     ) -> MonitorTick:
+        # The lock prevents a second exit order from being queued within the
+        # same evaluate() call for the same position. It is *always* cleared
+        # on return: after a partial fill the position still exists (with
+        # shrunk contracts) and must be re-evaluable next tick; after a
+        # rejection or a full close we also want it unlocked.
         self._pending_exit.add(pos.position_id)
         try:
             result = await self._oms.submit_exit(
@@ -137,8 +142,7 @@ class PositionMonitor:
                 exit_reason=reason,
             )
         finally:
-            if not self._portfolio.has(pos.position_id):
-                self._pending_exit.discard(pos.position_id)
+            self._pending_exit.discard(pos.position_id)
         action: MonitorAction
         if reason == "early_cashout_99":
             action = "early_cashout_99"

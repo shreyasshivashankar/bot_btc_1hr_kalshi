@@ -162,6 +162,71 @@ class Portfolio:
             features_at_entry=pos.features_at_entry,
         )
 
+    def partial_close(
+        self,
+        *,
+        position_id: str,
+        exit_fill: Fill,
+        exit_reason: ExitReason,
+        partial_seq: int,
+        counterfactual_held_pnl_usd: float | None = None,
+    ) -> BetOutcome:
+        """Close part of a position (e.g. IOC exit that partially filled).
+
+        Shrinks the open position by `exit_fill.contracts`, credits bankroll for
+        the partial fill, emits a `BetOutcome` tagged with `bet_id = {position_id}-p{seq}`
+        so BigQuery keeps a distinct record per partial. Entry fees are allocated
+        proportionally to the closed slice.
+        """
+        pos = self._positions.get(position_id)
+        if pos is None:
+            raise ValueError(f"no open position: {position_id}")
+        if exit_fill.action != "SELL":
+            raise ValueError(f"exit fill must be a SELL, got {exit_fill.action}")
+        closed = exit_fill.contracts
+        if closed <= 0 or closed >= pos.contracts:
+            raise ValueError(
+                f"partial close must be 1..{pos.contracts - 1}, got {closed}"
+            )
+
+        entry_fee_share = pos.fees_paid_usd * closed / pos.contracts
+        gross = closed * (exit_fill.price_cents - pos.entry_price_cents) / 100.0
+        total_fees = entry_fee_share + exit_fill.fees_usd
+        net = gross - total_fees
+
+        self._bankroll_micros += _to_micros(
+            closed * exit_fill.price_cents / 100.0 - exit_fill.fees_usd
+        )
+        net_micros = _to_micros(net)
+        self._daily_realized_pnl_micros += net_micros
+        self._lifetime_realized_pnl_micros += net_micros
+
+        # Shrink the live position in place. OpenPosition is mutable (non-frozen
+        # dataclass); remaining entry-fee share stays with the open remainder.
+        pos.contracts -= closed
+        pos.fees_paid_usd -= entry_fee_share
+
+        hold_sec = max(0.0, (exit_fill.ts_ns - pos.opened_at_ns) / 1_000_000_000)
+        return BetOutcome(
+            bet_id=f"{position_id}-p{partial_seq}",
+            decision_id=pos.decision_id,
+            market_id=pos.market_id,
+            trap=pos.trap,  # type: ignore[arg-type]
+            side=pos.side,
+            opened_at_ns=pos.opened_at_ns,
+            closed_at_ns=exit_fill.ts_ns,
+            hold_duration_sec=hold_sec,
+            entry_price_cents=pos.entry_price_cents,
+            exit_price_cents=exit_fill.price_cents,
+            contracts=closed,
+            gross_pnl_usd=gross,
+            fees_usd=total_fees,
+            net_pnl_usd=net,
+            counterfactual_held_pnl_usd=counterfactual_held_pnl_usd,
+            exit_reason=exit_reason,
+            features_at_entry=pos.features_at_entry,
+        )
+
     def settle(
         self,
         *,
