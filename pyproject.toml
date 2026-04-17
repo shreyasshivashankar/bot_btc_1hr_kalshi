@@ -17,6 +17,9 @@ dependencies = [
   "httpx>=0.27",
   "orjson>=3.10",
 
+  # Kalshi request signing (RSA-PSS-SHA256 over timestamp+method+path)
+  "cryptography>=42.0",
+
   # Data / numerics
   "numpy>=1.26",
   "numba>=0.59",

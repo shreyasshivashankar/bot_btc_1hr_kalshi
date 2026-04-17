@@ -19,6 +19,7 @@ import asyncio
 from dataclasses import dataclass
 
 from bot_btc_1hr_kalshi.execution.broker.base import (
+    BrokerPosition,
     Fill,
     OrderAck,
     OrderRequest,
@@ -27,6 +28,7 @@ from bot_btc_1hr_kalshi.execution.broker.base import (
 from bot_btc_1hr_kalshi.market_data.book import L2Book
 from bot_btc_1hr_kalshi.market_data.types import TradeEvent
 from bot_btc_1hr_kalshi.obs.clock import Clock
+from bot_btc_1hr_kalshi.obs.schemas import Side
 
 
 @dataclass(slots=True)
@@ -54,6 +56,9 @@ class PaperBroker:
         self._resting: dict[str, _Resting] = {}
         self._order_counter = 0
         self._lock = asyncio.Lock()
+        # Position ledger: (market_id, side) -> (signed_contracts, cum_cost_cents).
+        # A BUY adds +contracts and +contracts*price; a SELL decrements both.
+        self._position_ledger: dict[tuple[str, Side], tuple[int, int]] = {}
 
     def register_book(self, book: L2Book) -> None:
         """OMS calls this once per market so the broker can simulate fills."""
@@ -83,6 +88,8 @@ class PaperBroker:
 
         if req.order_type == "ioc":
             fills, remaining = self._fill_ioc(order_id, req, book)
+            for f in fills:
+                self._apply_to_ledger(f)
             status: OrderStatus = (
                 "filled" if remaining == 0 else "partially_filled" if fills else "cancelled"
             )
@@ -168,6 +175,31 @@ class PaperBroker:
                 for r in self._resting.values()
             )
 
+    async def list_positions(self) -> tuple[BrokerPosition, ...]:
+        async with self._lock:
+            out: list[BrokerPosition] = []
+            for (market, side), (contracts, cum_cents) in self._position_ledger.items():
+                if contracts == 0:
+                    continue
+                avg = cum_cents // contracts if contracts > 0 else 0
+                out.append(BrokerPosition(
+                    market_id=market, side=side, contracts=contracts, avg_entry_price_cents=avg,
+                ))
+            return tuple(out)
+
+    def _apply_to_ledger(self, fill: Fill) -> None:
+        key = (fill.market_id, fill.side)
+        contracts, cum = self._position_ledger.get(key, (0, 0))
+        if fill.action == "BUY":
+            contracts += fill.contracts
+            cum += fill.contracts * fill.price_cents
+        else:  # SELL closes some or all of the position
+            contracts -= fill.contracts
+            cum -= fill.contracts * fill.price_cents
+        if contracts <= 0:
+            contracts, cum = 0, 0
+        self._position_ledger[key] = (contracts, cum)
+
     async def match_trade(self, trade: TradeEvent) -> tuple[Fill, ...]:
         """Match an incoming TradeEvent against resting orders in its market.
 
@@ -210,6 +242,7 @@ class PaperBroker:
                 r.fills.append(fill)
                 r.remaining -= take
                 filled_now.append(fill)
+                self._apply_to_ledger(fill)
                 if r.remaining == 0:
                     completed.append(oid)
             for oid in completed:

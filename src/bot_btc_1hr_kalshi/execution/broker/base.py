@@ -51,8 +51,19 @@ class OrderAck:
     reason: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class BrokerPosition:
+    """Broker-side view of a position. Used by the reconciliation loop."""
+
+    market_id: str
+    side: Side
+    contracts: int
+    avg_entry_price_cents: int
+
+
 @runtime_checkable
 class Broker(Protocol):
     async def submit(self, req: OrderRequest) -> OrderAck: ...
     async def cancel(self, order_id: str) -> bool: ...
     async def list_open_orders(self) -> tuple[OrderAck, ...]: ...
+    async def list_positions(self) -> tuple[BrokerPosition, ...]: ...
