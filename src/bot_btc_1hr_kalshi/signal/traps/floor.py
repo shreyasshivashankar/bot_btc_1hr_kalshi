@@ -31,8 +31,9 @@ def detect_floor_reversion(
     if not snap.book.valid:
         return None
 
+    best_bid = snap.book.best_bid
     best_ask = snap.book.best_ask
-    if best_ask is None or best_ask.price_cents > FLOOR_MAX_CENTS:
+    if best_bid is None or best_ask is None or best_ask.price_cents > FLOOR_MAX_CENTS:
         return None
 
     pct_b = snap.features.bollinger_pct_b
@@ -46,12 +47,15 @@ def detect_floor_reversion(
     if confidence < min_confidence:
         return None
 
-    edge_cents = confidence * max(0.0, FAIR_VALUE_MID_CENTS - best_ask.price_cents)
+    # Hard rule #1: never cross on entry. We post a maker BUY at the best bid;
+    # edge reflects distance from fair value at that bid.
+    entry_price_cents = best_bid.price_cents
+    edge_cents = confidence * max(0.0, FAIR_VALUE_MID_CENTS - entry_price_cents)
 
     return TrapSignal(
         trap="floor_reversion",
         side="YES",
-        entry_price_cents=best_ask.price_cents,
+        entry_price_cents=entry_price_cents,
         confidence=confidence,
         edge_cents=edge_cents,
         features=snap.features,

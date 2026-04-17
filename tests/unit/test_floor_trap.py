@@ -57,7 +57,9 @@ def test_fires_on_clear_floor_setup() -> None:
     assert sig is not None
     assert sig.trap == "floor_reversion"
     assert sig.side == "YES"
-    assert sig.entry_price_cents == 25
+    # entry is at best_bid (ask_price - 2 per _book helper), not at the ask —
+    # maker-only entry means we post at the bid.
+    assert sig.entry_price_cents == 23
     assert 0.0 < sig.confidence <= 1.0
     assert sig.edge_cents > 0
 
