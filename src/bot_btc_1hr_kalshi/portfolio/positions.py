@@ -7,14 +7,27 @@ Position convention: we always *buy* a side's contract. A YES-buy at 30c pays
 (100 - 30) = 70c per contract if YES settles, and loses 30c otherwise. At any
 mid-tick, gross PnL on that leg = contracts * (mark_cents - entry_cents) / 100.
 Symmetric for NO-buys: entry is the NO-side price, mark is the NO-side mark.
+
+Units: bankroll and PnL are stored internally as integer micro-dollars
+(1 USD = 1_000_000 micros) so that a long sequence of small credits/debits
+never accumulates float drift. The `*_usd` properties convert back to float
+at read-time for risk/OMS/telemetry. Only the internal running counters use
+micros — per-bet amounts (BetOutcome, OpenPosition.fees_paid_usd) stay in
+float USD so the BigQuery schema and broker Fill surface are unchanged.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from bot_btc_1hr_kalshi.execution.broker.base import Fill
 from bot_btc_1hr_kalshi.obs.schemas import BetOutcome, ExitReason, Features, Side
+
+_MICROS_PER_USD = 1_000_000
+
+
+def _to_micros(usd: float) -> int:
+    return round(usd * _MICROS_PER_USD)
 
 
 @dataclass(slots=True)
@@ -35,12 +48,22 @@ class OpenPosition:
         return self.contracts * self.entry_price_cents / 100.0
 
 
-@dataclass(slots=True)
+@dataclass(slots=True, init=False)
 class Portfolio:
-    bankroll_usd: float
-    _positions: dict[str, OpenPosition] = field(default_factory=dict)
-    _daily_realized_pnl_usd: float = 0.0
-    _lifetime_realized_pnl_usd: float = 0.0
+    _bankroll_micros: int
+    _positions: dict[str, OpenPosition]
+    _daily_realized_pnl_micros: int
+    _lifetime_realized_pnl_micros: int
+
+    def __init__(self, *, bankroll_usd: float) -> None:
+        self._bankroll_micros = _to_micros(bankroll_usd)
+        self._positions = {}
+        self._daily_realized_pnl_micros = 0
+        self._lifetime_realized_pnl_micros = 0
+
+    @property
+    def bankroll_usd(self) -> float:
+        return self._bankroll_micros / _MICROS_PER_USD
 
     @property
     def open_positions(self) -> tuple[OpenPosition, ...]:
@@ -52,7 +75,7 @@ class Portfolio:
 
     @property
     def daily_realized_pnl_usd(self) -> float:
-        return self._daily_realized_pnl_usd
+        return self._daily_realized_pnl_micros / _MICROS_PER_USD
 
     def get(self, position_id: str) -> OpenPosition | None:
         return self._positions.get(position_id)
@@ -86,7 +109,7 @@ class Portfolio:
             features_at_entry=features_at_entry,
         )
         self._positions[position_id] = pos
-        self.bankroll_usd -= pos.notional_usd + fill.fees_usd
+        self._bankroll_micros -= _to_micros(pos.notional_usd + fill.fees_usd)
         return pos
 
     def close(
@@ -111,9 +134,12 @@ class Portfolio:
         total_fees = pos.fees_paid_usd + exit_fill.fees_usd
         net = gross - total_fees
 
-        self.bankroll_usd += pos.contracts * exit_fill.price_cents / 100.0 - exit_fill.fees_usd
-        self._daily_realized_pnl_usd += net
-        self._lifetime_realized_pnl_usd += net
+        self._bankroll_micros += _to_micros(
+            pos.contracts * exit_fill.price_cents / 100.0 - exit_fill.fees_usd
+        )
+        net_micros = _to_micros(net)
+        self._daily_realized_pnl_micros += net_micros
+        self._lifetime_realized_pnl_micros += net_micros
 
         hold_sec = max(0.0, (exit_fill.ts_ns - pos.opened_at_ns) / 1_000_000_000)
         return BetOutcome(
@@ -154,9 +180,10 @@ class Portfolio:
         gross = pos.contracts * (settlement_cents - pos.entry_price_cents) / 100.0
         net = gross - pos.fees_paid_usd
 
-        self.bankroll_usd += pos.contracts * settlement_cents / 100.0
-        self._daily_realized_pnl_usd += net
-        self._lifetime_realized_pnl_usd += net
+        self._bankroll_micros += _to_micros(pos.contracts * settlement_cents / 100.0)
+        net_micros = _to_micros(net)
+        self._daily_realized_pnl_micros += net_micros
+        self._lifetime_realized_pnl_micros += net_micros
 
         return BetOutcome(
             bet_id=position_id,
@@ -179,4 +206,4 @@ class Portfolio:
         )
 
     def reset_daily_pnl(self) -> None:
-        self._daily_realized_pnl_usd = 0.0
+        self._daily_realized_pnl_micros = 0

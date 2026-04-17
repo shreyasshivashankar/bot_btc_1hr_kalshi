@@ -207,3 +207,23 @@ def test_reset_daily_pnl() -> None:
     assert p.daily_realized_pnl_usd > 0
     p.reset_daily_pnl()
     assert p.daily_realized_pnl_usd == 0.0
+
+
+def test_bankroll_has_no_float_drift_over_many_small_fees() -> None:
+    """Regression: 10_000 sequential $0.003 fee deductions must produce an
+    exact $30.00 reduction. With plain float arithmetic this drifts in the
+    ~1e-11 range; integer-micro storage is exact."""
+    p = Portfolio(bankroll_usd=1000.0)
+    for i in range(10_000):
+        p.open_from_fill(
+            position_id=f"p{i}",
+            decision_id=f"d{i}",
+            fill=_buy(50, 1, fees=0.003),
+            trap="floor_reversion",
+            features_at_entry=_features(),
+        )
+        p.settle(position_id=f"p{i}", settlement_cents=100, settled_at_ns=9_000 + i)
+    # Per cycle: -$0.50 entry - $0.003 fee + $1.00 settle = +$0.497 net.
+    # Over 10_000 cycles: +$4970.00 exactly (would drift ~1e-10 with floats).
+    assert p.bankroll_usd == 5970.0
+    assert p.daily_realized_pnl_usd == 4970.0
