@@ -3,11 +3,16 @@
 Hard rule #9: on WS seq gap, the book is marked INVALID until a REST snapshot
 rebuilds it. Any feature derived from `L2Book` (spread, depth, OFI) must check
 `book.valid` before use — the signal layer treats INVALID as a pass.
+
+The book is stored in YES-space (YES bids + YES asks). NO-side bids and asks
+are derived by parity: NO_bid at price p ⇔ YES_ask at (100 - p). Use
+`best_bid_for(side)` / `best_ask_for(side)` when you need side-specific prices.
 """
 
 from __future__ import annotations
 
 from bot_btc_1hr_kalshi.market_data.types import BookLevel, BookUpdate
+from bot_btc_1hr_kalshi.obs.schemas import Side
 
 
 class L2Book:
@@ -99,6 +104,24 @@ class L2Book:
             return None
         return ba.price_cents - bb.price_cents
 
+    def best_bid_for(self, side: Side) -> BookLevel | None:
+        """Best bid on the given side (YES uses stored bids; NO flips from YES asks)."""
+        if side == "YES":
+            return self.best_bid
+        ask = self.best_ask
+        if ask is None:
+            return None
+        return BookLevel(price_cents=100 - ask.price_cents, size=ask.size)
+
+    def best_ask_for(self, side: Side) -> BookLevel | None:
+        """Best ask on the given side (YES uses stored asks; NO flips from YES bids)."""
+        if side == "YES":
+            return self.best_ask
+        bid = self.best_bid
+        if bid is None:
+            return None
+        return BookLevel(price_cents=100 - bid.price_cents, size=bid.size)
+
     def book_depth(self, *, levels: int = 5) -> float:
         """Sum of sizes across the top `levels` price tiers on each side."""
         if not self._bids and not self._asks:
@@ -112,3 +135,19 @@ class L2Book:
         bids = [BookLevel(p, s) for p, s in sorted(self._bids.items(), reverse=True)]
         asks = [BookLevel(p, s) for p, s in sorted(self._asks.items())]
         return bids, asks
+
+    def snapshot_levels_for(self, side: Side) -> tuple[list[BookLevel], list[BookLevel]]:
+        """Side-specific (bids, asks). For NO, flips each YES level via 100-p."""
+        bids, asks = self.snapshot_levels()
+        if side == "YES":
+            return bids, asks
+        # NO-space: NO bids = YES asks reflected (desc by NO-price), NO asks = YES bids reflected.
+        no_bids = sorted(
+            (BookLevel(price_cents=100 - lvl.price_cents, size=lvl.size) for lvl in asks),
+            key=lambda x: -x.price_cents,
+        )
+        no_asks = sorted(
+            (BookLevel(price_cents=100 - lvl.price_cents, size=lvl.size) for lvl in bids),
+            key=lambda x: x.price_cents,
+        )
+        return no_bids, no_asks

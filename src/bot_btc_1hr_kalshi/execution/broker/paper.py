@@ -102,9 +102,9 @@ class PaperBroker:
                 fills=tuple(fills),
             )
 
-        # Maker: refuse if it would cross
-        best_bid = book.best_bid
-        best_ask = book.best_ask
+        # Maker: refuse if it would cross. Compare in side-specific price space.
+        best_bid = book.best_bid_for(req.side)
+        best_ask = book.best_ask_for(req.side)
         if req.action == "BUY" and best_ask is not None and req.limit_price_cents >= best_ask.price_cents:
             return _reject(req, "maker_would_cross")
         if req.action == "SELL" and best_bid is not None and req.limit_price_cents <= best_bid.price_cents:
@@ -123,7 +123,7 @@ class PaperBroker:
     def _fill_ioc(
         self, order_id: str, req: OrderRequest, book: L2Book
     ) -> tuple[list[Fill], int]:
-        bids, asks = book.snapshot_levels()
+        bids, asks = book.snapshot_levels_for(req.side)
         levels = asks if req.action == "BUY" else bids
         remaining = req.contracts
         fills: list[Fill] = []

@@ -92,7 +92,9 @@ class PositionMonitor:
         if not book.valid:
             return MonitorTick(position_id=pos.position_id, action="skip_book_invalid")
 
-        best_bid = book.best_bid
+        # Evaluate in the position's own price space (YES-position → YES bid,
+        # NO-position → NO bid which is 100 - YES ask).
+        best_bid = book.best_bid_for(pos.side)
         if best_bid is None:
             return MonitorTick(position_id=pos.position_id, action="noop")
 
