@@ -42,6 +42,18 @@ class L2Book:
     def last_seq(self) -> int | None:
         return self._last_seq
 
+    def invalidate(self, reason: str) -> None:
+        """Mark the book INVALID (hard rule #9). Callers downstream of a WS
+        reconnect, a snapshot-rebuild trigger, or any other event that breaks
+        our view of resting liquidity must call this before the next feature
+        evaluation. Book remains INVALID until the next snapshot replays the
+        full state."""
+        self._valid = False
+        self._invalidation_reason = reason
+        self._last_seq = None
+        self._bids.clear()
+        self._asks.clear()
+
     def apply(self, update: BookUpdate) -> None:
         """Apply a book update. Detects seq gaps and invalidates on mismatch."""
         if update.market_id != self._market_id:

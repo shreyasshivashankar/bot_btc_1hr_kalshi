@@ -287,3 +287,45 @@ async def test_submit_exit_on_unknown_position_raises() -> None:
             limit_price_cents=28,
             exit_reason="soft_stop",
         )
+
+
+def test_aggregate_sell_fill_uses_round_half_up_not_bankers() -> None:
+    """Python's built-in round() is banker's rounding — round(0.5) == 0.
+    For VWAP cents, we want half-away-from-zero so accumulated fills do not
+    drift toward even values over time."""
+    from bot_btc_1hr_kalshi.execution.broker.base import Fill
+    from bot_btc_1hr_kalshi.execution.oms import _aggregate_sell_fill
+
+    # 50 @ 40¢ + 50 @ 41¢ → notional = 4050¢, total = 100 → exactly 40.5¢.
+    # round() gives 40 (banker's), round-half-up gives 41.
+    fills = (
+        Fill(order_id="o", client_order_id="c", market_id="M", side="YES",
+             action="SELL", price_cents=40, contracts=50, ts_ns=100, fees_usd=0.0),
+        Fill(order_id="o", client_order_id="c", market_id="M", side="YES",
+             action="SELL", price_cents=41, contracts=50, ts_ns=200, fees_usd=0.0),
+    )
+    agg = _aggregate_sell_fill(fills)
+    assert agg.price_cents == 41
+    assert agg.contracts == 100
+    # First fill's timestamp anchors the aggregate — this is when the IOC
+    # began executing. Changing this re-aligns latency attribution, so pin it.
+    assert agg.ts_ns == 100
+
+
+def test_aggregate_sell_fill_sums_fees_and_contracts() -> None:
+    from bot_btc_1hr_kalshi.execution.broker.base import Fill
+    from bot_btc_1hr_kalshi.execution.oms import _aggregate_sell_fill
+
+    fills = (
+        Fill(order_id="o", client_order_id="c", market_id="M", side="YES",
+             action="SELL", price_cents=30, contracts=10, ts_ns=1, fees_usd=0.10),
+        Fill(order_id="o", client_order_id="c", market_id="M", side="YES",
+             action="SELL", price_cents=31, contracts=20, ts_ns=2, fees_usd=0.20),
+        Fill(order_id="o", client_order_id="c", market_id="M", side="YES",
+             action="SELL", price_cents=32, contracts=30, ts_ns=3, fees_usd=0.30),
+    )
+    agg = _aggregate_sell_fill(fills)
+    assert agg.contracts == 60
+    assert agg.fees_usd == pytest.approx(0.60)
+    # weighted avg = (30*10 + 31*20 + 32*30) / 60 = 1880/60 ≈ 31.333 → 31 cents
+    assert agg.price_cents == 31

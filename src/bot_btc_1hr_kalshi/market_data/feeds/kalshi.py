@@ -53,6 +53,7 @@ class KalshiFeed:
         backoff_initial_sec: float = 1.0,
         backoff_max_sec: float = 30.0,
         sleep: Callable[[float], Awaitable[Any]] | None = None,
+        on_reconnect: Callable[[str], None] | None = None,
     ) -> None:
         if not market_tickers:
             raise ValueError("market_tickers must be non-empty")
@@ -64,6 +65,7 @@ class KalshiFeed:
         self._backoff_initial = backoff_initial_sec
         self._backoff_max = backoff_max_sec
         self._sleep = sleep or _default_sleep
+        self._on_reconnect = on_reconnect
         self._req_id = 0
 
     async def events(self) -> AsyncIterator[FeedEvent]:
@@ -75,6 +77,15 @@ class KalshiFeed:
                     yield ev
             except SessionEndedError as exc:
                 _log.warning("feed.kalshi.reconnect", reason=str(exc), backoff_sec=backoff)
+                # Hard rule #9: book-derived features must be INVALID after a
+                # WS cycle until a fresh snapshot rebuilds the book. Notify
+                # before sleeping so the gate flips in the same event loop
+                # tick as the connection loss.
+                if self._on_reconnect is not None:
+                    try:
+                        self._on_reconnect(str(exc))
+                    except Exception as cb_exc:
+                        _log.warning("feed.kalshi.on_reconnect_error", error=str(cb_exc))
                 await self._sleep(backoff)
                 backoff = min(self._backoff_max, backoff * 2.0)
 
@@ -88,7 +99,6 @@ class KalshiFeed:
             self._req_id += 1
             await conn.send(build_subscribe(req_id=self._req_id, market_tickers=self._tickers))
             async for raw in conn:
-                self._staleness.mark()
                 try:
                     ev = parse_frame(raw, recv_ts_ns=self._clock.now_ns())
                 except KalshiParseError as exc:
@@ -96,6 +106,11 @@ class KalshiFeed:
                     continue
                 if ev is None:
                     continue
+                # Staleness is measured against the exchange-emitted event
+                # timestamp, not our receive time. A backlogged WS queue
+                # masquerading as "fresh" recv prints was the whole reason
+                # hard rule #4 exists (market-data staleness > 2s → halt).
+                self._staleness.mark_at(ev.ts_ns)
                 yield ev
         finally:
             try:

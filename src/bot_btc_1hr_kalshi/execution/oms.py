@@ -236,7 +236,11 @@ def _aggregate_sell_fill(fills: tuple[Fill, ...]) -> Fill:
     total = sum(f.contracts for f in fills)
     notional_cents = sum(f.price_cents * f.contracts for f in fills)
     fees = sum(f.fees_usd for f in fills)
-    vwap = round(notional_cents / total)
+    # Integer round-half-up. Built-in `round()` is banker's rounding in 3.x,
+    # which on .5 drifts toward even and biases cumulative VWAPs. The
+    # `(n + d/2) // d` form rounds half away from zero for non-negative ints
+    # and keeps cents math deterministic under replay.
+    vwap = (notional_cents + total // 2) // total
     f0 = fills[0]
     return Fill(
         order_id=f0.order_id,
@@ -246,6 +250,12 @@ def _aggregate_sell_fill(fills: tuple[Fill, ...]) -> Fill:
         action=f0.action,
         price_cents=vwap,
         contracts=total,
-        ts_ns=fills[-1].ts_ns,
+        # Use the first fill's timestamp: it is the moment our IOC began
+        # executing against the book. Sub-ms differences between first and
+        # last prints do not meaningfully change our exit-time semantics,
+        # but anchoring at the first print pairs cleanly with the order
+        # submission timestamp and matches how downstream latency tracking
+        # attributes the exit to the tick that triggered it.
+        ts_ns=fills[0].ts_ns,
         fees_usd=fees,
     )

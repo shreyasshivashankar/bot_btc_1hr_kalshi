@@ -203,3 +203,118 @@ async def test_list_positions_raises_on_non_200() -> None:
     broker = KalshiBroker(client=_client(httpx.MockTransport(handler)), signer=_signer(clock), clock=clock)
     with pytest.raises(KalshiBrokerError):
         await broker.list_positions()
+
+
+async def test_429_retries_with_backoff_and_eventually_succeeds() -> None:
+    attempts = {"n": 0}
+    sleeps: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts["n"] += 1
+        if attempts["n"] <= 2:
+            return httpx.Response(429, headers={"Retry-After": "0.1"}, content=b"slow down")
+        return httpx.Response(200, content=orjson.dumps({
+            "order": {"order_id": "ord-1", "client_order_id": "c1", "status": "resting",
+                      "count": 5, "remaining_count": 5, "fills": []}
+        }))
+
+    async def fake_sleep(sec: float) -> None:
+        sleeps.append(sec)
+
+    clock = ManualClock(1)
+    broker = KalshiBroker(
+        client=_client(httpx.MockTransport(handler)),
+        signer=_signer(clock),
+        clock=clock,
+        sleep=fake_sleep,
+        retry_initial_sec=0.05,
+    )
+    ack = await broker.submit(_req())
+    assert ack.status == "resting"
+    assert attempts["n"] == 3
+    # Retry-After header honored: both sleeps should equal 0.1 s.
+    assert sleeps == [0.1, 0.1]
+
+
+async def test_429_exhausted_raises_broker_error() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(429, headers={"Retry-After": "0.01"}, content=b"too many")
+
+    async def fake_sleep(sec: float) -> None:
+        return None
+
+    clock = ManualClock(1)
+    broker = KalshiBroker(
+        client=_client(httpx.MockTransport(handler)),
+        signer=_signer(clock),
+        clock=clock,
+        sleep=fake_sleep,
+        max_retries=2,
+        retry_initial_sec=0.01,
+    )
+    with pytest.raises(KalshiBrokerError, match="rate_limited_exhausted"):
+        await broker.submit(_req())
+
+
+async def test_429_falls_back_to_jitter_when_no_retry_after() -> None:
+    attempts = {"n": 0}
+    sleeps: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            return httpx.Response(429, content=b"slow down")
+        return httpx.Response(200, content=orjson.dumps({
+            "order": {"order_id": "ord-1", "client_order_id": "c1", "status": "resting",
+                      "count": 5, "remaining_count": 5, "fills": []}
+        }))
+
+    async def fake_sleep(sec: float) -> None:
+        sleeps.append(sec)
+
+    clock = ManualClock(1)
+    broker = KalshiBroker(
+        client=_client(httpx.MockTransport(handler)),
+        signer=_signer(clock),
+        clock=clock,
+        sleep=fake_sleep,
+        rng=lambda: 0.5,  # deterministic jitter
+        retry_initial_sec=0.2,
+    )
+    ack = await broker.submit(_req())
+    assert ack.status == "resting"
+    # Full-jitter: 0.5 * initial_backoff (0.2) = 0.1.
+    assert sleeps == [0.1]
+
+
+async def test_429_resigns_every_attempt() -> None:
+    """Every attempt must re-invoke the signer — the signature embeds the
+    wall-clock timestamp, and a stale ts fails Kalshi's auth window."""
+    timestamps: list[str] = []
+    attempts = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts["n"] += 1
+        timestamps.append(request.headers["KALSHI-ACCESS-TIMESTAMP"])
+        if attempts["n"] == 1:
+            return httpx.Response(429, headers={"Retry-After": "0"}, content=b"")
+        return httpx.Response(200, content=orjson.dumps({
+            "order": {"order_id": "ord-1", "client_order_id": "c1", "status": "resting",
+                      "count": 1, "remaining_count": 1, "fills": []}
+        }))
+
+    async def fake_sleep(sec: float) -> None:
+        clock.advance_ns(5_000_000_000)  # 5 seconds — past typical signing window
+
+    clock = ManualClock(1_700_000_000_000_000_000)
+    broker = KalshiBroker(
+        client=_client(httpx.MockTransport(handler)),
+        signer=_signer(clock),
+        clock=clock,
+        sleep=fake_sleep,
+        retry_initial_sec=0.05,
+    )
+    ack = await broker.submit(_req())
+    assert ack.status == "resting"
+    assert len(timestamps) == 2
+    assert timestamps[0] != timestamps[1]  # different ts_ms → different signatures

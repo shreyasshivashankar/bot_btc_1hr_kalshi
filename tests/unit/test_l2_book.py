@@ -131,3 +131,35 @@ def test_zero_size_in_snapshot_is_dropped() -> None:
     b = L2Book("BTC-1H")
     b.apply(_snapshot(1, [(40, 100), (39, 0)], [(42, 80)]))
     assert 39 not in b.snapshot_levels()[0]
+
+
+def test_invalidate_clears_book_and_marks_invalid() -> None:
+    """Hard rule #9: a reconnect / external invalidate must make all book-
+    derived features treat the book as INVALID and must not leak the stale
+    prices that remained from the prior session."""
+    b = L2Book("BTC-1H")
+    b.apply(_snapshot(10, [(40, 100)], [(42, 80)]))
+    assert b.valid
+    assert b.best_bid is not None
+
+    b.invalidate("reconnect")
+
+    assert not b.valid
+    assert b.invalidation_reason == "reconnect"
+    assert b.best_bid is None
+    assert b.best_ask is None
+    assert b.last_seq is None
+    assert b.book_depth() == 0.0
+
+
+def test_snapshot_after_invalidate_restores_validity() -> None:
+    b = L2Book("BTC-1H")
+    b.apply(_snapshot(10, [(40, 100)], [(42, 80)]))
+    b.invalidate("reconnect")
+
+    # A fresh snapshot must rebuild fully — and crucially, the seq-gap
+    # detector must not re-trigger on the first post-invalidate snapshot.
+    b.apply(_snapshot(500, [(41, 55)], [(43, 45)]))
+    assert b.valid
+    assert b.invalidation_reason is None
+    assert b.best_bid == BookLevel(41, 55)

@@ -14,6 +14,9 @@ go through an injected `httpx.AsyncClient` so tests can use MockTransport.
 
 from __future__ import annotations
 
+import asyncio
+import random
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 import httpx
@@ -86,25 +89,83 @@ class KalshiBroker:
         signer: KalshiSigner,
         clock: Clock,
         api_base: str = "/trade-api/v2",
+        max_retries: int = 3,
+        retry_initial_sec: float = 0.25,
+        retry_max_sec: float = 8.0,
+        sleep: Callable[[float], Awaitable[None]] | None = None,
+        rng: Callable[[], float] | None = None,
     ) -> None:
+        if max_retries < 0:
+            raise ValueError("max_retries must be >= 0")
+        if retry_initial_sec <= 0:
+            raise ValueError("retry_initial_sec must be > 0")
+        if retry_max_sec < retry_initial_sec:
+            raise ValueError("retry_max_sec must be >= retry_initial_sec")
         self._client = client
         self._signer = signer
         self._clock = clock
         self._base = api_base.rstrip("/")
+        self._max_retries = max_retries
+        self._retry_initial = retry_initial_sec
+        self._retry_max = retry_max_sec
+        self._sleep = sleep or asyncio.sleep
+        self._rng = rng or random.random
 
     async def _request(
         self, method: str, path: str, *, body: bytes | None = None
     ) -> httpx.Response:
         full_path = f"{self._base}{path}"
-        headers = self._signer.headers(method=method, path=full_path)
-        if body is not None:
-            headers["Content-Type"] = "application/json"
-        resp = await self._client.request(method, full_path, headers=headers, content=body)
-        if resp.status_code >= 500:
-            raise KalshiBrokerError(f"{method} {full_path} → {resp.status_code}: {resp.text}")
-        if resp.status_code == 401:
-            raise KalshiBrokerError(f"auth_failed: {resp.text}")
-        return resp
+        backoff = self._retry_initial
+        # We re-sign every attempt because the timestamp is part of the
+        # signature — a replay that crosses the server's ts-window is
+        # auth-rejected (hard rule #5 spirit: clock is authoritative).
+        for attempt in range(self._max_retries + 1):
+            headers = self._signer.headers(method=method, path=full_path)
+            if body is not None:
+                headers["Content-Type"] = "application/json"
+            resp = await self._client.request(
+                method, full_path, headers=headers, content=body,
+            )
+            if resp.status_code == 429:
+                if attempt >= self._max_retries:
+                    # Retries exhausted. Surface as an error, don't return
+                    # the 429 as if it were a routine rejection — the caller
+                    # needs to halt/alert rather than silently retry at the
+                    # OMS layer.
+                    break
+                retry_after = _parse_retry_after(resp)
+                # Full jitter: sleep ∈ [0, backoff). Server Retry-After wins
+                # if present, since the exchange is telling us exactly how
+                # long to wait (and crossing it is grounds for a 1hr ban).
+                sleep_for = (
+                    retry_after
+                    if retry_after is not None
+                    else self._rng() * backoff
+                )
+                _log.warning(
+                    "broker.kalshi.rate_limited",
+                    method=method,
+                    path=full_path,
+                    attempt=attempt + 1,
+                    sleep_sec=sleep_for,
+                    retry_after_header=retry_after,
+                )
+                await self._sleep(sleep_for)
+                backoff = min(self._retry_max, backoff * 2.0)
+                continue
+            if resp.status_code >= 500:
+                raise KalshiBrokerError(
+                    f"{method} {full_path} → {resp.status_code}: {resp.text}"
+                )
+            if resp.status_code == 401:
+                raise KalshiBrokerError(f"auth_failed: {resp.text}")
+            return resp
+        # Retries exhausted on 429. A persistent rate-limit at this point
+        # means the caller should surface the failure; do not silently
+        # succeed with the last 429 response.
+        raise KalshiBrokerError(
+            f"rate_limited_exhausted: {method} {full_path} after {self._max_retries} retries"
+        )
 
     async def submit(self, req: OrderRequest) -> OrderAck:
         body = orjson.dumps({
@@ -189,6 +250,23 @@ class KalshiBroker:
                 avg_entry_price_cents=avg_entry,
             ))
         return tuple(out)
+
+
+def _parse_retry_after(resp: httpx.Response) -> float | None:
+    """Parse Retry-After (RFC 7231). Kalshi sends integer seconds; we ignore
+    HTTP-date forms for now since the exchange does not emit them. Returns
+    None on any parse failure so the caller falls back to exponential
+    backoff with jitter."""
+    raw = resp.headers.get("Retry-After") or resp.headers.get("retry-after")
+    if not raw:
+        return None
+    try:
+        val = float(raw.strip())
+    except ValueError:
+        return None
+    if val < 0:
+        return None
+    return val
 
 
 def _reason_from_body(resp: httpx.Response) -> str:
