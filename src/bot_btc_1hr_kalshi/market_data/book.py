@@ -63,16 +63,22 @@ class L2Book:
             self._valid = True
             self._invalidation_reason = None
         else:
+            # Deltas are signed quantity changes; accumulate onto the existing
+            # level. A running total of ≤0 means the level is fully cleared.
+            # (See BookUpdate docstring — masking negatives would erase every
+            # resting quote on partial fills.)
             for lvl in update.bids:
-                if lvl.size == 0:
+                new_size = self._bids.get(lvl.price_cents, 0) + lvl.size
+                if new_size <= 0:
                     self._bids.pop(lvl.price_cents, None)
                 else:
-                    self._bids[lvl.price_cents] = lvl.size
+                    self._bids[lvl.price_cents] = new_size
             for lvl in update.asks:
-                if lvl.size == 0:
+                new_size = self._asks.get(lvl.price_cents, 0) + lvl.size
+                if new_size <= 0:
                     self._asks.pop(lvl.price_cents, None)
                 else:
-                    self._asks[lvl.price_cents] = lvl.size
+                    self._asks[lvl.price_cents] = new_size
 
         self._last_seq = update.seq
 

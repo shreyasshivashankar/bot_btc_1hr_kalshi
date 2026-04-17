@@ -23,8 +23,17 @@ class BookLevel:
 
 @dataclass(frozen=True, slots=True)
 class BookUpdate:
-    """A Kalshi L2 update. `is_snapshot=True` replaces the book; False applies
-    as a delta where size=0 means remove that price level."""
+    """A Kalshi L2 update.
+
+    `is_snapshot=True`: each `BookLevel.size` is the absolute resting quantity
+    at that price (0 = no resting liquidity; the book replaces its state).
+
+    `is_snapshot=False`: each `BookLevel.size` is a *signed delta* — the
+    quantity change at that price level. The consumer accumulates it onto
+    the existing size and removes the level if the running total falls to
+    ≤0. This matches Kalshi's wire semantics; masking negative deltas to 0
+    would wipe out resting liquidity on every partial fill (see
+    `L2Book.apply`)."""
 
     seq: int
     ts_ns: int

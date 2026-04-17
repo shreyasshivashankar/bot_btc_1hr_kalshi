@@ -106,18 +106,19 @@ def parse_frame(raw: bytes | str, *, recv_ts_ns: int) -> BookUpdate | TradeEvent
         side = msg["side"]
         price = int(msg["price"])
         delta = int(msg["delta"])
-        # Kalshi deltas are signed quantity changes; our BookUpdate models
-        # absolute post-change size. The transport layer maintains a shadow
-        # book to convert deltas → absolute sizes before applying; here we
-        # encode the raw per-level change as a single-level update.
+        # Kalshi deltas are signed quantity changes; we pass the signed value
+        # through unchanged. L2Book accumulates onto the existing level and
+        # removes it when the running total reaches ≤0. Masking negatives to
+        # 0 here (as we previously did) would cause L2Book to treat every
+        # partial fill as "remove this entire price level" and wipe the book.
         bids: tuple[BookLevel, ...]
         asks: tuple[BookLevel, ...]
         if side == "yes":
-            bids = (BookLevel(price_cents=price, size=max(delta, 0)),)
+            bids = (BookLevel(price_cents=price, size=delta),)
             asks = ()
         elif side == "no":
             bids = ()
-            asks = (BookLevel(price_cents=100 - price, size=max(delta, 0)),)
+            asks = (BookLevel(price_cents=100 - price, size=delta),)
         else:
             raise KalshiParseError(f"unknown side: {side}")
         return BookUpdate(

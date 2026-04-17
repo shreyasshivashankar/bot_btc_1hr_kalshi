@@ -61,11 +61,30 @@ def test_snapshot_makes_book_valid() -> None:
 def test_delta_inserts_and_removes() -> None:
     b = L2Book("BTC-1H")
     b.apply(_snapshot(1, [(40, 100)], [(42, 80)]))
-    b.apply(_delta(2, [(41, 25)], []))  # new bid tier
+    b.apply(_delta(2, [(41, 25)], []))  # +25 at new tier
     assert b.best_bid == BookLevel(41, 25)
 
-    b.apply(_delta(3, [(41, 0)], []))  # remove that tier
+    b.apply(_delta(3, [(41, -25)], []))  # cancel the 25 → tier removed
     assert b.best_bid == BookLevel(40, 100)
+
+
+def test_delta_partial_fill_preserves_resting_size() -> None:
+    """Regression: a signed negative delta must subtract from the resting
+    quantity, not pop the entire level. Previously the parser masked
+    negatives to 0 and L2Book treated size=0 as a level-remove, so a single
+    10-lot partial fill would wipe the other 490 contracts at that price."""
+    b = L2Book("BTC-1H")
+    b.apply(_snapshot(1, [(40, 500)], [(42, 80)]))
+
+    b.apply(_delta(2, [(40, -10)], []))
+    assert b.best_bid == BookLevel(40, 490)
+
+    b.apply(_delta(3, [(40, 50)], []))
+    assert b.best_bid == BookLevel(40, 540)
+
+    b.apply(_delta(4, [(40, -540)], []))
+    assert b.best_bid is None  # only bid tier cleared
+    assert b.valid  # cleanly subtracted, not gap-invalidated
 
 
 def test_seq_gap_invalidates_book() -> None:

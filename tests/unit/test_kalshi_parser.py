@@ -50,6 +50,20 @@ def test_parses_orderbook_delta_yes_side() -> None:
     assert ev.asks == ()
 
 
+def test_parses_orderbook_delta_negative_signed_through() -> None:
+    """Regression: negative deltas (partial fills / cancels) must pass through
+    as signed values — not be masked to 0, which would cause L2Book to wipe
+    the level."""
+    frame = _enc({
+        "type": "orderbook_delta",
+        "msg": {"market_ticker": "M", "seq": 7, "price": 38, "delta": -10, "side": "yes"},
+    })
+    ev = parse_frame(frame, recv_ts_ns=RECV_NS)
+    assert isinstance(ev, BookUpdate)
+    assert ev.bids[0].size == -10
+    assert ev.asks == ()
+
+
 def test_parses_orderbook_delta_no_side_flips_to_yes_ask() -> None:
     frame = _enc({
         "type": "orderbook_delta",
