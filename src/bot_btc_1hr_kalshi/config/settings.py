@@ -78,6 +78,21 @@ class TelemetrySettings(BaseModel):
     bq_table: str
 
 
+class CalendarSettings(BaseModel):
+    """Structured economic-calendar configuration (hard rule #8).
+
+    `path` is relative to the config directory. Absent / empty means the
+    guard runs with zero scheduled events — the human kill-switch remains
+    the only override path.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    path: str | None = None
+    lead_seconds: float = Field(gt=0.0, default=60.0)
+    tick_interval_sec: float = Field(gt=0.0, default=5.0)
+
+
 class Settings(BaseModel):
     """Top-level configuration. Loaded from config/{mode}.yaml by loader.py."""
 
@@ -90,3 +105,4 @@ class Settings(BaseModel):
     monitor: MonitorSettings
     execution: ExecutionSettings
     telemetry: TelemetrySettings
+    calendar: CalendarSettings = CalendarSettings()
