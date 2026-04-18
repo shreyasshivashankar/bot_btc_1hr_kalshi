@@ -24,7 +24,9 @@ from bot_btc_1hr_kalshi.admin.server import create_app as create_admin_app
 from bot_btc_1hr_kalshi.app import App
 from bot_btc_1hr_kalshi.config.loader import load_settings
 from bot_btc_1hr_kalshi.config.settings import Mode
+from bot_btc_1hr_kalshi.execution.broker.base import Broker
 from bot_btc_1hr_kalshi.execution.broker.paper import PaperBroker
+from bot_btc_1hr_kalshi.execution.broker.shadow import ShadowBroker
 from bot_btc_1hr_kalshi.execution.oms import OMS
 from bot_btc_1hr_kalshi.monitor.position_monitor import PositionMonitor
 from bot_btc_1hr_kalshi.obs.clock import SystemClock
@@ -51,6 +53,31 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return p.parse_args(argv)
 
 
+def _broker_for_mode(mode: Mode, *, clock: SystemClock) -> Broker:
+    """Select the broker for the given mode.
+
+    dev / paper: local paper broker (in-proc fill simulation).
+    shadow:      no-wire shadow broker (records intents only — hard rule #2).
+    live:        a real Kalshi broker would be wired here; TODO as Slice 4F.
+
+    Live is deliberately not wired in this function yet: the Kalshi broker
+    needs httpx.AsyncClient + Secret Manager for keys, and that wiring is
+    a separate change. Raise explicitly so `--mode live` fails loudly
+    rather than silently running against PaperBroker — which would be a
+    hard-rule-#2 violation waiting to happen.
+    """
+    if mode in ("dev", "paper"):
+        return PaperBroker(clock=clock)
+    if mode == "shadow":
+        return ShadowBroker(clock=clock)
+    if mode == "live":
+        raise NotImplementedError(
+            "live broker wiring is not yet complete — Kalshi REST broker "
+            "requires httpx client + Secret Manager key loading (Slice 4F)",
+        )
+    raise ValueError(f"unknown mode: {mode}")
+
+
 def build_app(
     *,
     mode: Mode,
@@ -68,7 +95,7 @@ def build_app(
     store = JsonFileBreakerStore(state_path) if state_path else NullBreakerStore()
     breakers = BreakerState(store=store)
     portfolio = Portfolio(bankroll_usd=bankroll)
-    broker = PaperBroker(clock=clock)
+    broker: Broker = _broker_for_mode(mode, clock=clock)
     oms = OMS(
         broker=broker,
         portfolio=portfolio,
