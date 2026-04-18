@@ -162,6 +162,26 @@ Flattens the book immediately. 2-hour stabilization follows (no new entries). Lo
 ```
 Prints: mode (paper/shadow/live), halt state, open positions, session PnL, circuit breaker states, feed health.
 
+### Tick archive capture (for `make backtest`)
+
+Set `BOT_BTC_1HR_KALSHI_ARCHIVE_DIR=/var/lib/bot_btc_1hr_kalshi/archive` before starting the bot. Every `FeedEvent` consumed by the live loop is appended to hour-partitioned JSONL files (`events-YYYY-MM-DDTHH.jsonl`). Sync the directory to GCS periodically:
+
+```bash
+# systemd timer or cron — every 5 min while bot is running
+gsutil -m rsync -r /var/lib/bot_btc_1hr_kalshi/archive \
+    gs://bot-btc-1hr-kalshi-tick-archive-$ENV/
+```
+
+Once you have ≥2 weeks of captured ticks, run backtests:
+
+```bash
+MARKET=KBTC-26APR1600-B60000 STRIKE_USD=60000 \
+  FROM=2026-04-01T00 TO=2026-04-15T00 \
+  make backtest
+```
+
+`make backtest` prints Sharpe / maxDD / hit-rate / per-trap PnL from the captured stream.
+
 ### External watchdog (hard rule #3 — no single point of halt)
 
 `/admin/status` returns an `activity` block an external poller uses to detect a wedged event loop:

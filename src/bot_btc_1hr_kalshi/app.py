@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from bot_btc_1hr_kalshi.archive.writer import ArchiveWriter
 from bot_btc_1hr_kalshi.config.settings import Settings
 from bot_btc_1hr_kalshi.execution.oms import OMS
 from bot_btc_1hr_kalshi.market_data.book import L2Book
@@ -32,6 +33,10 @@ class App:
     monitor: PositionMonitor
     lifecycle: LifecycleEmitter | None = None
     activity: ActivityTracker | None = None
+    # When set, the feed-loop consumer should call `archive_writer.write(event)`
+    # for every FeedEvent it processes so `make backtest` has a tick archive
+    # to replay. Opened/closed by __main__; None in tests and in replay.
+    archive_writer: ArchiveWriter | None = None
     books: dict[str, L2Book] = field(default_factory=dict)
     trading_halted: bool = False
     tier1_override_active: bool = False

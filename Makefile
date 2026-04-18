@@ -51,8 +51,13 @@ test-fast:  ## Unit tests only, skip lint/typecheck
 replay:  ## Replay captured tick data (requires ./data/ticks/ — see scripts/fetch_ticks.sh)
 	$(VENV_PY) -m bot_btc_1hr_kalshi.research.replay --data ./data/ticks
 
-backtest:  ## Walk-forward backtest — prints Sharpe / maxDD / hit rate
-	$(VENV_PY) -m bot_btc_1hr_kalshi.research.backtest --data ./data/ticks
+backtest:  ## Replay tick archive -> Sharpe / maxDD / hit rate. Requires MARKET, STRIKE_USD.
+	$(VENV_PY) -m bot_btc_1hr_kalshi.research.backtest_cli \
+	  --archive-dir $${ARCHIVE_DIR:-./archive} \
+	  --market $${MARKET:?set MARKET=KBTC-...} \
+	  --strike-usd $${STRIKE_USD:?set STRIKE_USD=60000} \
+	  --bankroll $${BANKROLL:-1000} \
+	  $${FROM:+--from $$FROM} $${TO:+--to $$TO}
 
 paper:  ## Live market data, simulated fills, no real orders
 	BOT_BTC_1HR_KALSHI_MODE=paper $(VENV_PY) -m bot_btc_1hr_kalshi

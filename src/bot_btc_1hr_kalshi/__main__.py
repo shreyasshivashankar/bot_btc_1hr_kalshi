@@ -17,11 +17,13 @@ import asyncio
 import os
 import signal
 import sys
+from pathlib import Path
 
 import uvicorn
 
 from bot_btc_1hr_kalshi.admin.server import create_app as create_admin_app
 from bot_btc_1hr_kalshi.app import App
+from bot_btc_1hr_kalshi.archive.writer import ArchiveWriter
 from bot_btc_1hr_kalshi.config.loader import load_settings
 from bot_btc_1hr_kalshi.config.settings import Mode
 from bot_btc_1hr_kalshi.execution.broker.base import Broker
@@ -39,6 +41,7 @@ from bot_btc_1hr_kalshi.risk.breaker_store import JsonFileBreakerStore, NullBrea
 from bot_btc_1hr_kalshi.risk.breakers import BreakerState
 
 BREAKER_STATE_PATH_ENV = "BOT_BTC_1HR_KALSHI_BREAKER_STATE_PATH"
+ARCHIVE_DIR_ENV = "BOT_BTC_1HR_KALSHI_ARCHIVE_DIR"
 
 DEFAULT_ADMIN_TOKEN_ENV = "BOT_BTC_1HR_KALSHI_ADMIN_TOKEN"  # noqa: S105 — env var name, not a secret
 PAPER_LIVE_MODES: tuple[Mode, ...] = ("dev", "paper", "shadow", "live")
@@ -86,8 +89,6 @@ def build_app(
     bankroll: float,
     config_dir: str | None,
 ) -> App:
-    from pathlib import Path
-
     settings = load_settings(
         mode,
         config_dir=Path(config_dir) if config_dir else None,
@@ -100,6 +101,8 @@ def build_app(
     broker: Broker = _broker_for_mode(mode, clock=clock)
     lifecycle = LifecycleEmitter(clock=clock)
     activity = ActivityTracker(boot_ns=clock.now_ns())
+    archive_dir = os.getenv(ARCHIVE_DIR_ENV)
+    archive_writer = ArchiveWriter(Path(archive_dir)) if archive_dir else None
     oms = OMS(
         broker=broker,
         portfolio=portfolio,
@@ -120,6 +123,7 @@ def build_app(
         monitor=monitor,
         lifecycle=lifecycle,
         activity=activity,
+        archive_writer=archive_writer,
     )
 
 
@@ -162,6 +166,8 @@ async def serve(app: App, *, admin_token: str, host: str, port: int) -> None:
     try:
         await server.serve()
     finally:
+        if app.archive_writer is not None:
+            app.archive_writer.close()
         if app.portfolio.open_positions:
             log.error(
                 "shutdown.open_positions_remain",
