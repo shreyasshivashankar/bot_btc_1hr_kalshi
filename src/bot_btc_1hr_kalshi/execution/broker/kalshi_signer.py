@@ -8,8 +8,11 @@ Kalshi's trading-api authenticates each REST request with three headers:
 The signature covers the timestamp, HTTP method (uppercase) and path (URL
 path only, without scheme/host/query).
 
-Private keys are PEM-encoded RSA keys, loaded from Secret Manager via env
-var `BOT_BTC_1HR_KALSHI_API_SECRET` (hard rule #4).
+Private keys are PEM-encoded RSA files. The boot wiring reads the PEM file
+at the path in `BOT_BTC_1HR_KALSHI_PRIVATE_KEY_PATH` and passes the bytes
+into this class (hard rule #4). On Cloud Run, Secret Manager mounts the
+PEM as a file at that path; locally the env var points to a file on disk.
+The signer itself is path-agnostic — it just takes bytes.
 """
 
 from __future__ import annotations

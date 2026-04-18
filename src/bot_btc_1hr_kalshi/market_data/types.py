@@ -12,7 +12,7 @@ from typing import Literal
 from bot_btc_1hr_kalshi.obs.money import MICROS_PER_USD, Micros
 from bot_btc_1hr_kalshi.obs.schemas import Side
 
-Venue = Literal["kalshi", "coinbase", "binance"]
+Venue = Literal["kalshi", "coinbase", "kraken"]
 AggressorSide = Literal["buy", "sell"]
 
 
@@ -59,7 +59,7 @@ class TradeEvent:
 
 @dataclass(frozen=True, slots=True)
 class SpotTick:
-    """A trade print on a spot venue (Coinbase/Binance).
+    """A trade print on a spot venue (Coinbase primary / Kraken confirmation).
 
     Price is stored as integer micro-dollars (1 USD = 1_000_000 micros).
     BTC-USD spot venues quote to cent precision; micros gives us 4 extra

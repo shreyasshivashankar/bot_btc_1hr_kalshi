@@ -28,6 +28,8 @@ def _features(
     pct_b: float = -0.5,
     regime_vol: RegimeVol = "normal",
     regime_trend: Literal["up", "down", "flat"] = "flat",
+    rsi_5m: float | None = None,
+    rsi_1h: float | None = None,
 ) -> Features:
     return Features(
         regime_trend=regime_trend,
@@ -39,6 +41,8 @@ def _features(
         spread_cents=2,
         spot_btc_usd=60_000.0,
         minutes_to_settlement=30.0,
+        rsi_5m=rsi_5m,
+        rsi_1h=rsi_1h,
     )
 
 
@@ -110,3 +114,73 @@ def test_edge_scales_with_confidence_and_discount() -> None:
     less_cheap = detect_floor_reversion(_snap(ask_price=35, pct_b=-0.9), min_confidence=0.3)
     assert cheap is not None and less_cheap is not None
     assert cheap.edge_cents > less_cheap.edge_cents
+
+
+# ---- HTF alignment (Slice 8) -------------------------------------------------
+
+
+def test_htf_veto_rejects_long_when_1h_rsi_bearish() -> None:
+    # 1H RSI 40 < 45 (default bearish veto) — trap must not fire even with
+    # a strong pct_b and confirming 5m oversold reading.
+    sig = detect_floor_reversion(
+        _snap(ask_price=20, pct_b=-0.9, rsi_1h=40.0, rsi_5m=25.0),
+        min_confidence=0.3,
+    )
+    assert sig is None
+
+
+def test_htf_veto_passes_when_1h_rsi_neutral_or_bullish() -> None:
+    # RSI 50 >= 45 threshold — macro not bearish → trap fires.
+    sig = detect_floor_reversion(
+        _snap(ask_price=20, pct_b=-0.9, rsi_1h=50.0),
+        min_confidence=0.3,
+    )
+    assert sig is not None
+
+
+def test_htf_veto_fails_open_during_warmup() -> None:
+    # rsi_1h=None (warmup) must not block the trap — matches pre-Slice-8 behavior.
+    sig = detect_floor_reversion(
+        _snap(ask_price=20, pct_b=-0.9, rsi_1h=None),
+        min_confidence=0.3,
+    )
+    assert sig is not None
+
+
+def test_rsi_5m_weight_deep_oversold_keeps_full_confidence() -> None:
+    sig = detect_floor_reversion(
+        _snap(ask_price=20, pct_b=-0.8, rsi_5m=25.0),
+        min_confidence=0.3,
+    )
+    assert sig is not None
+    # 5m RSI <=35 → weight 1.0 → confidence == |pct_b|.
+    assert sig.confidence == 0.8
+
+
+def test_rsi_5m_weight_neutral_halves_confidence() -> None:
+    # pct_b -0.8 weighted by rsi_5m=50 gives 0.8 * 0.5 = 0.4.
+    sig = detect_floor_reversion(
+        _snap(ask_price=20, pct_b=-0.8, rsi_5m=50.0),
+        min_confidence=0.3,
+    )
+    assert sig is not None
+    assert sig.confidence == 0.4
+
+
+def test_rsi_5m_weight_can_drop_below_min_confidence() -> None:
+    # pct_b=-0.7, rsi_5m=50 → weighted confidence 0.35. min_confidence=0.4 blocks.
+    sig = detect_floor_reversion(
+        _snap(ask_price=20, pct_b=-0.7, rsi_5m=50.0),
+        min_confidence=0.4,
+    )
+    assert sig is None
+
+
+def test_htf_veto_rsi_threshold_is_configurable() -> None:
+    # Override to 40 → RSI 42 (previously vetoed at default 45) should pass.
+    sig = detect_floor_reversion(
+        _snap(ask_price=20, pct_b=-0.9, rsi_1h=42.0),
+        min_confidence=0.3,
+        htf_bearish_veto_rsi=40.0,
+    )
+    assert sig is not None

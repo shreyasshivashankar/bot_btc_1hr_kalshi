@@ -26,6 +26,9 @@
     {"name": "book_depth_at_entry", "type": "FLOAT64", "mode": "REQUIRED"},
     {"name": "spread_cents", "type": "INT64", "mode": "REQUIRED"},
     {"name": "spot_btc_usd", "type": "FLOAT64", "mode": "REQUIRED"},
-    {"name": "minutes_to_settlement", "type": "FLOAT64", "mode": "REQUIRED"}
+    {"name": "minutes_to_settlement", "type": "FLOAT64", "mode": "REQUIRED"},
+    {"name": "rsi_5m", "type": "FLOAT64", "mode": "NULLABLE"},
+    {"name": "rsi_1h", "type": "FLOAT64", "mode": "NULLABLE"},
+    {"name": "move_24h_pct", "type": "FLOAT64", "mode": "NULLABLE"}
   ]}
 ]

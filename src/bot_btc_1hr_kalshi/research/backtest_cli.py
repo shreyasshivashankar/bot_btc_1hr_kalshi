@@ -142,6 +142,7 @@ def run_backtest(
         portfolio=portfolio, oms=oms, monitor=monitor,
     )
     feature_engine = FeatureEngine(
+        timeframes=["1m", "5m", "15m", "1h", "1d"],
         bollinger_period=settings.signal.bollinger_period_bars,
         bollinger_std_mult=settings.signal.bollinger_std_mult,
     )

@@ -22,9 +22,9 @@ feeds:
   coinbase:
     ws_url: ${CB_WS_URL:-wss://default.example/cb}
     staleness_halt_ms: 2000
-  binance:
-    ws_url: ${BINANCE_WS_URL}
-    staleness_halt_ms: 2000
+  kraken:
+    ws_url: ${KRAKEN_WS_URL}
+    staleness_halt_ms: 5000
 risk:
   kelly_fraction: 0.25
   max_position_notional_usd: 100
@@ -56,18 +56,18 @@ telemetry:
 
 def test_loads_paper_config(tmp_path: Path) -> None:
     _write(tmp_path / "paper.yaml", PAPER_YAML)
-    env = {"BINANCE_WS_URL": "wss://example.com/bn"}
+    env = {"KRAKEN_WS_URL": "wss://example.com/kraken"}
     s = load_settings("paper", config_dir=tmp_path, env=env)
     assert isinstance(s, Settings)
     assert s.mode == "paper"
-    assert s.feeds.binance.ws_url == "wss://example.com/bn"
+    assert s.feeds.kraken.ws_url == "wss://example.com/kraken"
     # default-fallback branch hit (CB_WS_URL not set)
     assert s.feeds.coinbase.ws_url == "wss://default.example/cb"
 
 
 def test_missing_required_env_raises(tmp_path: Path) -> None:
     _write(tmp_path / "paper.yaml", PAPER_YAML)
-    with pytest.raises(KeyError, match="BINANCE_WS_URL"):
+    with pytest.raises(KeyError, match="KRAKEN_WS_URL"):
         load_settings("paper", config_dir=tmp_path, env={})
 
 
@@ -77,7 +77,7 @@ def test_unknown_field_in_yaml_is_rejected(tmp_path: Path) -> None:
     bad = PAPER_YAML.replace("mode: paper\n", "mode: paper\nstray: oops\n")
     _write(tmp_path / "paper.yaml", bad)
     with pytest.raises(ValidationError):
-        load_settings("paper", config_dir=tmp_path, env={"BINANCE_WS_URL": "wss://x"})
+        load_settings("paper", config_dir=tmp_path, env={"KRAKEN_WS_URL": "wss://x"})
 
 
 def test_missing_file(tmp_path: Path) -> None:

@@ -11,9 +11,12 @@ feeds:
   coinbase:
     ws_url: wss://ws-feed.exchange.coinbase.com
     staleness_halt_ms: 2000
-  binance:
-    ws_url: wss://stream.binance.com:9443/ws/btcusdt@trade
-    staleness_halt_ms: 2000
+  # Kraken is the confirmation venue (replaced Binance; Binance is geo-blocked
+  # from US IPs incl. Cloud Run us-central1). Lower-volume than Coinbase, so a
+  # larger staleness budget avoids spurious halts.
+  kraken:
+    ws_url: wss://ws.kraken.com/v2
+    staleness_halt_ms: 5000
 
 risk:
   # Sized for a $50 starter bankroll; bot restarts each session at $50 (see
@@ -49,3 +52,10 @@ telemetry:
   bet_outcomes_logger: bot_btc_1hr_kalshi.bet_outcomes
   bq_dataset: bot_btc_1hr_kalshi_bet_outcomes
   bq_table: outcomes
+
+integrity:
+  # Primary (Coinbase) / Confirmation (Kraken) entry gate. See
+  # signal/integrity.py. Veto only on ACTIVE disagreement — silence ≠ veto.
+  velocity_window_sec: 1.0
+  active_disagreement_floor_usd: 25.0   # noise floor; primary velocity below this is not "a move"
+  stale_halt_sec: 60.0                  # fail-closed on broken confirmation feed

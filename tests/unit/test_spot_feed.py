@@ -8,11 +8,12 @@ import pytest
 from bot_btc_1hr_kalshi.market_data.feeds.spot import (
     SpotFeed,
     SpotParseError,
-    binance_parser,
     build_coinbase_subscribe,
+    build_kraken_subscribe,
     coinbase_parser,
-    parse_binance,
+    kraken_parser,
     parse_coinbase,
+    parse_kraken,
 )
 from bot_btc_1hr_kalshi.market_data.types import SpotTick
 from bot_btc_1hr_kalshi.obs.clock import ManualClock
@@ -63,32 +64,80 @@ def test_coinbase_bad_time_falls_back_to_recv() -> None:
     assert tick.ts_ns == RECV_NS
 
 
-def test_binance_trade_parses() -> None:
+def test_kraken_trade_update_parses() -> None:
     frame = orjson.dumps({
-        "e": "trade", "E": 1_700_000_000_000, "T": 1_700_000_000_500,
-        "s": "BTCUSDT", "p": "60500.1", "q": "0.003",
+        "channel": "trade",
+        "type": "update",
+        "data": [
+            {
+                "symbol": "BTC/USD",
+                "side": "buy",
+                "price": 60500.1,
+                "qty": 0.003,
+                "ord_type": "limit",
+                "trade_id": 12345,
+                "timestamp": "2026-04-17T04:00:00.500Z",
+            },
+        ],
     })
-    tick = parse_binance(frame, recv_ts_ns=RECV_NS)
+    tick = parse_kraken(frame, recv_ts_ns=RECV_NS)
     assert isinstance(tick, SpotTick)
-    assert tick.venue == "binance"
+    assert tick.venue == "kraken"
     assert tick.price_usd == pytest.approx(60500.1)
     assert tick.size == pytest.approx(0.003)
-    assert tick.ts_ns == 1_700_000_000_500 * 1_000_000
+    assert tick.ts_ns > 0
 
 
-def test_binance_non_trade_returns_none() -> None:
-    assert parse_binance(orjson.dumps({"e": "kline"}), recv_ts_ns=RECV_NS) is None
+def test_kraken_snapshot_ignored() -> None:
+    """Snapshots are Kraken's 'last trade at subscribe time' — intentionally
+    discarded so the velocity tracker doesn't latch onto stale prints."""
+    frame = orjson.dumps({
+        "channel": "trade",
+        "type": "snapshot",
+        "data": [{"symbol": "BTC/USD", "price": 1, "qty": 1}],
+    })
+    assert parse_kraken(frame, recv_ts_ns=RECV_NS) is None
 
 
-def test_binance_missing_fields_raises() -> None:
+def test_kraken_subscribe_ack_ignored() -> None:
+    frame = orjson.dumps({"method": "subscribe", "success": True, "result": {}})
+    assert parse_kraken(frame, recv_ts_ns=RECV_NS) is None
+
+
+def test_kraken_missing_fields_raises() -> None:
+    frame = orjson.dumps({
+        "channel": "trade",
+        "type": "update",
+        "data": [{"symbol": "BTC/USD"}],
+    })
     with pytest.raises(SpotParseError):
-        parse_binance(orjson.dumps({"e": "trade"}), recv_ts_ns=RECV_NS)
+        parse_kraken(frame, recv_ts_ns=RECV_NS)
+
+
+def test_kraken_bad_timestamp_falls_back_to_recv() -> None:
+    frame = orjson.dumps({
+        "channel": "trade",
+        "type": "update",
+        "data": [{"symbol": "BTC/USD", "price": 1, "qty": 1, "timestamp": "bad"}],
+    })
+    tick = parse_kraken(frame, recv_ts_ns=RECV_NS)
+    assert isinstance(tick, SpotTick)
+    assert tick.ts_ns == RECV_NS
 
 
 def test_build_coinbase_subscribe_shape() -> None:
     raw = build_coinbase_subscribe(["BTC-USD"])
     data = orjson.loads(raw)
     assert data == {"type": "subscribe", "product_ids": ["BTC-USD"], "channels": ["ticker"]}
+
+
+def test_build_kraken_subscribe_shape() -> None:
+    raw = build_kraken_subscribe(["BTC/USD"])
+    data = orjson.loads(raw)
+    assert data == {
+        "method": "subscribe",
+        "params": {"channel": "trade", "symbol": ["BTC/USD"]},
+    }
 
 
 # --- SpotFeed integration over FakeConn -------------------------------------
@@ -147,30 +196,35 @@ async def test_spotfeed_coinbase_yields_ticks_and_sends_subscribe() -> None:
     assert st.last_msg_ns is not None
 
 
-async def test_spotfeed_binance_no_subscribe_needed() -> None:
+async def test_spotfeed_kraken_sends_v2_subscribe() -> None:
     from bot_btc_1hr_kalshi.market_data.feeds.staleness import StalenessTracker
 
     frame = orjson.dumps({
-        "e": "trade", "T": 1_700_000_000_000, "s": "BTCUSDT", "p": "60000", "q": "0.01",
+        "channel": "trade",
+        "type": "update",
+        "data": [{
+            "symbol": "BTC/USD", "price": 60000, "qty": 0.01,
+            "timestamp": "2026-04-17T04:00:00Z",
+        }],
     })
     conn = FakeConn([frame])
     clock = ManualClock(0)
-    st = StalenessTracker(name="binance", clock=clock, threshold_ms=2000)
+    st = StalenessTracker(name="kraken", clock=clock, threshold_ms=5000)
 
     async def connect(url: str) -> FakeConn:
         return conn
 
     feed = SpotFeed(
-        name="binance",
-        ws_url="wss://stream.binance.com:9443/ws/btcusdt@trade",
+        name="kraken",
+        ws_url="wss://ws.kraken.com/v2",
         clock=clock,
         ws_connect=connect,  # type: ignore[arg-type]
         staleness=st,
-        parse=binance_parser(clock),
-        subscribe=None,
+        parse=kraken_parser(clock),
+        subscribe=build_kraken_subscribe(["BTC/USD"]),
     )
 
     async for tick in feed.events():
-        assert tick.venue == "binance"
+        assert tick.venue == "kraken"
         break
-    assert conn.sent == []
+    assert conn.sent and b'"subscribe"' in conn.sent[0]

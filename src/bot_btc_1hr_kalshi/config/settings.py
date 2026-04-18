@@ -24,7 +24,7 @@ class FeedsSettings(BaseModel):
 
     kalshi: FeedSettings
     coinbase: FeedSettings
-    binance: FeedSettings
+    kraken: FeedSettings
 
 
 class RiskSettings(BaseModel):
@@ -36,6 +36,11 @@ class RiskSettings(BaseModel):
     single_trade_drawdown_freeze_pct: float = Field(gt=0.0, le=1.0, default=0.15)
     reconcile_interval_sec: int = Field(gt=0, default=60)
     clock_drift_halt_ms: int = Field(gt=0, default=1000)
+    # Hard LastSpot staleness contract (Slice 6). Market discovery and entry
+    # decisions refuse to act when the primary spot tick is older than this.
+    # Matches clock_drift_halt_ms by design: both gate the trading graph
+    # against silent-stale-data-induced decisions.
+    spot_staleness_halt_ms: int = Field(gt=0, default=1000)
 
 
 class SignalSettings(BaseModel):
@@ -44,6 +49,19 @@ class SignalSettings(BaseModel):
     bollinger_period_bars: int = Field(gt=0)
     bollinger_std_mult: float = Field(gt=0.0)
     min_signal_confidence: float = Field(ge=0.0, le=1.0)
+    # Top-down alignment veto (DESIGN.md §6.3, Slice 8). The gate lives
+    # inside the traps, not in risk.check, so rejected candidates do not
+    # pollute the decision journal. If 1H RSI is bullish (> `htf_bullish_
+    # veto_rsi`), reject any 5m SHORT setup; if bearish (< `htf_bearish_
+    # veto_rsi`), reject any 5m LONG setup. 45/55 is the standard Wilder
+    # dead band around RSI 50.
+    htf_bullish_veto_rsi: float = Field(gt=0.0, lt=100.0, default=55.0)
+    htf_bearish_veto_rsi: float = Field(gt=0.0, lt=100.0, default=45.0)
+    # Runaway Train lockout (DESIGN.md §6.3, Slice 8; applied inside
+    # detect_ceiling_reversion). When the rolling 24h move magnitude
+    # exceeds this fraction, disable Trap 3 — mean-reversion against a
+    # parabolic / capitulation phase has no edge.
+    runaway_train_halt_pct: float = Field(gt=0.0, le=1.0, default=0.05)
 
 
 class SoftStopSettings(BaseModel):
@@ -78,6 +96,24 @@ class TelemetrySettings(BaseModel):
     bq_table: str
 
 
+class IntegritySettings(BaseModel):
+    """Primary/Confirmation integrity gate (docs/DESIGN.md §7.3a).
+
+    Coinbase is primary — its prints drive FeatureEngine directly. Kraken is
+    the confirmation venue and vetoes ENTRY only when its directional velocity
+    actively contradicts Coinbase over `velocity_window_sec`. Silence on the
+    confirmation venue is NOT a veto (low-liquidity venues legitimately
+    print intermittently); prolonged silence > `stale_halt_sec` IS a veto
+    (fail-closed on a broken feed).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    velocity_window_sec: float = Field(gt=0.0, default=1.0)
+    active_disagreement_floor_usd: float = Field(gt=0.0, default=25.0)
+    stale_halt_sec: float = Field(gt=0.0, default=60.0)
+
+
 class CalendarSettings(BaseModel):
     """Structured economic-calendar configuration (hard rule #8).
 
@@ -106,3 +142,4 @@ class Settings(BaseModel):
     execution: ExecutionSettings
     telemetry: TelemetrySettings
     calendar: CalendarSettings = CalendarSettings()
+    integrity: IntegritySettings = IntegritySettings()

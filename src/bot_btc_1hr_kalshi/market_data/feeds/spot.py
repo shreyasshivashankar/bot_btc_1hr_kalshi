@@ -1,15 +1,21 @@
-"""Spot price feeds for Coinbase and Binance.
+"""Spot price feeds for Coinbase (primary) and Kraken (confirmation).
 
-These provide the BTC-USD ticker that drives the FeatureEngine's Bollinger
-and ATR computations. We run two in parallel for redundancy — one is primary,
-the other is secondary. If the primary stalls > threshold, the watchdog can
-fail over by flipping which feed the FeatureEngine listens to.
+Architecture is Primary / Confirmation, not primary / secondary failover:
+  * Coinbase drives the FeatureEngine — Bollinger, ATR, regime classification.
+  * Kraken does NOT feed features. It's consulted only by the integrity gate
+    (`signal/integrity.py`) on ENTRY, and only vetoes when its directional
+    velocity actively contradicts Coinbase over a ~1s window. See the
+    integrity module docstring for the "silence ≠ veto, active disagreement
+    vetoes" rationale.
+
+Binance was the original confirmation venue but is geo-blocked from US IPs
+(HTTP 451). Kraken V2 WS is the operational replacement.
 
 Wire formats (public docs, as of 2026):
     Coinbase (subscribe channel=ticker, product_id=BTC-USD):
         {"type":"ticker","product_id":"BTC-USD","price":"...","last_size":"...","time":"ISO8601"}
-    Binance (URL: /ws/btcusdt@trade — no subscribe needed):
-        {"e":"trade","E":ms,"s":"BTCUSDT","p":"price","q":"qty","T":ms,...}
+    Kraken V2 (subscribe {"method":"subscribe","params":{"channel":"trade","symbol":["BTC/USD"]}}):
+        {"channel":"trade","type":"update","data":[{"symbol":"BTC/USD","side":"...","price":N,"qty":N,"ord_type":"...","trade_id":N,"timestamp":"ISO8601"}]}
 """
 
 from __future__ import annotations
@@ -68,28 +74,40 @@ def parse_coinbase(raw: bytes | str, *, recv_ts_ns: int) -> SpotTick | None:
     )
 
 
-def parse_binance(raw: bytes | str, *, recv_ts_ns: int) -> SpotTick | None:
+def parse_kraken(raw: bytes | str, *, recv_ts_ns: int) -> SpotTick | None:
+    """Parse a Kraken V2 WS trade frame into a SpotTick.
+
+    Kraken emits both the subscribe ack (`{"method":"subscribe","success":true}`)
+    and per-symbol snapshots (`type=="snapshot"`). Only `type=="update"` on
+    `channel=="trade"` produces ticks downstream; snapshots are Kraken's
+    "last trade at subscribe time" which we intentionally discard so the
+    velocity tracker doesn't latch onto a stale print.
+    """
     try:
         data = orjson.loads(raw)
     except orjson.JSONDecodeError as exc:
         raise SpotParseError(f"invalid JSON: {exc}") from exc
     if not isinstance(data, dict):
         raise SpotParseError("frame is not an object")
-    etype = data.get("e")
-    if etype is None:
+    if data.get("channel") != "trade":
         return None
-    if etype != "trade":
+    if data.get("type") != "update":
         return None
+    items = data.get("data")
+    if not isinstance(items, list) or not items:
+        return None
+    last = items[-1]
+    if not isinstance(last, dict):
+        raise SpotParseError("trade entry is not an object")
     try:
-        price = float(data["p"])
-        size = float(data["q"])
-        trade_ms = int(data.get("T") or data.get("E") or 0)
+        price = float(last["price"])
+        size = float(last["qty"])
     except (KeyError, ValueError, TypeError) as exc:
         raise SpotParseError(f"missing fields: {exc}") from exc
-    ts_ns = trade_ms * 1_000_000 if trade_ms > 0 else recv_ts_ns
+    ts_ns = _iso_to_ns(str(last.get("timestamp", "")), fallback_ns=recv_ts_ns)
     return SpotTick(
         ts_ns=ts_ns,
-        venue="binance",
+        venue="kraken",
         price_micros=usd_to_micros(price),
         size=size,
     )
@@ -98,6 +116,12 @@ def parse_binance(raw: bytes | str, *, recv_ts_ns: int) -> SpotTick | None:
 def build_coinbase_subscribe(product_ids: list[str]) -> bytes:
     return orjson.dumps(
         {"type": "subscribe", "product_ids": product_ids, "channels": ["ticker"]}
+    )
+
+
+def build_kraken_subscribe(symbols: list[str]) -> bytes:
+    return orjson.dumps(
+        {"method": "subscribe", "params": {"channel": "trade", "symbol": symbols}}
     )
 
 
@@ -180,9 +204,9 @@ def coinbase_parser(clock: Clock) -> Callable[[bytes | str], SpotTick | None]:
     return _p
 
 
-def binance_parser(clock: Clock) -> Callable[[bytes | str], SpotTick | None]:
+def kraken_parser(clock: Clock) -> Callable[[bytes | str], SpotTick | None]:
     def _p(raw: bytes | str) -> SpotTick | None:
-        return parse_binance(raw, recv_ts_ns=clock.now_ns())
+        return parse_kraken(raw, recv_ts_ns=clock.now_ns())
 
     return _p
 

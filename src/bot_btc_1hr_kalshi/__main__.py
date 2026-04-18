@@ -29,11 +29,29 @@ from bot_btc_1hr_kalshi.archive.writer import ArchiveWriter
 from bot_btc_1hr_kalshi.config.loader import load_settings
 from bot_btc_1hr_kalshi.config.settings import FeedSettings, Mode
 from bot_btc_1hr_kalshi.execution.broker.base import Broker
+from bot_btc_1hr_kalshi.execution.broker.kalshi_signer import KalshiSigner
 from bot_btc_1hr_kalshi.execution.broker.paper import PaperBroker
 from bot_btc_1hr_kalshi.execution.broker.shadow import ShadowBroker
 from bot_btc_1hr_kalshi.execution.oms import OMS
-from bot_btc_1hr_kalshi.feedloop import run_forever as run_feed_forever
+from bot_btc_1hr_kalshi.feedloop import (
+    run_forever as run_feed_forever,
+)
+from bot_btc_1hr_kalshi.feedloop import (
+    ws_connect_kalshi_signed,
+    ws_connect_websockets,
+)
+from bot_btc_1hr_kalshi.market_data.bars import MultiTimeframeBus
+from bot_btc_1hr_kalshi.market_data.feeds.kalshi import WSConnect
+from bot_btc_1hr_kalshi.market_data.feeds.spot import (
+    SpotFeed,
+    build_coinbase_subscribe,
+    build_kraken_subscribe,
+    coinbase_parser,
+    kraken_parser,
+)
+from bot_btc_1hr_kalshi.market_data.feeds.staleness import StalenessTracker
 from bot_btc_1hr_kalshi.market_data.kalshi_rest import kalshi_date_header_probe
+from bot_btc_1hr_kalshi.market_data.spot_oracle import SpotOracle
 from bot_btc_1hr_kalshi.monitor.position_monitor import PositionMonitor
 from bot_btc_1hr_kalshi.obs.activity import ActivityTracker
 from bot_btc_1hr_kalshi.obs.clock import SystemClock
@@ -44,12 +62,15 @@ from bot_btc_1hr_kalshi.portfolio.positions import Portfolio
 from bot_btc_1hr_kalshi.risk.breaker_store import JsonFileBreakerStore, NullBreakerStore
 from bot_btc_1hr_kalshi.risk.breakers import BreakerState
 from bot_btc_1hr_kalshi.risk.clock_drift import ClockDriftMonitor
+from bot_btc_1hr_kalshi.signal.features import FeatureEngine
 
 BREAKER_STATE_PATH_ENV = "BOT_BTC_1HR_KALSHI_BREAKER_STATE_PATH"
 ARCHIVE_DIR_ENV = "BOT_BTC_1HR_KALSHI_ARCHIVE_DIR"
 COINBASE_WS_URL_ENV = "BOT_BTC_1HR_KALSHI_COINBASE_WS_URL"
-BINANCE_WS_URL_ENV = "BOT_BTC_1HR_KALSHI_BINANCE_WS_URL"
+KRAKEN_WS_URL_ENV = "BOT_BTC_1HR_KALSHI_KRAKEN_WS_URL"
 SERIES_TICKER_ENV = "BOT_BTC_1HR_KALSHI_SERIES_TICKER"
+KALSHI_API_KEY_ENV = "BOT_BTC_1HR_KALSHI_API_KEY"
+KALSHI_PRIVATE_KEY_PATH_ENV = "BOT_BTC_1HR_KALSHI_PRIVATE_KEY_PATH"
 
 DEFAULT_ADMIN_TOKEN_ENV = "BOT_BTC_1HR_KALSHI_ADMIN_TOKEN"  # noqa: S105 — env var name, not a secret
 PAPER_LIVE_MODES: tuple[Mode, ...] = ("dev", "paper", "shadow", "live")
@@ -186,6 +207,7 @@ async def serve(app: App, *, admin_token: str, host: str, port: int) -> None:
 
     feed_task: asyncio.Task[None] | None = None
     drift_task: asyncio.Task[None] | None = None
+    spot_task: asyncio.Task[None] | None = None
     rest_client: httpx.AsyncClient | None = None
 
     def _on_term() -> None:
@@ -199,18 +221,26 @@ async def serve(app: App, *, admin_token: str, host: str, port: int) -> None:
             feed_task.cancel()
         if drift_task is not None:
             drift_task.cancel()
+        if spot_task is not None:
+            spot_task.cancel()
         server.should_exit = True
 
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, _on_term)
 
-    feed_task, drift_task, rest_client = _start_feed_loop_if_enabled(app, log)
+    feed_task, drift_task, spot_task, rest_client = _start_feed_loop_if_enabled(
+        app, log
+    )
 
     log.info("boot.serving", mode=app.settings.mode, host=host, port=port)
     try:
         await server.serve()
     finally:
-        for name, task in (("feed-loop", feed_task), ("clock-drift", drift_task)):
+        for name, task in (
+            ("feed-loop", feed_task),
+            ("clock-drift", drift_task),
+            ("spot-oracle", spot_task),
+        ):
             if task is None:
                 continue
             task.cancel()
@@ -234,24 +264,29 @@ async def serve(app: App, *, admin_token: str, host: str, port: int) -> None:
 
 def _start_feed_loop_if_enabled(
     app: App, log: Any,
-) -> tuple[asyncio.Task[None] | None, asyncio.Task[None] | None, httpx.AsyncClient | None]:
-    """Spawn the live feed loop + clock-drift monitor unless we're in dev mode.
+) -> tuple[
+    asyncio.Task[None] | None,
+    asyncio.Task[None] | None,
+    asyncio.Task[None] | None,
+    httpx.AsyncClient | None,
+]:
+    """Spawn the live feed loop + clock-drift + spot-oracle unless in dev.
 
-    Returns (feed_task, drift_task, http_client) so the caller can cancel
-    each task and close the client on shutdown. All three are None when
-    the live loop is disabled.
+    Returns (feed_task, drift_task, spot_task, http_client) so the caller
+    can cancel each task and close the client on shutdown. All are None
+    when the live loop is disabled.
     """
     if app.settings.mode not in MODES_WITH_FEED_LOOP:
         log.info("boot.feed_loop_disabled", mode=app.settings.mode)
-        return None, None, None
+        return None, None, None, None
     if app.broker is None:
         log.error("boot.feed_loop_missing_broker", mode=app.settings.mode)
-        return None, None, None
+        return None, None, None, None
 
     kalshi_ws = _resolve_feed_url(app.settings.feeds.kalshi)
     rest_url = _resolve_rest_url(app.settings.feeds.kalshi)
     coinbase_ws = _resolve_feed_url(app.settings.feeds.coinbase) or os.getenv(COINBASE_WS_URL_ENV)
-    binance_ws = _resolve_feed_url(app.settings.feeds.binance) or os.getenv(BINANCE_WS_URL_ENV)
+    kraken_ws = _resolve_feed_url(app.settings.feeds.kraken) or os.getenv(KRAKEN_WS_URL_ENV)
     series_ticker = os.getenv(SERIES_TICKER_ENV, "KXBTC")
 
     missing = [
@@ -259,14 +294,107 @@ def _start_feed_loop_if_enabled(
             ("kalshi.ws_url", kalshi_ws),
             ("kalshi.rest_url", rest_url),
             ("coinbase.ws_url", coinbase_ws),
-            ("binance.ws_url", binance_ws),
+            ("kraken.ws_url", kraken_ws),
         ) if not val
     ]
-    if missing or kalshi_ws is None or rest_url is None or coinbase_ws is None or binance_ws is None:
+    if missing or kalshi_ws is None or rest_url is None or coinbase_ws is None or kraken_ws is None:
         log.error("boot.feed_loop_missing_config", missing=missing)
-        return None, None, None
+        return None, None, None, None
 
     rest_client = httpx.AsyncClient(base_url=rest_url, timeout=10.0)
+
+    # Kalshi's WS handshake is signed — same KALSHI-ACCESS-* header scheme as
+    # REST (see execution/broker/kalshi_signer.py). In dev we may not have
+    # creds wired yet, so fall back to the unsigned connector and log a
+    # warning; in paper / shadow / live the server rejects an unsigned
+    # handshake with HTTP 401, which will surface via the feed reconnect log.
+    kalshi_ws_connect: WSConnect = ws_connect_websockets
+    api_key = os.getenv(KALSHI_API_KEY_ENV)
+    private_key_path = os.getenv(KALSHI_PRIVATE_KEY_PATH_ENV)
+    if api_key and private_key_path:
+        try:
+            pem_bytes = Path(private_key_path).read_bytes()
+            signer = KalshiSigner(
+                api_key_id=api_key,
+                private_key_pem=pem_bytes,
+                clock=app.clock,
+            )
+            kalshi_ws_connect = ws_connect_kalshi_signed(signer)
+            log.info(
+                "boot.kalshi_ws_signed",
+                key_id=api_key[:8] + "…",
+                key_path=private_key_path,
+            )
+        except OSError as exc:
+            log.error("boot.kalshi_key_read_failed", path=private_key_path, error=str(exc))
+            return None, None, None, rest_client
+        except ValueError as exc:
+            log.error("boot.kalshi_signer_invalid", error=str(exc))
+            return None, None, None, rest_client
+    else:
+        log.warning(
+            "boot.kalshi_ws_unsigned",
+            note="BOT_BTC_1HR_KALSHI_API_KEY / _PRIVATE_KEY_PATH not set; WS handshake will be rejected by live Kalshi",
+        )
+
+    # Persistent SpotOracle (Slice 6). Owns the Coinbase + Kraken WS for the
+    # lifetime of the container, not the hourly session — so hour-rolls no
+    # longer start with a blank spot reference (which used to force
+    # alphabetical strike tiebreak and pick deep-ITM markets).
+    coinbase_feed = SpotFeed(
+        name="coinbase",
+        ws_url=coinbase_ws,
+        clock=app.clock,
+        ws_connect=ws_connect_websockets,
+        staleness=StalenessTracker(
+            name="coinbase",
+            clock=app.clock,
+            threshold_ms=app.settings.feeds.coinbase.staleness_halt_ms,
+        ),
+        parse=coinbase_parser(app.clock),
+        subscribe=build_coinbase_subscribe(["BTC-USD"]),
+    )
+    kraken_feed = SpotFeed(
+        name="kraken",
+        ws_url=kraken_ws,
+        clock=app.clock,
+        ws_connect=ws_connect_websockets,
+        staleness=StalenessTracker(
+            name="kraken",
+            clock=app.clock,
+            threshold_ms=app.settings.feeds.kraken.staleness_halt_ms,
+        ),
+        parse=kraken_parser(app.clock),
+        subscribe=build_kraken_subscribe(["BTC/USD"]),
+    )
+    spot_oracle = SpotOracle(
+        primary=coinbase_feed,
+        confirmation=kraken_feed,
+        clock=app.clock,
+    )
+    app.spot_oracle = spot_oracle
+    spot_task = asyncio.create_task(spot_oracle.run(), name="spot-oracle")
+
+    # Multi-timeframe bar bus (Slice 7). Timeframes mirror DESIGN.md §5 —
+    # 1m/5m/15m for intra-hour features, 1h for the top-down alignment veto,
+    # 1d for the 24h runaway-train breaker. Fed from the oracle's primary
+    # callback; downstream feature consumers wire in on later slices.
+    bar_bus = MultiTimeframeBus(tf_secs=[60, 300, 900, 3600, 86400])
+    app.bar_bus = bar_bus
+    spot_oracle.subscribe_primary(bar_bus.ingest)
+
+    # App-scope FeatureEngine (Slice 8, Phase 2). TF labels must match the
+    # bar_bus seconds table above. Kept at App scope so 1H/1d accumulator
+    # state persists across hourly market rolls (§DESIGN.md #6.3 HTF veto
+    # reads `rsi("1h")` which needs ~14h of 1h closes to warm up).
+    feature_engine = FeatureEngine(
+        timeframes=["1m", "5m", "15m", "1h", "1d"],
+        bollinger_period=app.settings.signal.bollinger_period_bars,
+        bollinger_std_mult=app.settings.signal.bollinger_std_mult,
+    )
+    feature_engine.attach(bar_bus)
+    app.feature_engine = feature_engine
+
     task = asyncio.create_task(
         run_feed_forever(
             app=app,
@@ -274,8 +402,8 @@ def _start_feed_loop_if_enabled(
             rest_http_client=rest_client,
             clock=app.clock,
             kalshi_ws_url=kalshi_ws,
-            coinbase_ws_url=coinbase_ws,
-            binance_ws_url=binance_ws,
+            spot_oracle=spot_oracle,
+            ws_connect=kalshi_ws_connect,
             rest_base="",  # rest_url already includes /trade-api/v2
             series_ticker=series_ticker,
         ),
@@ -299,8 +427,9 @@ def _start_feed_loop_if_enabled(
         series_ticker=series_ticker,
         kalshi_ws=kalshi_ws,
         clock_drift_threshold_ms=app.settings.risk.clock_drift_halt_ms,
+        spot_staleness_threshold_ms=app.settings.risk.spot_staleness_halt_ms,
     )
-    return task, drift_task, rest_client
+    return task, drift_task, spot_task, rest_client
 
 
 def main(argv: list[str] | None = None) -> int:

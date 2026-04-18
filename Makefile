@@ -60,14 +60,14 @@ backtest:  ## Replay tick archive -> Sharpe / maxDD / hit rate. Requires MARKET,
 	  $${FROM:+--from $$FROM} $${TO:+--to $$TO}
 
 paper:  ## Live market data, simulated fills, no real orders
-	BOT_BTC_1HR_KALSHI_MODE=paper $(VENV_PY) -m bot_btc_1hr_kalshi
+	$(VENV_PY) -m bot_btc_1hr_kalshi --mode paper
 
 shadow:  ## Live feeds + full decision pipeline, orders routed to /dev/null
-	BOT_BTC_1HR_KALSHI_MODE=shadow $(VENV_PY) -m bot_btc_1hr_kalshi
+	$(VENV_PY) -m bot_btc_1hr_kalshi --mode shadow
 
 live:  ## PRODUCTION — requires RISK_COMMITTEE_SIGNED=yes in env
 	@test "$$RISK_COMMITTEE_SIGNED" = "yes" || { echo "refusing live without RISK_COMMITTEE_SIGNED=yes"; exit 1; }
-	BOT_BTC_1HR_KALSHI_MODE=live $(VENV_PY) -m bot_btc_1hr_kalshi
+	$(VENV_PY) -m bot_btc_1hr_kalshi --mode live
 
 reconcile:  ## Reconcile local OMS state vs Kalshi broker state
 	$(VENV_PY) -m bot_btc_1hr_kalshi.execution.reconcile

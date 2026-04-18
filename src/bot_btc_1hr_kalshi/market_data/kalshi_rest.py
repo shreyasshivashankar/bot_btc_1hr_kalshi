@@ -123,12 +123,26 @@ class KalshiRestClient:
         now_ns: int,
         series_ticker: str = "KXBTC",
         max_horizon_sec: int = 3600,
+        btc_spot_usd: float | None = None,
     ) -> HourlyMarket:
-        """Find the hourly market whose settlement is the next one after now.
+        """Pick the hourly market closest to `btc_spot_usd`, settling next.
 
-        We pick the market with the *soonest* future settlement within
-        `max_horizon_sec` (default: one hour). Ties (shouldn't happen in
-        practice) broken alphabetically on ticker for determinism.
+        Kalshi's BTC-hourly series lists ~40 strikes each hour spanning
+        roughly ±10% of spot (e.g. $66k-$86k around $78k). Without a spot
+        reference the selection used to tiebreak alphabetically, which
+        systematically picked deep-ITM markets where the YES price is
+        already ~99¢ and there is no tradeable edge for a mean-reversion
+        strategy.
+
+        New ranking (Slice 6):
+          1. Filter: future settlement within `max_horizon_sec`.
+          2. Primary sort: soonest settlement wins.
+          3. Secondary sort: smallest `|strike - btc_spot_usd|` when spot
+             is provided (tiebreak alphabetical ticker for determinism).
+          4. If `btc_spot_usd is None`, falls back to alphabetical tiebreak
+             so legacy callers and unit tests still get deterministic
+             output. Live callers MUST pass spot — the feedloop enforces
+             this via the SpotOracle's fail-closed `get_primary`.
 
         Raises `MarketDiscoveryError` if no market matches — caller should
         backoff and retry rather than trading blind.
@@ -162,8 +176,16 @@ class KalshiRestClient:
                 f"{max_horizon_sec}s (found {len(markets)} listings)"
             )
 
-        # Soonest settlement wins; deterministic tiebreak on ticker.
-        candidates.sort(key=lambda c: (c.settlement_ts_ns, c.ticker))
+        if btc_spot_usd is not None:
+            candidates.sort(
+                key=lambda c: (
+                    c.settlement_ts_ns,
+                    abs(c.strike_usd - btc_spot_usd),
+                    c.ticker,
+                )
+            )
+        else:
+            candidates.sort(key=lambda c: (c.settlement_ts_ns, c.ticker))
         chosen = candidates[0]
         _log.info(
             "market_discovery.selected",
@@ -171,6 +193,12 @@ class KalshiRestClient:
             strike_usd=chosen.strike_usd,
             settlement_ts_ns=chosen.settlement_ts_ns,
             candidate_count=len(candidates),
+            btc_spot_usd=btc_spot_usd,
+            strike_gap_usd=(
+                abs(chosen.strike_usd - btc_spot_usd)
+                if btc_spot_usd is not None
+                else None
+            ),
         )
         return chosen
 

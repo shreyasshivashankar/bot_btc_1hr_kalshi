@@ -14,7 +14,9 @@ from bot_btc_1hr_kalshi.archive.writer import ArchiveWriter
 from bot_btc_1hr_kalshi.config.settings import Settings
 from bot_btc_1hr_kalshi.execution.broker.base import Broker
 from bot_btc_1hr_kalshi.execution.oms import OMS
+from bot_btc_1hr_kalshi.market_data.bars import MultiTimeframeBus
 from bot_btc_1hr_kalshi.market_data.book import L2Book
+from bot_btc_1hr_kalshi.market_data.spot_oracle import SpotOracle
 from bot_btc_1hr_kalshi.monitor.position_monitor import PositionMonitor
 from bot_btc_1hr_kalshi.obs.activity import ActivityTracker
 from bot_btc_1hr_kalshi.obs.clock import Clock
@@ -22,6 +24,7 @@ from bot_btc_1hr_kalshi.obs.lifecycle import LifecycleEmitter
 from bot_btc_1hr_kalshi.obs.schemas import BetOutcome
 from bot_btc_1hr_kalshi.portfolio.positions import Portfolio
 from bot_btc_1hr_kalshi.risk.breakers import BreakerState
+from bot_btc_1hr_kalshi.signal.features import FeatureEngine
 
 
 @dataclass(slots=True)
@@ -39,6 +42,23 @@ class App:
     # for every FeedEvent it processes so `make backtest` has a tick archive
     # to replay. Opened/closed by __main__; None in tests and in replay.
     archive_writer: ArchiveWriter | None = None
+    # Persistent BTC spot source. Lives at App scope so discovery and the
+    # FeatureEngine see a continuous price stream across hour-rolls (Slice
+    # 6 — replaces the previous per-session SpotFeed ownership). None when
+    # the feed loop is disabled (dev mode, unit tests).
+    spot_oracle: SpotOracle | None = None
+    # Multi-timeframe bar bus (Slice 7). Downstreams that need candle-closed
+    # views of spot (RSI, VWAP, HTF alignment) subscribe to the relevant
+    # timeframe here instead of re-aggregating from raw ticks. Fed by
+    # `spot_oracle.subscribe_primary(bar_bus.ingest)` at startup so its
+    # lifetime tracks the oracle's. None when the feed loop is disabled.
+    bar_bus: MultiTimeframeBus | None = None
+    # TF-keyed feature engine (Slice 8, Phase 2). Lives at App scope
+    # alongside bar_bus — accumulator state must survive hourly market
+    # rolls (the 1H RSI alone needs ~14 hours of 1h closes to warm up).
+    # `__main__` attaches it to the bar bus once; each per-session
+    # FeedLoop receives the same reference.
+    feature_engine: FeatureEngine | None = None
     books: dict[str, L2Book] = field(default_factory=dict)
     trading_halted: bool = False
     tier1_override_active: bool = False

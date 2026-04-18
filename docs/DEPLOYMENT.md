@@ -38,8 +38,8 @@ What it does (in order):
    - `roles/bigquery.dataEditor` (bet-outcome log routing)
    - `roles/storage.objectAdmin` (tick-archive bucket only, conditional IAM)
 3. Creates secrets in Secret Manager (you'll paste values interactively):
-   - `BOT_BTC_1HR_KALSHI_API_KEY`
-   - `BOT_BTC_1HR_KALSHI_API_SECRET`
+   - `BOT_BTC_1HR_KALSHI_API_KEY` — Kalshi key id (UUID)
+   - `BOT_BTC_1HR_KALSHI_PRIVATE_KEY` — Kalshi RSA private key (PEM). Mounted as a **file**, not an env var (see §Secret mount below).
    - `BOT_BTC_1HR_KALSHI_ADMIN_TOKEN` (generated with `openssl rand -hex 32` if you press enter)
 4. Sets the project's `_Default` log bucket to **7-day retention** (application / operational logs auto-expire).
 5. Creates a **7-day retention log bucket** `bot-btc-1hr-kalshi-bets-7d` in your region for bet-outcome records.
@@ -98,9 +98,17 @@ gcloud run deploy $BOT_BTC_1HR_KALSHI_SERVICE_NAME \
   --ingress=internal-and-cloud-load-balancing \
   --no-allow-unauthenticated \
   --env-vars-file=deploy/env.yaml \
-  --set-secrets="BOT_BTC_1HR_KALSHI_API_KEY=BOT_BTC_1HR_KALSHI_API_KEY:latest,BOT_BTC_1HR_KALSHI_API_SECRET=BOT_BTC_1HR_KALSHI_API_SECRET:latest,BOT_BTC_1HR_KALSHI_ADMIN_TOKEN=BOT_BTC_1HR_KALSHI_ADMIN_TOKEN:latest" \
+  --set-env-vars="BOT_BTC_1HR_KALSHI_PRIVATE_KEY_PATH=/secrets/kalshi/kalshi-private-key" \
+  --set-secrets="BOT_BTC_1HR_KALSHI_API_KEY=BOT_BTC_1HR_KALSHI_API_KEY:latest,BOT_BTC_1HR_KALSHI_ADMIN_TOKEN=BOT_BTC_1HR_KALSHI_ADMIN_TOKEN:latest,/secrets/kalshi/kalshi-private-key=BOT_BTC_1HR_KALSHI_PRIVATE_KEY:latest" \
   --timeout=3600
 ```
+
+**Secret mount — why the PEM is a file, not an env var.** `--set-secrets` accepts two forms:
+
+- `NAME=SECRET:VERSION` → exposes the secret value as an env var named `NAME`.
+- `/path/to/file=SECRET:VERSION` → mounts the secret value as a file at that path (read-only, `0400`).
+
+Short values (UUIDs, tokens) stay env vars. The RSA private key is multi-line PEM; exporting it through `set -x` or YAML quoting can silently drop newlines, and although OpenSSL PEM parsers tolerate whitespace-mashed base64, the contract is cleaner when the raw bytes are persisted in a file. Locally we use the same contract: `BOT_BTC_1HR_KALSHI_PRIVATE_KEY_PATH=/path/to/your.pem`. One loader, two environments.
 
 Flags explained:
 - `min=max=1`: exactly one instance, always running. Trading state is not horizontally scalable.

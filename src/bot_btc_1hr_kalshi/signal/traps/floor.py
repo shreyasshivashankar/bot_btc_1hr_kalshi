@@ -4,9 +4,17 @@ Fires when:
   1. Kalshi YES best ask is "cheap" (<= FLOOR_MAX_CENTS).
   2. BTC spot is below its lower Bollinger band (pct_b < 0).
   3. Regime is not "high vol" — mean reversion degrades in vol spikes.
-  4. Confidence (magnitude of band deviation) clears the configured floor.
+  4. 1H RSI is NOT committed bearish (>= `htf_bearish_veto_rsi`). Going
+     long against a declared macro downtrend is fighting the tape — the
+     HTF veto lives inside the trap so rejected candidates never hit the
+     decision journal (DESIGN.md §6.3, Slice 8).
+  5. Confidence (|pct_b|, weighted by 5m RSI alignment) clears the floor.
 
 Side = YES: we're betting the spot will revert upward, making YES more valuable.
+
+Warmup (rsi_1h / rsi_5m == None): both HTF veto and RSI weighting fail-open
+— matches pre-Slice-8 behavior while the accumulators fill on cold start
+(1H RSI needs ~14 hours of 1h closes).
 
 Edge: Normal-CDF settlement probability (DESIGN.md §6.2 / signal/edge_model.py)
 minus the maker-entry price in cents. A trap with zero edge is dropped by the
@@ -20,11 +28,33 @@ from bot_btc_1hr_kalshi.signal.types import MarketSnapshot, TrapSignal
 
 FLOOR_MAX_CENTS = 40
 
+# 5m RSI weight anchors (Slice 8). Deep oversold = full weight; neutral
+# (RSI 50) = 0.5 floor. Linear interp in between. Acts as a soft gate —
+# the trap still fires on strong pct_b alone, but RSI confirmation
+# amplifies its passage through min_confidence.
+_RSI_5M_OVERSOLD = 35.0
+_RSI_5M_NEUTRAL = 50.0
+_RSI_WEIGHT_FLOOR = 0.5
+
+
+def _floor_rsi_weight(rsi_5m: float | None) -> float:
+    if rsi_5m is None:
+        return 1.0
+    if rsi_5m <= _RSI_5M_OVERSOLD:
+        return 1.0
+    if rsi_5m >= _RSI_5M_NEUTRAL:
+        return _RSI_WEIGHT_FLOOR
+    # Linear interp between (OVERSOLD, 1.0) and (NEUTRAL, FLOOR).
+    span = _RSI_5M_NEUTRAL - _RSI_5M_OVERSOLD
+    decay = (rsi_5m - _RSI_5M_OVERSOLD) / span
+    return 1.0 - decay * (1.0 - _RSI_WEIGHT_FLOOR)
+
 
 def detect_floor_reversion(
     snap: MarketSnapshot,
     *,
     min_confidence: float,
+    htf_bearish_veto_rsi: float = 45.0,
 ) -> TrapSignal | None:
     if not snap.book.valid:
         return None
@@ -41,7 +71,12 @@ def detect_floor_reversion(
     if snap.features.regime_vol == "high":
         return None
 
-    confidence = min(1.0, abs(pct_b))
+    # HTF alignment veto — fail-open during warmup.
+    rsi_1h = snap.features.rsi_1h
+    if rsi_1h is not None and rsi_1h < htf_bearish_veto_rsi:
+        return None
+
+    confidence = min(1.0, abs(pct_b)) * _floor_rsi_weight(snap.features.rsi_5m)
     if confidence < min_confidence:
         return None
 

@@ -39,6 +39,18 @@ spec:
       timeoutSeconds: 3600
       containerConcurrency: 10
 
+      # Kalshi's RSA-PSS private key is mounted as a file (not an env var)
+      # so multi-line PEM content survives intact. The application reads the
+      # path from BOT_BTC_1HR_KALSHI_PRIVATE_KEY_PATH. Same pattern locally:
+      # env var points at a PEM file on disk.
+      volumes:
+        - name: kalshi-private-key
+          secret:
+            secretName: BOT_BTC_1HR_KALSHI_PRIVATE_KEY
+            items:
+              - key: latest
+                path: kalshi-private-key
+
       # SIGTERM → SIGKILL grace, best-effort. Knative/Kubernetes honors this
       # field; Cloud Run managed does NOT document it (the YAML reference
       # at cloud.google.com/run/docs/reference/yaml/v1 lists neither this
@@ -63,6 +75,11 @@ spec:
               cpu: "2"
               memory: "2Gi"
 
+          volumeMounts:
+            - name: kalshi-private-key
+              mountPath: /secrets/kalshi
+              readOnly: true
+
           # Non-secret config — sync with deploy/env.example.yaml
           env:
             - name: BOT_BTC_1HR_KALSHI_MODE
@@ -75,16 +92,15 @@ spec:
               value: REGION
             # ... (rest populated from deploy/env.yaml at deploy time)
 
-            # Secrets mounted from Secret Manager
+            # Path to the PEM file mounted from Secret Manager above.
+            - name: BOT_BTC_1HR_KALSHI_PRIVATE_KEY_PATH
+              value: /secrets/kalshi/kalshi-private-key
+
+            # Secrets exposed as env vars (non-PEM values — short strings).
             - name: BOT_BTC_1HR_KALSHI_API_KEY
               valueFrom:
                 secretKeyRef:
                   name: BOT_BTC_1HR_KALSHI_API_KEY
-                  key: latest
-            - name: BOT_BTC_1HR_KALSHI_API_SECRET
-              valueFrom:
-                secretKeyRef:
-                  name: BOT_BTC_1HR_KALSHI_API_SECRET
                   key: latest
             - name: BOT_BTC_1HR_KALSHI_ADMIN_TOKEN
               valueFrom:

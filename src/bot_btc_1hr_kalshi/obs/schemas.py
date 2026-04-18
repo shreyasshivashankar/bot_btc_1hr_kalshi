@@ -43,6 +43,13 @@ class Features(BaseModel):
     spread_cents: int = Field(ge=0)
     spot_btc_usd: float = Field(gt=0.0)
     minutes_to_settlement: float = Field(ge=0.0)
+    # HTF-alignment fields (Slice 8). `None` during warmup — Wilder's RSI
+    # needs `period` bars of history on each TF (~14h on 1h), and the 24h
+    # move needs 25 1h closes. Persisted NULLABLE in BigQuery so historical
+    # rows written before Slice 8 shipped don't break queries.
+    rsi_5m: float | None = Field(default=None, ge=0.0, le=100.0)
+    rsi_1h: float | None = Field(default=None, ge=0.0, le=100.0)
+    move_24h_pct: float | None = None
 
 
 class Sizing(BaseModel):
