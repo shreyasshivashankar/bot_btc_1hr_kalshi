@@ -21,6 +21,7 @@ from bot_btc_1hr_kalshi.execution.broker.base import (
     OrderAck,
     OrderRequest,
 )
+from bot_btc_1hr_kalshi.obs.activity import ActivityTracker
 from bot_btc_1hr_kalshi.obs.clock import Clock
 from bot_btc_1hr_kalshi.obs.lifecycle import LifecycleEmitter
 from bot_btc_1hr_kalshi.obs.logging import BET_OUTCOMES_LOGGER, get_logger
@@ -62,6 +63,7 @@ class OMS:
         min_signal_confidence: float,
         clock: Clock,
         lifecycle: LifecycleEmitter | None = None,
+        activity: ActivityTracker | None = None,
     ) -> None:
         self._broker = broker
         self._portfolio = portfolio
@@ -75,6 +77,9 @@ class OMS:
         # Tests wire None; production wires a real emitter so the audit
         # trail covers every order transition.
         self._lifecycle = lifecycle
+        # Optional — when set, every consider_entry stamps the tracker so
+        # a process watchdog can detect a wedged decision loop.
+        self._activity = activity
         # Counter for partial-close bet_id suffixing. A position that fully
         # closes after N partials will have emitted outcomes p1..pN plus a
         # final unsuffixed outcome for the remainder.
@@ -88,6 +93,8 @@ class OMS:
     ) -> EntryResult:
         decision_id = str(uuid.uuid4())
         now_ns = self._clock.now_ns()
+        if self._activity is not None:
+            self._activity.mark_decision(now_ns)
 
         sized = kelly_contracts(
             edge_cents=signal.edge_cents,

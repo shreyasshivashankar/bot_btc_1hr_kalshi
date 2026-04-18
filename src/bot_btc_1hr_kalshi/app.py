@@ -14,6 +14,7 @@ from bot_btc_1hr_kalshi.config.settings import Settings
 from bot_btc_1hr_kalshi.execution.oms import OMS
 from bot_btc_1hr_kalshi.market_data.book import L2Book
 from bot_btc_1hr_kalshi.monitor.position_monitor import PositionMonitor
+from bot_btc_1hr_kalshi.obs.activity import ActivityTracker
 from bot_btc_1hr_kalshi.obs.clock import Clock
 from bot_btc_1hr_kalshi.obs.lifecycle import LifecycleEmitter
 from bot_btc_1hr_kalshi.obs.schemas import BetOutcome
@@ -30,23 +31,32 @@ class App:
     oms: OMS
     monitor: PositionMonitor
     lifecycle: LifecycleEmitter | None = None
+    activity: ActivityTracker | None = None
     books: dict[str, L2Book] = field(default_factory=dict)
     trading_halted: bool = False
     tier1_override_active: bool = False
 
     def status(self) -> dict[str, Any]:
-        return {
+        now_ns = self.clock.now_ns()
+        base: dict[str, Any] = {
             "mode": self.settings.mode,
             "trading_halted": self.trading_halted,
             "tier1_override_active": self.tier1_override_active,
-            "breaker_reason": self.breakers.reason(self.clock.now_ns()),
-            "any_breaker_tripped": self.breakers.any_tripped(self.clock.now_ns()),
+            "breaker_reason": self.breakers.reason(now_ns),
+            "any_breaker_tripped": self.breakers.any_tripped(now_ns),
             "bankroll_usd": self.portfolio.bankroll_usd,
             "open_positions_count": len(self.portfolio.open_positions),
             "open_positions_notional_usd": self.portfolio.open_positions_notional_usd,
             "daily_realized_pnl_usd": self.portfolio.daily_realized_pnl_usd,
             "markets_tracked": sorted(self.books.keys()),
         }
+        if self.activity is not None:
+            base["activity"] = self.activity.snapshot(now_ns=now_ns)
+        return base
+
+    def mark_tick(self, ts_ns: int) -> None:
+        if self.activity is not None:
+            self.activity.mark_tick(ts_ns)
 
     def halt(self, *, reason: str = "operator") -> None:
         self.trading_halted = True

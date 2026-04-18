@@ -15,6 +15,7 @@ from bot_btc_1hr_kalshi.execution.oms import OMS
 from bot_btc_1hr_kalshi.market_data.book import L2Book
 from bot_btc_1hr_kalshi.market_data.types import BookLevel, BookUpdate
 from bot_btc_1hr_kalshi.monitor.position_monitor import PositionMonitor
+from bot_btc_1hr_kalshi.obs.activity import ActivityTracker
 from bot_btc_1hr_kalshi.obs.clock import ManualClock
 from bot_btc_1hr_kalshi.obs.schemas import Features
 from bot_btc_1hr_kalshi.portfolio.positions import Portfolio
@@ -65,6 +66,7 @@ def _build_app() -> tuple[App, PaperBroker]:
     breakers = BreakerState()
     portfolio = Portfolio(bankroll_usd=1_000.0)
     broker = PaperBroker(clock=clock)
+    activity = ActivityTracker(boot_ns=clock.now_ns())
     oms = OMS(
         broker=broker,
         portfolio=portfolio,
@@ -72,6 +74,7 @@ def _build_app() -> tuple[App, PaperBroker]:
         risk_settings=settings.risk,
         min_signal_confidence=settings.signal.min_signal_confidence,
         clock=clock,
+        activity=activity,
     )
     monitor = PositionMonitor(oms=oms, portfolio=portfolio, settings=settings.monitor)
     app = App(
@@ -81,6 +84,7 @@ def _build_app() -> tuple[App, PaperBroker]:
         portfolio=portfolio,
         oms=oms,
         monitor=monitor,
+        activity=activity,
     )
     return app, broker
 
@@ -146,6 +150,28 @@ def test_admin_status_returns_operator_view() -> None:
         assert body["trading_halted"] is False
         assert body["bankroll_usd"] == 1000.0
         assert body["open_positions_count"] == 0
+
+
+def test_admin_status_exposes_watchdog_activity_block() -> None:
+    # The external watchdog polls /admin/status and escalates when
+    # seconds_since_last_tick crosses a threshold, so the shape of this
+    # block is a public contract.
+    app, _ = _build_app()
+    assert app.activity is not None  # helps mypy narrow
+    app.activity.mark_tick(app.clock.now_ns())
+    with _client(app) as c:
+        body = c.get("/admin/status", headers=_auth()).json()
+        activity = body["activity"]
+        assert set(activity) == {
+            "boot_ns",
+            "uptime_seconds",
+            "last_tick_ns",
+            "last_decision_ns",
+            "seconds_since_last_tick",
+            "seconds_since_last_decision",
+        }
+        assert activity["seconds_since_last_tick"] == 0.0
+        assert activity["seconds_since_last_decision"] is None
 
 
 def test_halt_and_resume_round_trip() -> None:

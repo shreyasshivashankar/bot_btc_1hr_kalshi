@@ -162,6 +162,28 @@ Flattens the book immediately. 2-hour stabilization follows (no new entries). Lo
 ```
 Prints: mode (paper/shadow/live), halt state, open positions, session PnL, circuit breaker states, feed health.
 
+### External watchdog (hard rule #3 — no single point of halt)
+
+`/admin/status` returns an `activity` block an external poller uses to detect a wedged event loop:
+
+```json
+"activity": {
+  "boot_ns": 1713312000000000000,
+  "uptime_seconds": 3612.4,
+  "last_tick_ns": 1713315612400000000,
+  "last_decision_ns": 1713315610100000000,
+  "seconds_since_last_tick": 0.03,
+  "seconds_since_last_decision": 2.33
+}
+```
+
+Configure a Cloud Scheduler job every 60 s that `curl`s `/admin/status` with the admin token and pages oncall (or POSTs `/admin/halt`) if:
+
+- `seconds_since_last_tick > 30` during market hours (feed wedged), **or**
+- `seconds_since_last_decision > 900` during market hours (decision loop wedged even if feeds tick).
+
+Values are `null` until the first tick/decision of a run — treat null as OK only during the first minute of `uptime_seconds`. The in-process breakers cover feed staleness too (halt at 2 s); the watchdog exists for the case where the in-process code itself is stuck and can't halt itself.
+
 ---
 
 ## Bet-outcome log queries (for parameter tuning)

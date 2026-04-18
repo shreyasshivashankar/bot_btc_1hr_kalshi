@@ -29,6 +29,7 @@ from bot_btc_1hr_kalshi.execution.broker.paper import PaperBroker
 from bot_btc_1hr_kalshi.execution.broker.shadow import ShadowBroker
 from bot_btc_1hr_kalshi.execution.oms import OMS
 from bot_btc_1hr_kalshi.monitor.position_monitor import PositionMonitor
+from bot_btc_1hr_kalshi.obs.activity import ActivityTracker
 from bot_btc_1hr_kalshi.obs.clock import SystemClock
 from bot_btc_1hr_kalshi.obs.lifecycle import LifecycleEmitter
 from bot_btc_1hr_kalshi.obs.logging import configure as configure_logging
@@ -98,6 +99,7 @@ def build_app(
     portfolio = Portfolio(bankroll_usd=bankroll)
     broker: Broker = _broker_for_mode(mode, clock=clock)
     lifecycle = LifecycleEmitter(clock=clock)
+    activity = ActivityTracker(boot_ns=clock.now_ns())
     oms = OMS(
         broker=broker,
         portfolio=portfolio,
@@ -106,6 +108,7 @@ def build_app(
         min_signal_confidence=settings.signal.min_signal_confidence,
         clock=clock,
         lifecycle=lifecycle,
+        activity=activity,
     )
     monitor = PositionMonitor(oms=oms, portfolio=portfolio, settings=settings.monitor)
     return App(
@@ -116,6 +119,7 @@ def build_app(
         oms=oms,
         monitor=monitor,
         lifecycle=lifecycle,
+        activity=activity,
     )
 
 
