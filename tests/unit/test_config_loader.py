@@ -31,7 +31,7 @@ risk:
   max_daily_loss_pct: 0.05
   single_trade_drawdown_freeze_pct: 0.15
   reconcile_interval_sec: 60
-  clock_drift_halt_ms: 250
+  clock_drift_halt_ms: 1000
 signal:
   bollinger_period_bars: 20
   bollinger_std_mult: 2.0

@@ -8,6 +8,7 @@ We assert two things:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from collections.abc import AsyncIterator
 
 import orjson
@@ -17,7 +18,11 @@ from bot_btc_1hr_kalshi.app import App
 from bot_btc_1hr_kalshi.config.loader import load_settings
 from bot_btc_1hr_kalshi.execution.broker.paper import PaperBroker
 from bot_btc_1hr_kalshi.execution.oms import OMS
-from bot_btc_1hr_kalshi.feedloop import FeedLoop, minutes_to_settlement_fn
+from bot_btc_1hr_kalshi.feedloop import (
+    FeedLoop,
+    _watch_kalshi_staleness,
+    minutes_to_settlement_fn,
+)
 from bot_btc_1hr_kalshi.market_data.book import L2Book
 from bot_btc_1hr_kalshi.market_data.feeds.kalshi import KalshiFeed, WSConnection
 from bot_btc_1hr_kalshi.market_data.feeds.spot import (
@@ -183,3 +188,36 @@ def test_minutes_to_settlement_fn_counts_down() -> None:
     assert fn(30_000_000_000) == pytest.approx(0.5)
     assert fn(60_000_000_000) == 0.0
     assert fn(70_000_000_000) == 0.0  # clamped to 0
+
+
+@pytest.mark.asyncio
+async def test_watch_kalshi_staleness_flips_breaker_on_transition() -> None:
+    """Watchdog must trip feed_staleness when tracker reports stale, and
+    release it when a fresh `mark()` makes the tracker non-stale again."""
+    clock = ManualClock(0)
+    breakers = BreakerState()
+    tracker = StalenessTracker(name="kalshi", clock=clock, threshold_ms=100)
+    tracker.mark()  # seed: not stale
+
+    task = asyncio.create_task(
+        _watch_kalshi_staleness(breakers=breakers, tracker=tracker, poll_sec=0.01)
+    )
+    try:
+        # No staleness yet — breaker clear.
+        await asyncio.sleep(0.03)
+        assert not breakers.any_tripped(now_ns=clock.now_ns())
+
+        # Advance clock past threshold; watchdog should trip the breaker.
+        clock.advance_ns(200 * 1_000_000)
+        await asyncio.sleep(0.05)
+        assert breakers.any_tripped(now_ns=clock.now_ns())
+        assert breakers.reason(now_ns=clock.now_ns()) == "feed_staleness"
+
+        # Recovery: mark() makes the tracker non-stale; watchdog should clear.
+        tracker.mark()
+        await asyncio.sleep(0.05)
+        assert not breakers.any_tripped(now_ns=clock.now_ns())
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task

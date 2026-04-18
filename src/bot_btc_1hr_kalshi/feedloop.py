@@ -58,6 +58,7 @@ from bot_btc_1hr_kalshi.market_data.types import (
 )
 from bot_btc_1hr_kalshi.obs.clock import Clock
 from bot_btc_1hr_kalshi.obs.schemas import Features
+from bot_btc_1hr_kalshi.risk.breakers import BreakerState
 from bot_btc_1hr_kalshi.signal.features import FeatureEngine
 from bot_btc_1hr_kalshi.signal.registry import run_traps
 from bot_btc_1hr_kalshi.signal.types import MarketSnapshot
@@ -77,6 +78,37 @@ def minutes_to_settlement_fn(settlement_ts_ns: int) -> Callable[[int], float]:
     def mts(now_ns: int) -> float:
         return max(0.0, (settlement_ts_ns - now_ns) / 60_000_000_000)
     return mts
+
+
+async def _watch_kalshi_staleness(
+    *,
+    breakers: BreakerState,
+    tracker: StalenessTracker,
+    poll_sec: float = 0.25,
+) -> None:
+    """Polls the Kalshi StalenessTracker and flips the feed_staleness breaker.
+
+    Hard rule: primary feed staleness > 2s halts new entries. The tracker
+    knows its own threshold (`threshold_ms` from the feed config); we just
+    compare and flip the breaker on transition. Edge-triggered: we only
+    touch the breaker when the stale bit changes, to keep the breaker
+    log line meaningful rather than a recurring heartbeat.
+    """
+    prev_stale = False
+    while True:
+        cur_stale = tracker.is_stale()
+        if cur_stale != prev_stale:
+            if cur_stale:
+                _log.error(
+                    "staleness.halt",
+                    feed=tracker.name,
+                    age_ms=tracker.age_ms(),
+                )
+            else:
+                _log.info("staleness.recovered", feed=tracker.name)
+            breakers.set_feed_halt(halted=cur_stale)
+            prev_stale = cur_stale
+        await asyncio.sleep(poll_sec)
 
 
 class FeedLoop:
@@ -402,9 +434,24 @@ async def _run_one_session(
         settlement_ts_ns=market.settlement_ts_ns,
         clock=clock,
     )
+    # Enforce hard-rule invariant "primary feed staleness > 2s → halt" by
+    # polling the Kalshi tracker. Scoped to the session: cancelled on exit
+    # and the next session spawns a fresh one against a fresh tracker.
+    staleness_task = asyncio.create_task(
+        _watch_kalshi_staleness(breakers=app.breakers, tracker=kalshi_staleness),
+        name="kalshi-staleness-watchdog",
+    )
     try:
         await loop.run()
     finally:
+        staleness_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await staleness_task
+        # Clear stale-feed breaker at session end: the next session's fresh
+        # tracker starts with last_msg_ns=None (never reports stale until its
+        # feed produces), so leaving the breaker latched would spuriously
+        # halt the new session.
+        app.breakers.set_feed_halt(halted=False)
         # Drop the book reference so the next session can register a new one
         # under the new ticker. If an open position still exists we keep it
         # (hard rule #10 — operator must flatten).

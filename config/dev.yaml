@@ -23,7 +23,7 @@ risk:
   max_daily_loss_pct: 0.05
   single_trade_drawdown_freeze_pct: 0.15   # 60-min API lockout
   reconcile_interval_sec: 60
-  clock_drift_halt_ms: 250
+  clock_drift_halt_ms: 1000                # RFC7231 Date header is second-truncated; ±500ms noise floor — see kalshi_rest.kalshi_date_header_probe
 
 signal:
   bollinger_period_bars: 20

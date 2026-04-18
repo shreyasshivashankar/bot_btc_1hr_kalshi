@@ -33,6 +33,7 @@ from bot_btc_1hr_kalshi.execution.broker.paper import PaperBroker
 from bot_btc_1hr_kalshi.execution.broker.shadow import ShadowBroker
 from bot_btc_1hr_kalshi.execution.oms import OMS
 from bot_btc_1hr_kalshi.feedloop import run_forever as run_feed_forever
+from bot_btc_1hr_kalshi.market_data.kalshi_rest import kalshi_date_header_probe
 from bot_btc_1hr_kalshi.monitor.position_monitor import PositionMonitor
 from bot_btc_1hr_kalshi.obs.activity import ActivityTracker
 from bot_btc_1hr_kalshi.obs.clock import SystemClock
@@ -42,6 +43,7 @@ from bot_btc_1hr_kalshi.obs.logging import get_logger
 from bot_btc_1hr_kalshi.portfolio.positions import Portfolio
 from bot_btc_1hr_kalshi.risk.breaker_store import JsonFileBreakerStore, NullBreakerStore
 from bot_btc_1hr_kalshi.risk.breakers import BreakerState
+from bot_btc_1hr_kalshi.risk.clock_drift import ClockDriftMonitor
 
 BREAKER_STATE_PATH_ENV = "BOT_BTC_1HR_KALSHI_BREAKER_STATE_PATH"
 ARCHIVE_DIR_ENV = "BOT_BTC_1HR_KALSHI_ARCHIVE_DIR"
@@ -179,6 +181,7 @@ async def serve(app: App, *, admin_token: str, host: str, port: int) -> None:
     loop = asyncio.get_running_loop()
 
     feed_task: asyncio.Task[None] | None = None
+    drift_task: asyncio.Task[None] | None = None
     rest_client: httpx.AsyncClient | None = None
 
     def _on_term() -> None:
@@ -190,25 +193,29 @@ async def serve(app: App, *, admin_token: str, host: str, port: int) -> None:
         app.halt(reason="sigterm")
         if feed_task is not None:
             feed_task.cancel()
+        if drift_task is not None:
+            drift_task.cancel()
         server.should_exit = True
 
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, _on_term)
 
-    feed_task, rest_client = _start_feed_loop_if_enabled(app, log)
+    feed_task, drift_task, rest_client = _start_feed_loop_if_enabled(app, log)
 
     log.info("boot.serving", mode=app.settings.mode, host=host, port=port)
     try:
         await server.serve()
     finally:
-        if feed_task is not None:
-            feed_task.cancel()
+        for name, task in (("feed-loop", feed_task), ("clock-drift", drift_task)):
+            if task is None:
+                continue
+            task.cancel()
             try:
-                await feed_task
+                await task
             except asyncio.CancelledError:
                 pass
             except Exception as exc:
-                log.warning("shutdown.feed_loop_error", error=str(exc))
+                log.warning("shutdown.task_error", task=name, error=str(exc))
         if rest_client is not None:
             await rest_client.aclose()
         if app.archive_writer is not None:
@@ -223,18 +230,19 @@ async def serve(app: App, *, admin_token: str, host: str, port: int) -> None:
 
 def _start_feed_loop_if_enabled(
     app: App, log: Any,
-) -> tuple[asyncio.Task[None] | None, httpx.AsyncClient | None]:
-    """Spawn the live feed loop unless we're in `dev` mode (no network).
+) -> tuple[asyncio.Task[None] | None, asyncio.Task[None] | None, httpx.AsyncClient | None]:
+    """Spawn the live feed loop + clock-drift monitor unless we're in dev mode.
 
-    Returns (task, http_client) so the caller can cancel the task and close
-    the client on shutdown. Both are None when the loop is disabled.
+    Returns (feed_task, drift_task, http_client) so the caller can cancel
+    each task and close the client on shutdown. All three are None when
+    the live loop is disabled.
     """
     if app.settings.mode not in MODES_WITH_FEED_LOOP:
         log.info("boot.feed_loop_disabled", mode=app.settings.mode)
-        return None, None
+        return None, None, None
     if app.broker is None:
         log.error("boot.feed_loop_missing_broker", mode=app.settings.mode)
-        return None, None
+        return None, None, None
 
     kalshi_ws = _resolve_feed_url(app.settings.feeds.kalshi)
     rest_url = _resolve_rest_url(app.settings.feeds.kalshi)
@@ -252,7 +260,7 @@ def _start_feed_loop_if_enabled(
     ]
     if missing or kalshi_ws is None or rest_url is None or coinbase_ws is None or binance_ws is None:
         log.error("boot.feed_loop_missing_config", missing=missing)
-        return None, None
+        return None, None, None
 
     rest_client = httpx.AsyncClient(base_url=rest_url, timeout=10.0)
     task = asyncio.create_task(
@@ -269,12 +277,26 @@ def _start_feed_loop_if_enabled(
         ),
         name="feed-loop",
     )
+
+    # Clock-drift monitor (hard rule #5). Uses Kalshi's own `Date` response
+    # header as the reference clock — what matters is agreement with the
+    # server we're about to sign requests to, not UTC ground truth.
+    drift_monitor = ClockDriftMonitor(
+        clock=app.clock,
+        breakers=app.breakers,
+        probe=kalshi_date_header_probe(rest_client),
+        interval_sec=30.0,
+        threshold_ms=app.settings.risk.clock_drift_halt_ms,
+    )
+    drift_task = asyncio.create_task(drift_monitor.run(), name="clock-drift")
+
     log.info(
         "boot.feed_loop_started",
         series_ticker=series_ticker,
         kalshi_ws=kalshi_ws,
+        clock_drift_threshold_ms=app.settings.risk.clock_drift_halt_ms,
     )
-    return task, rest_client
+    return task, drift_task, rest_client
 
 
 def main(argv: list[str] | None = None) -> int:

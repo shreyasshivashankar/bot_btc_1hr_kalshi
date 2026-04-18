@@ -99,7 +99,8 @@ gcloud run deploy $BOT_BTC_1HR_KALSHI_SERVICE_NAME \
   --no-allow-unauthenticated \
   --env-vars-file=deploy/env.yaml \
   --set-secrets="BOT_BTC_1HR_KALSHI_API_KEY=BOT_BTC_1HR_KALSHI_API_KEY:latest,BOT_BTC_1HR_KALSHI_API_SECRET=BOT_BTC_1HR_KALSHI_API_SECRET:latest,BOT_BTC_1HR_KALSHI_ADMIN_TOKEN=BOT_BTC_1HR_KALSHI_ADMIN_TOKEN:latest" \
-  --timeout=3600
+  --timeout=3600 \
+  --update-annotations="run.googleapis.com/container-shutdown-timeout=600s"
 ```
 
 Flags explained:
@@ -107,6 +108,7 @@ Flags explained:
 - `--no-cpu-throttling`: CPU is always allocated, not just during HTTP requests. This is what keeps the event loop alive for WS consumption.
 - `--ingress=internal-and-cloud-load-balancing` + `--no-allow-unauthenticated`: no public internet access to admin endpoints.
 - `--timeout=3600`: max HTTP request time; trading loop uses WS, not HTTP, so this only affects admin endpoints.
+- `container-shutdown-timeout=600s` annotation: SIGTERM-to-SIGKILL grace. Bumped from 10s default to the Gen2 max so `halt → flatten → IOC ladder` can drain in-flight exits before the kernel kills the container during infra maintenance.
 - `--set-secrets`: mounts Secret Manager values as env vars at container start.
 
 On successful deploy you'll get a service URL. Save it:

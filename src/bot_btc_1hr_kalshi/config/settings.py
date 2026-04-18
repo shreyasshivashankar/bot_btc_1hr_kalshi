@@ -35,7 +35,7 @@ class RiskSettings(BaseModel):
     max_daily_loss_pct: float = Field(gt=0.0, le=1.0)
     single_trade_drawdown_freeze_pct: float = Field(gt=0.0, le=1.0, default=0.15)
     reconcile_interval_sec: int = Field(gt=0, default=60)
-    clock_drift_halt_ms: int = Field(gt=0, default=250)
+    clock_drift_halt_ms: int = Field(gt=0, default=1000)
 
 
 class SignalSettings(BaseModel):

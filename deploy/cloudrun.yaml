@@ -34,6 +34,13 @@ spec:
 
         # Faster cold start on deploy.
         run.googleapis.com/startup-cpu-boost: "true"
+
+        # SIGTERM → SIGKILL grace. Default is 10s; we bump to the Gen2 max
+        # (600s = 10 min) so `app.halt()` has room to let the IOC escalation
+        # ladder and PositionMonitor drain in-flight exits before the kernel
+        # kills the container during infra maintenance. Residual tail risk
+        # (instant SIGKILL) is handled by ABANDONED_TO_SETTLEMENT accounting.
+        run.googleapis.com/container-shutdown-timeout: "600s"
     spec:
       serviceAccountName: bot-btc-1hr-kalshi-runtime@PROJECT_ID.iam.gserviceaccount.com
       timeoutSeconds: 3600

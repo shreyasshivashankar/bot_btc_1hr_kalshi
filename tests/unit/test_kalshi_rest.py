@@ -9,6 +9,7 @@ import pytest
 from bot_btc_1hr_kalshi.market_data.kalshi_rest import (
     KalshiRestClient,
     MarketDiscoveryError,
+    kalshi_date_header_probe,
 )
 
 
@@ -135,3 +136,57 @@ async def test_list_open_markets_http_error_raises() -> None:
     client = KalshiRestClient(client=_client(httpx.MockTransport(handler)))
     with pytest.raises(MarketDiscoveryError):
         await client.list_open_markets()
+
+
+async def test_kalshi_date_header_probe_parses_rfc7231() -> None:
+    # RFC 7231 IMF-fixdate: "Sun, 06 Nov 1994 08:49:37 GMT"
+    # The probe adds +500ms to the parsed second-truncated Date to center
+    # the zero-drift measurement on zero (the header floor-truncates to 1s).
+    date_hdr = "Fri, 17 Apr 2026 14:12:00 GMT"
+    parsed_ns = int(
+        dt.datetime(2026, 4, 17, 14, 12, 0, tzinfo=dt.UTC).timestamp()
+        * 1_000_000_000
+    )
+    expected_ns = parsed_ns + 500_000_000
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/trade-api/v2/exchange/status"
+        return httpx.Response(
+            200,
+            headers={"Date": date_hdr},
+            content=b'{"exchange_active":true}',
+        )
+
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="https://api.test/trade-api/v2",
+    )
+    probe = kalshi_date_header_probe(client)
+    got_ns = await probe()
+    assert got_ns == expected_ns
+
+
+async def test_kalshi_date_header_probe_missing_header_raises() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b"{}")  # no Date header
+
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="https://api.test/trade-api/v2",
+    )
+    probe = kalshi_date_header_probe(client)
+    with pytest.raises(RuntimeError, match="Date header"):
+        await probe()
+
+
+async def test_kalshi_date_header_probe_5xx_raises() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, content=b"")
+
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="https://api.test/trade-api/v2",
+    )
+    probe = kalshi_date_header_probe(client)
+    with pytest.raises(httpx.HTTPStatusError):
+        await probe()

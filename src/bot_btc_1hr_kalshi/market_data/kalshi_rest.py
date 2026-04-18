@@ -15,13 +15,17 @@ The BTC hourly series ticker is `KXBTC` as of 2026. It is configurable via
 
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 from dataclasses import dataclass
+from email.utils import parsedate_to_datetime
 from typing import Any
 
 import httpx
 import orjson
 import structlog
+
+from bot_btc_1hr_kalshi.risk.clock_drift import NtpProbe
 
 _log = structlog.get_logger("bot_btc_1hr_kalshi.market_discovery")
 
@@ -108,6 +112,9 @@ class KalshiRestClient:
             cursor = data.get("cursor") or None
             if not cursor:
                 break
+            # Space out paginated requests so a multi-page listing can't burst
+            # past Kalshi's retail read rate-limit (~10 req/s) on boot.
+            await asyncio.sleep(0.1)
         return out
 
     async def current_btc_hourly_market(
@@ -166,3 +173,42 @@ class KalshiRestClient:
             candidate_count=len(candidates),
         )
         return chosen
+
+
+_TRUNCATION_MIDPOINT_NS = 500_000_000  # 500ms — see docstring below
+
+
+def kalshi_date_header_probe(
+    client: httpx.AsyncClient,
+    *,
+    path: str = "/exchange/status",
+) -> NtpProbe:
+    """Clock-drift probe built on Kalshi's HTTP `Date` response header.
+
+    `client.base_url` is expected to already include the `/trade-api/v2`
+    prefix (that is how it is wired in `__main__._start_feed_loop_if_enabled`),
+    so `path` defaults to the server-relative suffix. Kalshi's own server
+    clock is our anchor for signed-request validity, not ground-truth UTC —
+    what we halt on is disagreement with the server that validates the
+    `KALSHI-ACCESS-TIMESTAMP` header.
+
+    Resolution: RFC 7231 `Date` is 1-second truncated (floor). A raw parse
+    would systematically under-report server time by a uniform 0-1000 ms,
+    triggering a false-positive halt on any threshold below 1 s. We shift
+    the return value by +500 ms so a perfectly-synced clock measures 0 drift
+    on average, with residual noise uniformly ±500 ms. Callers should pair
+    this probe with `clock_drift_halt_ms >= 1000` (config default). If
+    Kalshi ever ships a millisecond `server_time` JSON field, drop the
+    offset and tighten the threshold.
+    """
+
+    async def _probe() -> int:
+        resp = await client.get(path)
+        resp.raise_for_status()
+        date_hdr = resp.headers.get("Date", "")
+        if not date_hdr:
+            raise RuntimeError("kalshi /exchange/status returned no Date header")
+        parsed = parsedate_to_datetime(date_hdr)
+        return int(parsed.timestamp() * 1_000_000_000) + _TRUNCATION_MIDPOINT_NS
+
+    return _probe
