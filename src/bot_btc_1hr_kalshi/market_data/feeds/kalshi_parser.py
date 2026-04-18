@@ -4,23 +4,42 @@ Kalshi's market-data WS speaks a small set of frame types (plus subscribe/ack
 control frames). This module keeps the wire-format concerns isolated so the
 transport layer can focus on connect/reconnect/staleness.
 
-Frame shapes (Kalshi public docs, as of 2026):
+Wire format (pinned against captured fixtures from api.elections.kalshi.com
+/trade-api/ws/v2, April 2026 — see tests/fixtures/kalshi_ws_frames.jsonl):
+
     orderbook_snapshot:
-        {"type": "orderbook_snapshot",
-         "msg": {"market_ticker": "...",
-                 "yes": [[price, size], ...],
-                 "no":  [[price, size], ...],
-                 "seq": N}}
+        {"type": "orderbook_snapshot", "sid": 1, "seq": N,
+         "msg": {"market_ticker": "...", "market_id": "...",
+                 "yes_dollars_fp": [["0.0100", "5000.00"], ...],
+                 "no_dollars_fp":  [["0.0100", "106.00"], ...]}}
+        Either side may be empty/absent on one-sided books.
+
     orderbook_delta:
-        {"type": "orderbook_delta",
+        {"type": "orderbook_delta", "sid": 1, "seq": N,
+         "msg": {"market_ticker": "...", "market_id": "...",
+                 "price_dollars": "0.8100",
+                 "delta_fp": "-5000.00",      # signed; negative = cancel/fill
+                 "side": "yes" | "no",
+                 "ts": "2026-04-18T05:34:49.816683Z"}}
+
+    trade (REST-observed shape; WS envelope expected to match under `msg`):
+        {"type": "trade", "seq": N,
          "msg": {"market_ticker": "...",
-                 "price": P, "delta": D, "side": "yes"|"no",
-                 "seq": N}}
-    trade:
-        {"type": "trade",
-         "msg": {"market_ticker": "...", "yes_price": P,
-                 "count": N, "taker_side": "yes"|"no",
-                 "ts": ISO_OR_NS}}
+                 "yes_price_dollars": "0.1600",
+                 "no_price_dollars":  "0.8400",
+                 "count_fp": "232.54",        # fractional contracts allowed
+                 "taker_side": "yes" | "no",
+                 "created_time": "2026-04-18T05:26:56.728579Z",
+                 "trade_id": "..."}}
+
+Notes vs the earlier spec we initially coded against:
+  * `seq` is on the OUTER frame (not `msg.seq`).
+  * Prices and sizes are STRINGS in dollars / contracts, not ints.
+  * Timestamps are ISO 8601 strings (`ts` on deltas, `created_time` on trades).
+
+Legacy int-cent fixtures (`yes` / `no` / `price` / `delta` / `msg.seq` /
+`yes_price` / `count`) are still accepted as fallbacks so the compact
+hand-built unit-test fixtures continue to exercise the same code path.
 
 We model our L2Book in terms of YES bids / YES asks (YES is the contract we
 trade). A NO bid at price p is equivalent to a YES ask at (100 - p); the
@@ -42,29 +61,61 @@ class KalshiParseError(ValueError):
 
 
 def _as_ns(ts: Any, fallback_ns: int) -> int:
-    """Kalshi timestamps can be either nanoseconds (int) or seconds (int/float).
-    Treat anything < 10^12 as seconds. If absent, use the caller's fallback.
+    """Normalize a Kalshi timestamp to nanoseconds.
+
+    Observed wire forms:
+      * ISO-8601 string with 'Z' suffix (real wire, e.g. delta.msg.ts):
+        "2026-04-18T05:34:49.816683Z"
+      * seconds as int/float (legacy fixtures)
+      * nanoseconds as int (legacy fixtures; anything ≥ 10^12 is assumed ns)
+
+    None → caller's fallback (usually local recv time).
     """
     if ts is None:
         return fallback_ns
+    if isinstance(ts, str):
+        # Python's fromisoformat handles 'Z' on 3.11+. Fall through to error
+        # if the string is non-ISO so we fail loud on future wire drift.
+        try:
+            from datetime import datetime
+            dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise KalshiParseError(f"unparseable ts string: {ts!r}") from exc
+        return int(dt.timestamp() * 1_000_000_000)
     if isinstance(ts, (int, float)):
         return int(ts * 1_000_000_000) if ts < 1_000_000_000_000 else int(ts)
     raise KalshiParseError(f"unsupported ts type: {type(ts).__name__}")
 
 
-def _levels_yes(yes: list[list[int]], no: list[list[int]]) -> tuple[
-    tuple[BookLevel, ...], tuple[BookLevel, ...]
-]:
+def _price_to_cents(p: Any) -> int:
+    """Accept either an int (legacy cents) or a stringified dollar value
+    ('0.4200' → 42). Kalshi's wire format uses the latter."""
+    if isinstance(p, str):
+        return round(float(p) * 100)
+    return int(p)
+
+
+def _size_to_int(s: Any) -> int:
+    if isinstance(s, str):
+        return round(float(s))
+    return int(s)
+
+
+def _levels_yes(
+    yes: list[list[Any]], no: list[list[Any]],
+) -> tuple[tuple[BookLevel, ...], tuple[BookLevel, ...]]:
     """Convert Kalshi two-sided YES/NO quantities into a YES-centric book.
 
     YES bids stay as-is. NO bids at price `p` (someone wants to buy NO at p)
     become YES asks at `100 - p` (they'd sell YES at 100-p).
     """
     yes_bids = tuple(
-        BookLevel(price_cents=int(p), size=int(s)) for p, s in yes if int(s) > 0
+        BookLevel(price_cents=_price_to_cents(p), size=_size_to_int(s))
+        for p, s in yes if _size_to_int(s) > 0
     )
     yes_asks = tuple(
-        BookLevel(price_cents=100 - int(p), size=int(s)) for p, s in no if int(s) > 0
+        BookLevel(price_cents=100 - _price_to_cents(p), size=_size_to_int(s))
+        for p, s in no if _size_to_int(s) > 0
     )
     return yes_bids, yes_asks
 
@@ -91,10 +142,21 @@ def parse_frame(raw: bytes | str, *, recv_ts_ns: int) -> BookUpdate | TradeEvent
     if not isinstance(msg, dict):
         raise KalshiParseError(f"frame missing msg: {ftype}")
 
+    def _seq() -> int:
+        # `seq` may appear on the outer frame (real wire) or nested in msg
+        # (legacy fixture format). Looked up lazily so unknown-type frames
+        # raise "unknown frame type" rather than a missing-seq error.
+        raw = data.get("seq", msg.get("seq"))
+        if raw is None:
+            raise KalshiParseError(f"{ftype} missing seq")
+        return int(raw)
+
     if ftype == "orderbook_snapshot":
-        yes_bids, yes_asks = _levels_yes(msg.get("yes", []) or [], msg.get("no", []) or [])
+        yes_raw = msg.get("yes_dollars_fp") or msg.get("yes") or []
+        no_raw = msg.get("no_dollars_fp") or msg.get("no") or []
+        yes_bids, yes_asks = _levels_yes(yes_raw, no_raw)
         return BookUpdate(
-            seq=int(msg["seq"]),
+            seq=_seq(),
             ts_ns=_as_ns(msg.get("ts"), recv_ts_ns),
             market_id=str(msg["market_ticker"]),
             bids=yes_bids,
@@ -104,13 +166,20 @@ def parse_frame(raw: bytes | str, *, recv_ts_ns: int) -> BookUpdate | TradeEvent
 
     if ftype == "orderbook_delta":
         side = msg["side"]
-        price = int(msg["price"])
-        delta = int(msg["delta"])
-        # Kalshi deltas are signed quantity changes; we pass the signed value
-        # through unchanged. L2Book accumulates onto the existing level and
-        # removes it when the running total reaches ≤0. Masking negatives to
-        # 0 here (as we previously did) would cause L2Book to treat every
-        # partial fill as "remove this entire price level" and wipe the book.
+        # Wire format: price_dollars / delta_fp as strings. Legacy fixtures:
+        # price / delta as ints. Prefer wire fields, fall back to legacy.
+        price_raw = msg.get("price_dollars", msg.get("price"))
+        delta_raw = msg.get("delta_fp", msg.get("delta"))
+        if price_raw is None or delta_raw is None:
+            raise KalshiParseError("orderbook_delta missing price/delta")
+        price = _price_to_cents(price_raw)
+        # Deltas are signed quantity changes. Preserve sign through
+        # float→int rounding; int(round(-0.4)) is 0, not -1, so only use
+        # the fp path for string inputs.
+        delta = (
+            round(float(delta_raw)) if isinstance(delta_raw, str)
+            else int(delta_raw)
+        )
         bids: tuple[BookLevel, ...]
         asks: tuple[BookLevel, ...]
         if side == "yes":
@@ -122,7 +191,7 @@ def parse_frame(raw: bytes | str, *, recv_ts_ns: int) -> BookUpdate | TradeEvent
         else:
             raise KalshiParseError(f"unknown side: {side}")
         return BookUpdate(
-            seq=int(msg["seq"]),
+            seq=_seq(),
             ts_ns=_as_ns(msg.get("ts"), recv_ts_ns),
             market_id=str(msg["market_ticker"]),
             bids=bids,
@@ -131,6 +200,15 @@ def parse_frame(raw: bytes | str, *, recv_ts_ns: int) -> BookUpdate | TradeEvent
         )
 
     if ftype == "trade":
+        # Real Kalshi trade-record shape (observed via REST /markets/trades,
+        # WS wire expected to match):
+        #   {"yes_price_dollars": "0.1600", "no_price_dollars": "0.8400",
+        #    "count_fp": "232.54", "taker_side": "no",
+        #    "created_time": "2026-04-18T05:26:56.728579Z",
+        #    "ticker": "...", "trade_id": "..."}
+        # REST uses `ticker`, the WS envelope is expected to use
+        # `market_ticker` like snapshot/delta — accept either.
+        # Legacy fixture shape (int cents) kept as fallback for existing tests.
         taker_raw = str(msg["taker_side"]).upper()
         if taker_raw not in ("YES", "NO"):
             raise KalshiParseError(f"unknown taker_side: {taker_raw}")
@@ -138,12 +216,25 @@ def parse_frame(raw: bytes | str, *, recv_ts_ns: int) -> BookUpdate | TradeEvent
         # A YES taker is lifting YES asks (buy-aggressor); a NO taker is
         # lifting NO asks, which in YES-space is a sell-aggressor.
         aggressor: AggressorSide = "buy" if taker == "YES" else "sell"
+
+        price_raw = msg.get("yes_price_dollars", msg.get("yes_price"))
+        if price_raw is None:
+            raise KalshiParseError("trade missing yes_price_dollars / yes_price")
+        size_raw = msg.get("count_fp", msg.get("count"))
+        if size_raw is None:
+            raise KalshiParseError("trade missing count_fp / count")
+        ts_raw = msg.get("created_time", msg.get("ts"))
+        market_raw = msg.get("market_ticker", msg.get("ticker"))
+        if market_raw is None:
+            raise KalshiParseError("trade missing market_ticker / ticker")
+
+        seq_raw = data.get("seq", msg.get("seq", 0))
         return TradeEvent(
-            seq=int(msg.get("seq", 0)),
-            ts_ns=_as_ns(msg.get("ts"), recv_ts_ns),
-            market_id=str(msg["market_ticker"]),
-            price_cents=int(msg["yes_price"]),
-            size=int(msg["count"]),
+            seq=int(seq_raw) if seq_raw is not None else 0,
+            ts_ns=_as_ns(ts_raw, recv_ts_ns),
+            market_id=str(market_raw),
+            price_cents=_price_to_cents(price_raw),
+            size=_size_to_int(size_raw),
             aggressor=aggressor,
             taker_side=taker,
         )
