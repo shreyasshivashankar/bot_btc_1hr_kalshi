@@ -458,13 +458,11 @@ Service config (see `deploy/cloudrun.yaml`):
 ### 11.3 Secrets & environment
 
 **Secret Manager** holds:
-- `BOT_BTC_1HR_KALSHI_API_KEY`
-- `BOT_BTC_1HR_KALSHI_API_SECRET`
-- `BOT_BTC_1HR_KALSHI_COINBASE_API_KEY` (optional, for authenticated feeds)
-- `BOT_BTC_1HR_KALSHI_BINANCE_API_KEY` (optional)
-- `BOT_BTC_1HR_KALSHI_ADMIN_TOKEN` — bearer token for admin endpoints
+- `BOT_BTC_1HR_KALSHI_API_KEY` — Kalshi key id (UUID); exposed as env var of the same name
+- `BOT_BTC_1HR_KALSHI_PRIVATE_KEY` — Kalshi RSA private key (PEM); mounted as a file at `/secrets/kalshi/kalshi-private-key`, path exposed to the app via env var `BOT_BTC_1HR_KALSHI_PRIVATE_KEY_PATH`
+- `BOT_BTC_1HR_KALSHI_ADMIN_TOKEN` — bearer token for admin endpoints; exposed as env var of the same name
 
-Secrets are mounted as env vars at container start via `--set-secrets` on deploy. They never appear in the container image, the YAML manifest, or logs.
+Only short values (UUIDs, tokens) are surfaced as env vars. The multi-line PEM is deliberately mounted as a file: it avoids newline-corruption across shells, matches how argus wires its Kalshi client, and lets us use the same loader locally and on Cloud Run. The application reads the path from `BOT_BTC_1HR_KALSHI_PRIVATE_KEY_PATH`, opens the file, and passes bytes into `KalshiSigner`. Secrets never appear in the container image, the YAML manifest, or logs.
 
 **Env vars (non-secret)** are defined in `deploy/env.example.yaml`. Settable via console or `gcloud run services update --env-vars-file=env.yaml`. See §11.6 for the full list.
 

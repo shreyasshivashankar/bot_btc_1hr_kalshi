@@ -51,7 +51,7 @@ make reconcile      # reconcile local OMS state vs Kalshi broker state
 1. **Never cross the spread on entry.** Maker-only limit orders. Exits may cross via IOC.
 2. **Never deploy untested code to `live`.** Must pass: backtest → paper (≥48h) → shadow (≥24h) → live.
 3. **Never bypass the drawdown freeze.** 15% single-trade loss = 60min API lockout. No override.
-4. **Never hardcode secrets.** Kalshi keys load from Secret Manager (`BOT_BTC_1HR_KALSHI_API_KEY`, `BOT_BTC_1HR_KALSHI_API_SECRET`). Admin endpoints require `BOT_BTC_1HR_KALSHI_ADMIN_TOKEN`.
+4. **Never hardcode secrets.** Kalshi key id loads from Secret Manager as env var `BOT_BTC_1HR_KALSHI_API_KEY`; the RSA private key is mounted from Secret Manager as a file and the app reads its path from `BOT_BTC_1HR_KALSHI_PRIVATE_KEY_PATH` (same pattern locally — env var points at the PEM on disk). Admin endpoints require `BOT_BTC_1HR_KALSHI_ADMIN_TOKEN`.
 5. **Never use `datetime.now()` in trading logic.** Always pass the clock injected via the event loop — backtests need deterministic time.
 6. **Every order decision must emit a `DecisionRecord`** (trap, features, sizing inputs, expected edge). Every closed bet must emit a `BetOutcome` record to `bot_btc_1hr_kalshi.bet_outcomes`. No silent trades.
 7. **Position state is authoritative from the broker, not local memory.** Reconcile every 60s; halt on mismatch >1 contract.

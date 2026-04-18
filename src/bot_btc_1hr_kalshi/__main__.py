@@ -29,10 +29,18 @@ from bot_btc_1hr_kalshi.archive.writer import ArchiveWriter
 from bot_btc_1hr_kalshi.config.loader import load_settings
 from bot_btc_1hr_kalshi.config.settings import FeedSettings, Mode
 from bot_btc_1hr_kalshi.execution.broker.base import Broker
+from bot_btc_1hr_kalshi.execution.broker.kalshi_signer import KalshiSigner
 from bot_btc_1hr_kalshi.execution.broker.paper import PaperBroker
 from bot_btc_1hr_kalshi.execution.broker.shadow import ShadowBroker
 from bot_btc_1hr_kalshi.execution.oms import OMS
-from bot_btc_1hr_kalshi.feedloop import run_forever as run_feed_forever
+from bot_btc_1hr_kalshi.feedloop import (
+    run_forever as run_feed_forever,
+)
+from bot_btc_1hr_kalshi.feedloop import (
+    ws_connect_kalshi_signed,
+    ws_connect_websockets,
+)
+from bot_btc_1hr_kalshi.market_data.feeds.kalshi import WSConnect
 from bot_btc_1hr_kalshi.market_data.kalshi_rest import kalshi_date_header_probe
 from bot_btc_1hr_kalshi.monitor.position_monitor import PositionMonitor
 from bot_btc_1hr_kalshi.obs.activity import ActivityTracker
@@ -48,8 +56,10 @@ from bot_btc_1hr_kalshi.risk.clock_drift import ClockDriftMonitor
 BREAKER_STATE_PATH_ENV = "BOT_BTC_1HR_KALSHI_BREAKER_STATE_PATH"
 ARCHIVE_DIR_ENV = "BOT_BTC_1HR_KALSHI_ARCHIVE_DIR"
 COINBASE_WS_URL_ENV = "BOT_BTC_1HR_KALSHI_COINBASE_WS_URL"
-BINANCE_WS_URL_ENV = "BOT_BTC_1HR_KALSHI_BINANCE_WS_URL"
+KRAKEN_WS_URL_ENV = "BOT_BTC_1HR_KALSHI_KRAKEN_WS_URL"
 SERIES_TICKER_ENV = "BOT_BTC_1HR_KALSHI_SERIES_TICKER"
+KALSHI_API_KEY_ENV = "BOT_BTC_1HR_KALSHI_API_KEY"
+KALSHI_PRIVATE_KEY_PATH_ENV = "BOT_BTC_1HR_KALSHI_PRIVATE_KEY_PATH"
 
 DEFAULT_ADMIN_TOKEN_ENV = "BOT_BTC_1HR_KALSHI_ADMIN_TOKEN"  # noqa: S105 — env var name, not a secret
 PAPER_LIVE_MODES: tuple[Mode, ...] = ("dev", "paper", "shadow", "live")
@@ -251,7 +261,7 @@ def _start_feed_loop_if_enabled(
     kalshi_ws = _resolve_feed_url(app.settings.feeds.kalshi)
     rest_url = _resolve_rest_url(app.settings.feeds.kalshi)
     coinbase_ws = _resolve_feed_url(app.settings.feeds.coinbase) or os.getenv(COINBASE_WS_URL_ENV)
-    binance_ws = _resolve_feed_url(app.settings.feeds.binance) or os.getenv(BINANCE_WS_URL_ENV)
+    kraken_ws = _resolve_feed_url(app.settings.feeds.kraken) or os.getenv(KRAKEN_WS_URL_ENV)
     series_ticker = os.getenv(SERIES_TICKER_ENV, "KXBTC")
 
     missing = [
@@ -259,14 +269,49 @@ def _start_feed_loop_if_enabled(
             ("kalshi.ws_url", kalshi_ws),
             ("kalshi.rest_url", rest_url),
             ("coinbase.ws_url", coinbase_ws),
-            ("binance.ws_url", binance_ws),
+            ("kraken.ws_url", kraken_ws),
         ) if not val
     ]
-    if missing or kalshi_ws is None or rest_url is None or coinbase_ws is None or binance_ws is None:
+    if missing or kalshi_ws is None or rest_url is None or coinbase_ws is None or kraken_ws is None:
         log.error("boot.feed_loop_missing_config", missing=missing)
         return None, None, None
 
     rest_client = httpx.AsyncClient(base_url=rest_url, timeout=10.0)
+
+    # Kalshi's WS handshake is signed — same KALSHI-ACCESS-* header scheme as
+    # REST (see execution/broker/kalshi_signer.py). In dev we may not have
+    # creds wired yet, so fall back to the unsigned connector and log a
+    # warning; in paper / shadow / live the server rejects an unsigned
+    # handshake with HTTP 401, which will surface via the feed reconnect log.
+    kalshi_ws_connect: WSConnect = ws_connect_websockets
+    api_key = os.getenv(KALSHI_API_KEY_ENV)
+    private_key_path = os.getenv(KALSHI_PRIVATE_KEY_PATH_ENV)
+    if api_key and private_key_path:
+        try:
+            pem_bytes = Path(private_key_path).read_bytes()
+            signer = KalshiSigner(
+                api_key_id=api_key,
+                private_key_pem=pem_bytes,
+                clock=app.clock,
+            )
+            kalshi_ws_connect = ws_connect_kalshi_signed(signer)
+            log.info(
+                "boot.kalshi_ws_signed",
+                key_id=api_key[:8] + "…",
+                key_path=private_key_path,
+            )
+        except OSError as exc:
+            log.error("boot.kalshi_key_read_failed", path=private_key_path, error=str(exc))
+            return None, None, rest_client
+        except ValueError as exc:
+            log.error("boot.kalshi_signer_invalid", error=str(exc))
+            return None, None, rest_client
+    else:
+        log.warning(
+            "boot.kalshi_ws_unsigned",
+            note="BOT_BTC_1HR_KALSHI_API_KEY / _PRIVATE_KEY_PATH not set; WS handshake will be rejected by live Kalshi",
+        )
+
     task = asyncio.create_task(
         run_feed_forever(
             app=app,
@@ -275,7 +320,9 @@ def _start_feed_loop_if_enabled(
             clock=app.clock,
             kalshi_ws_url=kalshi_ws,
             coinbase_ws_url=coinbase_ws,
-            binance_ws_url=binance_ws,
+            kraken_ws_url=kraken_ws,
+            ws_connect=kalshi_ws_connect,
+            spot_ws_connect=ws_connect_websockets,
             rest_base="",  # rest_url already includes /trade-api/v2
             series_ticker=series_ticker,
         ),

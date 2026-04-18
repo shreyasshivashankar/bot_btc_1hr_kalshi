@@ -3,8 +3,10 @@
 Runs as a long-lived asyncio task alongside the admin HTTP server. On each
 hour-boundary roll it rediscovers the current BTC hourly market via REST,
 reconnects the Kalshi WS to the new ticker, and resets the L2 book. Spot
-feeds (Coinbase / Binance) are persistent — they feed BTC-USD ticker prices
-into the FeatureEngine independent of which Kalshi contract is active.
+feeds are persistent: Coinbase is the PRIMARY spot venue and feeds the
+FeatureEngine; Kraken is the CONFIRMATION venue and feeds only the
+`IntegrityTracker` (see `signal/integrity.py` — vetoes an entry only on
+active directional disagreement).
 
 Design notes:
   * One entry in flight: `_entry_guard` ensures only one `consider_entry`
@@ -28,21 +30,24 @@ import contextlib
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 import structlog
 
 from bot_btc_1hr_kalshi.app import App
 from bot_btc_1hr_kalshi.execution.broker.base import Broker
+from bot_btc_1hr_kalshi.execution.broker.kalshi_signer import KalshiSigner
 from bot_btc_1hr_kalshi.execution.broker.paper import PaperBroker
 from bot_btc_1hr_kalshi.execution.oms import EntryResult
 from bot_btc_1hr_kalshi.market_data.book import L2Book
-from bot_btc_1hr_kalshi.market_data.feeds.kalshi import KalshiFeed, WSConnect
+from bot_btc_1hr_kalshi.market_data.feeds.kalshi import KalshiFeed, WSConnect, WSConnection
 from bot_btc_1hr_kalshi.market_data.feeds.spot import (
     SpotFeed,
-    binance_parser,
     build_coinbase_subscribe,
+    build_kraken_subscribe,
     coinbase_parser,
+    kraken_parser,
 )
 from bot_btc_1hr_kalshi.market_data.feeds.staleness import StalenessTracker
 from bot_btc_1hr_kalshi.market_data.kalshi_rest import (
@@ -60,6 +65,7 @@ from bot_btc_1hr_kalshi.obs.clock import Clock
 from bot_btc_1hr_kalshi.obs.schemas import Features
 from bot_btc_1hr_kalshi.risk.breakers import BreakerState
 from bot_btc_1hr_kalshi.signal.features import FeatureEngine
+from bot_btc_1hr_kalshi.signal.integrity import IntegrityTracker
 from bot_btc_1hr_kalshi.signal.registry import run_traps
 from bot_btc_1hr_kalshi.signal.types import MarketSnapshot
 
@@ -132,6 +138,7 @@ class FeedLoop:
         settlement_ts_ns: int,
         clock: Clock,
         grace_sec: float = 5.0,
+        integrity: IntegrityTracker | None = None,
     ) -> None:
         self._app = app
         self._broker = broker
@@ -148,6 +155,7 @@ class FeedLoop:
         self._entry_guard = asyncio.Lock()
         self._spot_price: float | None = None
         self._mts_fn = minutes_to_settlement_fn(settlement_ts_ns)
+        self._integrity = integrity
 
     async def run(self) -> None:
         self._app.register_book(self._book)
@@ -201,8 +209,18 @@ class FeedLoop:
             # trade events do not directly produce fills in our model.
             pass
         elif isinstance(event, SpotTick):
-            self._features.update_spot(event.price_usd)
-            self._spot_price = event.price_usd
+            # Primary vs confirmation routing: Coinbase drives features;
+            # Kraken only feeds the integrity gate. Any other venue is
+            # silently dropped — the Venue literal prevents that at type
+            # check but a mis-wired test fixture would still reach here.
+            if event.venue == "coinbase":
+                self._features.update_spot(event.price_usd)
+                self._spot_price = event.price_usd
+                if self._integrity is not None:
+                    self._integrity.record_primary(event.ts_ns, event.price_usd)
+            elif event.venue == "kraken":
+                if self._integrity is not None:
+                    self._integrity.record_confirmation(event.ts_ns, event.price_usd)
 
         await self._maybe_enter()
         await self._monitor_tick()
@@ -223,6 +241,20 @@ class FeedLoop:
         )
         if signal is None:
             return
+
+        # Primary/Confirmation integrity gate (signal/integrity.py). Only
+        # vetoes on active directional disagreement between Coinbase and
+        # Kraken over a ~1s window, plus fail-closed on long confirmation
+        # silence. Absence of the tracker (tests, dev) skips the gate.
+        if self._integrity is not None:
+            decision = self._integrity.check_entry(self._clock.now_ns())
+            if not decision.approved:
+                _log.warning(
+                    "feedloop.entry_vetoed_integrity",
+                    trap=signal.trap,
+                    reason=decision.reason,
+                )
+                return
 
         # Serialize consider_entry so two feeds can't both trigger at once.
         async with self._entry_guard:
@@ -292,6 +324,35 @@ async def ws_connect_websockets(url: str) -> Any:
     return await websockets.connect(url, max_size=8 * 1024 * 1024, ping_interval=20)
 
 
+def ws_connect_kalshi_signed(signer: KalshiSigner) -> WSConnect:
+    """WSConnect factory that signs the Kalshi WS handshake.
+
+    Kalshi's trading-api WS (`/trade-api/ws/v2`) authenticates the opening
+    GET using the same KALSHI-ACCESS-{KEY,TIMESTAMP,SIGNATURE} header trio
+    as REST — see `execution/broker/kalshi_signer.py`. We derive the path
+    from the URL so staging / mock hosts work without reconfiguration:
+    `wss://host/trade-api/ws/v2` → signed path `/trade-api/ws/v2`.
+
+    Spot feeds (Coinbase, Kraken) are public and must NOT be sent these
+    headers; `_run_one_session` keeps a separate unsigned `WSConnect` for
+    them.
+    """
+
+    async def _connect(url: str) -> WSConnection:
+        import websockets
+
+        path = urlparse(url).path or "/"
+        headers = signer.headers(method="GET", path=path)
+        return await websockets.connect(
+            url,
+            additional_headers=headers,
+            max_size=8 * 1024 * 1024,
+            ping_interval=20,
+        )
+
+    return _connect
+
+
 async def run_forever(
     *,
     app: App,
@@ -300,8 +361,9 @@ async def run_forever(
     clock: Clock,
     kalshi_ws_url: str,
     coinbase_ws_url: str,
-    binance_ws_url: str,
+    kraken_ws_url: str,
     ws_connect: WSConnect = ws_connect_websockets,
+    spot_ws_connect: WSConnect | None = None,
     rest_base: str = "/trade-api/v2",
     series_ticker: str = "KXBTC",
     on_book_invalidate: Callable[[str], None] | None = None,
@@ -310,8 +372,13 @@ async def run_forever(
     """Discover → run session → repeat. Never returns under normal operation.
 
     Exits cleanly on asyncio.CancelledError (shutdown path).
+
+    `ws_connect` is used for the Kalshi WS feed (may be signed). `spot_ws_connect`
+    — if None, defaults to `ws_connect` for test back-compat — is used for the
+    public spot venues, which MUST NOT receive Kalshi auth headers.
     """
     discovery = KalshiRestClient(client=rest_http_client, api_base=rest_base)
+    spot_connect = spot_ws_connect if spot_ws_connect is not None else ws_connect
     backoff = 2.0
     while True:
         try:
@@ -343,8 +410,9 @@ async def run_forever(
                 market=market,
                 kalshi_ws_url=kalshi_ws_url,
                 coinbase_ws_url=coinbase_ws_url,
-                binance_ws_url=binance_ws_url,
+                kraken_ws_url=kraken_ws_url,
                 ws_connect=ws_connect,
+                spot_ws_connect=spot_connect,
                 on_book_invalidate=on_book_invalidate,
             )
         except asyncio.CancelledError:
@@ -362,10 +430,12 @@ async def _run_one_session(
     market: HourlyMarket,
     kalshi_ws_url: str,
     coinbase_ws_url: str,
-    binance_ws_url: str,
+    kraken_ws_url: str,
     ws_connect: WSConnect,
+    spot_ws_connect: WSConnect | None = None,
     on_book_invalidate: Callable[[str], None] | None,
 ) -> None:
+    spot_connect = spot_ws_connect if spot_ws_connect is not None else ws_connect
     book = L2Book(market.ticker)
 
     def _invalidate(reason: str) -> None:
@@ -383,10 +453,10 @@ async def _run_one_session(
         clock=clock,
         threshold_ms=app.settings.feeds.coinbase.staleness_halt_ms,
     )
-    binance_staleness = StalenessTracker(
-        name="binance",
+    kraken_staleness = StalenessTracker(
+        name="kraken",
         clock=clock,
-        threshold_ms=app.settings.feeds.binance.staleness_halt_ms,
+        threshold_ms=app.settings.feeds.kraken.staleness_halt_ms,
     )
 
     kalshi_feed = KalshiFeed(
@@ -402,25 +472,30 @@ async def _run_one_session(
             name="coinbase",
             ws_url=coinbase_ws_url,
             clock=clock,
-            ws_connect=ws_connect,
+            ws_connect=spot_connect,
             staleness=coinbase_staleness,
             parse=coinbase_parser(clock),
             subscribe=build_coinbase_subscribe(["BTC-USD"]),
         ),
         SpotFeed(
-            name="binance",
-            ws_url=binance_ws_url,
+            name="kraken",
+            ws_url=kraken_ws_url,
             clock=clock,
-            ws_connect=ws_connect,
-            staleness=binance_staleness,
-            parse=binance_parser(clock),
-            subscribe=None,
+            ws_connect=spot_connect,
+            staleness=kraken_staleness,
+            parse=kraken_parser(clock),
+            subscribe=build_kraken_subscribe(["BTC/USD"]),
         ),
     ]
 
     feature_engine = FeatureEngine(
         bollinger_period=app.settings.signal.bollinger_period_bars,
         bollinger_std_mult=app.settings.signal.bollinger_std_mult,
+    )
+    integrity = IntegrityTracker(
+        velocity_window_sec=app.settings.integrity.velocity_window_sec,
+        active_disagreement_floor_usd=app.settings.integrity.active_disagreement_floor_usd,
+        stale_halt_sec=app.settings.integrity.stale_halt_sec,
     )
     loop = FeedLoop(
         app=app,
@@ -433,6 +508,7 @@ async def _run_one_session(
         strike_usd=market.strike_usd,
         settlement_ts_ns=market.settlement_ts_ns,
         clock=clock,
+        integrity=integrity,
     )
     # Enforce hard-rule invariant "primary feed staleness > 2s → halt" by
     # polling the Kalshi tracker. Scoped to the session: cancelled on exit
@@ -462,6 +538,7 @@ __all__ = [
     "FeedLoop",
     "minutes_to_settlement_fn",
     "run_forever",
+    "ws_connect_kalshi_signed",
     "ws_connect_websockets",
 ]
 

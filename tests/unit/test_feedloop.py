@@ -22,6 +22,7 @@ from bot_btc_1hr_kalshi.feedloop import (
     FeedLoop,
     _watch_kalshi_staleness,
     minutes_to_settlement_fn,
+    ws_connect_kalshi_signed,
 )
 from bot_btc_1hr_kalshi.market_data.book import L2Book
 from bot_btc_1hr_kalshi.market_data.feeds.kalshi import KalshiFeed, WSConnection
@@ -188,6 +189,138 @@ def test_minutes_to_settlement_fn_counts_down() -> None:
     assert fn(30_000_000_000) == pytest.approx(0.5)
     assert fn(60_000_000_000) == 0.0
     assert fn(70_000_000_000) == 0.0  # clamped to 0
+
+
+@pytest.mark.asyncio
+async def test_feedloop_routes_coinbase_to_features_and_kraken_to_integrity() -> None:
+    """Coinbase prints must feed FeatureEngine; Kraken prints must feed
+    IntegrityTracker only. Verified by feeding one tick of each and asserting
+    the destination state changed."""
+    from bot_btc_1hr_kalshi.market_data.feeds.spot import (
+        build_kraken_subscribe,
+        kraken_parser,
+    )
+    from bot_btc_1hr_kalshi.signal.integrity import IntegrityTracker
+
+    start_ns = 1_800_000_000_000_000_000
+    settlement_ns = start_ns + 2_000_000_000
+    clock = ManualClock(start_ns)
+    app, broker = _build_app(clock)
+
+    coinbase_conn = FakeConn([_coinbase_tick(61_000.0)])
+    kraken_conn = FakeConn([orjson.dumps({
+        "channel": "trade",
+        "type": "update",
+        "data": [{
+            "symbol": "BTC/USD",
+            "price": 61_050.0,
+            "qty": 0.01,
+            "timestamp": "2026-04-17T14:00:00Z",
+        }],
+    })])
+    kalshi_conn = FakeConn([_kalshi_snapshot(1)])
+
+    async def connect(url: str) -> WSConnection:
+        if "kraken" in url:
+            return kraken_conn
+        if "coinbase" in url or "ws-feed" in url:
+            return coinbase_conn
+        return kalshi_conn
+
+    kalshi_feed = KalshiFeed(
+        ws_url="ws://kalshi/test",
+        market_tickers=["KXBTC-TEST"],
+        clock=clock,
+        ws_connect=connect,
+        staleness=StalenessTracker(name="kalshi", clock=clock, threshold_ms=2000),
+    )
+    coinbase_feed = SpotFeed(
+        name="coinbase",
+        ws_url="wss://ws-feed.exchange.coinbase.com",
+        clock=clock,
+        ws_connect=connect,
+        staleness=StalenessTracker(name="coinbase", clock=clock, threshold_ms=2000),
+        parse=coinbase_parser(clock),
+        subscribe=build_coinbase_subscribe(["BTC-USD"]),
+    )
+    kraken_feed = SpotFeed(
+        name="kraken",
+        ws_url="wss://ws.kraken.com/v2",
+        clock=clock,
+        ws_connect=connect,
+        staleness=StalenessTracker(name="kraken", clock=clock, threshold_ms=5000),
+        parse=kraken_parser(clock),
+        subscribe=build_kraken_subscribe(["BTC/USD"]),
+    )
+    features = FeatureEngine(bollinger_period=20, bollinger_std_mult=2.0)
+    integrity = IntegrityTracker(
+        velocity_window_sec=1.0,
+        active_disagreement_floor_usd=25.0,
+        stale_halt_sec=60.0,
+    )
+    book = L2Book("KXBTC-TEST")
+    loop = FeedLoop(
+        app=app, broker=broker, book=book, kalshi_feed=kalshi_feed,
+        spot_feeds=[coinbase_feed, kraken_feed], feature_engine=features,
+        market_id="KXBTC-TEST", strike_usd=60_000.0,
+        settlement_ts_ns=settlement_ns, clock=clock, grace_sec=0.1,
+        integrity=integrity,
+    )
+
+    run_task = asyncio.create_task(loop.run())
+    await asyncio.sleep(0.3)
+    clock.set_ns(settlement_ns + 1_000_000_000)
+    await asyncio.wait_for(run_task, timeout=5.0)
+
+    # FeatureEngine only saw Coinbase ($61_000), never Kraken ($61_050).
+    assert features.last_price == 61_000.0
+    # IntegrityTracker saw both venues (Coinbase→primary, Kraken→confirmation).
+    assert integrity.confirmation_last_ns is not None
+    assert integrity.primary_last_ns is not None
+
+
+@pytest.mark.asyncio
+async def test_ws_connect_kalshi_signed_sends_auth_headers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The signed WS factory must hand websockets.connect the KALSHI-ACCESS-*
+    header trio, with the path extracted from the URL (so staging hosts and
+    prod hosts share one factory)."""
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    from bot_btc_1hr_kalshi.execution.broker.kalshi_signer import KalshiSigner
+
+    priv = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    pem = priv.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+    clock = ManualClock(1_700_000_000_000_000_000)
+    signer = KalshiSigner(api_key_id="K123", private_key_pem=pem, clock=clock)
+
+    captured: dict[str, object] = {}
+
+    async def fake_connect(url: str, **kwargs: object) -> object:
+        captured["url"] = url
+        captured["kwargs"] = kwargs
+        return object()
+
+    import websockets as _ws
+
+    monkeypatch.setattr(_ws, "connect", fake_connect)
+
+    connect = ws_connect_kalshi_signed(signer)
+    await connect("wss://api.elections.kalshi.com/trade-api/ws/v2")
+
+    kwargs = captured["kwargs"]
+    assert isinstance(kwargs, dict)
+    headers = kwargs["additional_headers"]
+    assert isinstance(headers, dict)
+    assert headers["KALSHI-ACCESS-KEY"] == "K123"
+    assert "KALSHI-ACCESS-TIMESTAMP" in headers
+    assert "KALSHI-ACCESS-SIGNATURE" in headers
 
 
 @pytest.mark.asyncio

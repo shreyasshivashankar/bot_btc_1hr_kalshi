@@ -12,9 +12,10 @@ feeds:
   coinbase:
     ws_url: wss://ws-feed.exchange.coinbase.com
     staleness_halt_ms: 2000
-  binance:
-    ws_url: wss://stream.binance.com:9443/ws/btcusdt@trade
-    staleness_halt_ms: 2000
+  # Kraken is the confirmation venue (Binance geo-blocked from US Cloud Run).
+  kraken:
+    ws_url: wss://ws.kraken.com/v2
+    staleness_halt_ms: 5000
 
 risk:
   kelly_fraction: 0.25            # ½-Kelly cap — hard ceiling
@@ -46,3 +47,8 @@ telemetry:
   bet_outcomes_logger: bot_btc_1hr_kalshi.bet_outcomes
   bq_dataset: bot_btc_1hr_kalshi_bet_outcomes
   bq_table: outcomes
+
+integrity:
+  velocity_window_sec: 1.0
+  active_disagreement_floor_usd: 25.0
+  stale_halt_sec: 60.0

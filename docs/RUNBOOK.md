@@ -15,10 +15,11 @@ One-time setup (first deploy only):
 
 Set secrets + non-secret env:
 ```bash
-# Secrets — via Secret Manager; referenced by Cloud Run at runtime
+# Secrets — via Secret Manager; referenced by Cloud Run at runtime.
+# PRIVATE_KEY is stored and mounted as a file (PEM), not an env var.
 gcloud secrets versions add BOT_BTC_1HR_KALSHI_ADMIN_TOKEN --data-file=<(openssl rand -hex 32)
 gcloud secrets versions add BOT_BTC_1HR_KALSHI_API_KEY     --data-file=<(echo -n "$KALSHI_KEY_ID")
-gcloud secrets versions add BOT_BTC_1HR_KALSHI_API_SECRET  --data-file=kalshi_private_key.pem
+gcloud secrets versions add BOT_BTC_1HR_KALSHI_PRIVATE_KEY --data-file=kalshi_private_key.pem
 
 # Non-secrets — imported from deploy/env.yaml
 gcloud run services update bot-btc-1hr-kalshi \
@@ -30,9 +31,10 @@ Deploy + start:
 gcloud run deploy bot-btc-1hr-kalshi \
   --source=. \
   --region="${BOT_BTC_1HR_KALSHI_GCP_REGION:-us-central1}" \
+  --set-env-vars=BOT_BTC_1HR_KALSHI_PRIVATE_KEY_PATH=/secrets/kalshi/kalshi-private-key \
   --set-secrets=BOT_BTC_1HR_KALSHI_ADMIN_TOKEN=BOT_BTC_1HR_KALSHI_ADMIN_TOKEN:latest \
   --set-secrets=BOT_BTC_1HR_KALSHI_API_KEY=BOT_BTC_1HR_KALSHI_API_KEY:latest \
-  --set-secrets=BOT_BTC_1HR_KALSHI_API_SECRET=BOT_BTC_1HR_KALSHI_API_SECRET:latest \
+  --set-secrets=/secrets/kalshi/kalshi-private-key=BOT_BTC_1HR_KALSHI_PRIVATE_KEY:latest \
   --args="--mode,paper,--bankroll,50"
 # Note: each container start resets session bankroll to the --bankroll value.
 # Stop + start (or redeploy) to begin a new $50 session.

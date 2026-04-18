@@ -2,7 +2,7 @@
 
 Keeps deque-backed windows plus running sum & sum-of-squares so that `sma`
 and `stddev` are O(1) per query rather than O(window). This matters when
-the spot feed (Binance) bursts hundreds of ticks in a subsecond window and
+the spot feed (Coinbase) bursts hundreds of ticks in a subsecond window and
 we compute features on every tick. Numba lands for ATR later if needed.
 """
 

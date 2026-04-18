@@ -24,7 +24,7 @@ class FeedsSettings(BaseModel):
 
     kalshi: FeedSettings
     coinbase: FeedSettings
-    binance: FeedSettings
+    kraken: FeedSettings
 
 
 class RiskSettings(BaseModel):
@@ -78,6 +78,24 @@ class TelemetrySettings(BaseModel):
     bq_table: str
 
 
+class IntegritySettings(BaseModel):
+    """Primary/Confirmation integrity gate (docs/DESIGN.md §7.3a).
+
+    Coinbase is primary — its prints drive FeatureEngine directly. Kraken is
+    the confirmation venue and vetoes ENTRY only when its directional velocity
+    actively contradicts Coinbase over `velocity_window_sec`. Silence on the
+    confirmation venue is NOT a veto (low-liquidity venues legitimately
+    print intermittently); prolonged silence > `stale_halt_sec` IS a veto
+    (fail-closed on a broken feed).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    velocity_window_sec: float = Field(gt=0.0, default=1.0)
+    active_disagreement_floor_usd: float = Field(gt=0.0, default=25.0)
+    stale_halt_sec: float = Field(gt=0.0, default=60.0)
+
+
 class CalendarSettings(BaseModel):
     """Structured economic-calendar configuration (hard rule #8).
 
@@ -106,3 +124,4 @@ class Settings(BaseModel):
     execution: ExecutionSettings
     telemetry: TelemetrySettings
     calendar: CalendarSettings = CalendarSettings()
+    integrity: IntegritySettings = IntegritySettings()

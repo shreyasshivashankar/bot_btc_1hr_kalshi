@@ -112,9 +112,9 @@ create_secret_interactive() {
     --quiet >/dev/null
 }
 
-create_secret_interactive "BOT_BTC_1HR_KALSHI_API_KEY"    "Paste your Kalshi API KEY:"
-create_secret_interactive "BOT_BTC_1HR_KALSHI_API_SECRET" "Paste your Kalshi API SECRET:"
-create_secret_interactive "BOT_BTC_1HR_KALSHI_ADMIN_TOKEN"       "Admin bearer token (leave blank to auto-generate):" true
+create_secret_interactive "BOT_BTC_1HR_KALSHI_API_KEY"         "Paste your Kalshi API KEY (UUID):"
+create_secret_interactive "BOT_BTC_1HR_KALSHI_PRIVATE_KEY"     "Paste your Kalshi RSA PRIVATE KEY (PEM, including BEGIN/END lines):"
+create_secret_interactive "BOT_BTC_1HR_KALSHI_ADMIN_TOKEN"     "Admin bearer token (leave blank to auto-generate):" true
 
 # ----------------------------------------------------------------------------
 # 4. Cloud Logging: 7-day retention on BOTH buckets (app logs + bet outcomes)
@@ -339,7 +339,8 @@ Next steps:
        --no-cpu-throttling --cpu=2 --memory=2Gi \\
        --ingress=internal-and-cloud-load-balancing --no-allow-unauthenticated \\
        --env-vars-file=deploy/env.yaml \\
-       --set-secrets="BOT_BTC_1HR_KALSHI_API_KEY=BOT_BTC_1HR_KALSHI_API_KEY:latest,BOT_BTC_1HR_KALSHI_API_SECRET=BOT_BTC_1HR_KALSHI_API_SECRET:latest,BOT_BTC_1HR_KALSHI_ADMIN_TOKEN=BOT_BTC_1HR_KALSHI_ADMIN_TOKEN:latest"
+       --set-env-vars="BOT_BTC_1HR_KALSHI_PRIVATE_KEY_PATH=/secrets/kalshi/kalshi-private-key" \\
+       --set-secrets="BOT_BTC_1HR_KALSHI_API_KEY=BOT_BTC_1HR_KALSHI_API_KEY:latest,BOT_BTC_1HR_KALSHI_ADMIN_TOKEN=BOT_BTC_1HR_KALSHI_ADMIN_TOKEN:latest,/secrets/kalshi/kalshi-private-key=BOT_BTC_1HR_KALSHI_PRIVATE_KEY:latest"
 
   4. Grant yourself invoker access:
      gcloud run services add-iam-policy-binding ${BOT_BTC_1HR_KALSHI_SERVICE_NAME} \\
