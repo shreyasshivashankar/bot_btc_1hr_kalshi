@@ -41,7 +41,16 @@ from bot_btc_1hr_kalshi.feedloop import (
     ws_connect_websockets,
 )
 from bot_btc_1hr_kalshi.market_data.feeds.kalshi import WSConnect
+from bot_btc_1hr_kalshi.market_data.feeds.spot import (
+    SpotFeed,
+    build_coinbase_subscribe,
+    build_kraken_subscribe,
+    coinbase_parser,
+    kraken_parser,
+)
+from bot_btc_1hr_kalshi.market_data.feeds.staleness import StalenessTracker
 from bot_btc_1hr_kalshi.market_data.kalshi_rest import kalshi_date_header_probe
+from bot_btc_1hr_kalshi.market_data.spot_oracle import SpotOracle
 from bot_btc_1hr_kalshi.monitor.position_monitor import PositionMonitor
 from bot_btc_1hr_kalshi.obs.activity import ActivityTracker
 from bot_btc_1hr_kalshi.obs.clock import SystemClock
@@ -196,6 +205,7 @@ async def serve(app: App, *, admin_token: str, host: str, port: int) -> None:
 
     feed_task: asyncio.Task[None] | None = None
     drift_task: asyncio.Task[None] | None = None
+    spot_task: asyncio.Task[None] | None = None
     rest_client: httpx.AsyncClient | None = None
 
     def _on_term() -> None:
@@ -209,18 +219,26 @@ async def serve(app: App, *, admin_token: str, host: str, port: int) -> None:
             feed_task.cancel()
         if drift_task is not None:
             drift_task.cancel()
+        if spot_task is not None:
+            spot_task.cancel()
         server.should_exit = True
 
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, _on_term)
 
-    feed_task, drift_task, rest_client = _start_feed_loop_if_enabled(app, log)
+    feed_task, drift_task, spot_task, rest_client = _start_feed_loop_if_enabled(
+        app, log
+    )
 
     log.info("boot.serving", mode=app.settings.mode, host=host, port=port)
     try:
         await server.serve()
     finally:
-        for name, task in (("feed-loop", feed_task), ("clock-drift", drift_task)):
+        for name, task in (
+            ("feed-loop", feed_task),
+            ("clock-drift", drift_task),
+            ("spot-oracle", spot_task),
+        ):
             if task is None:
                 continue
             task.cancel()
@@ -244,19 +262,24 @@ async def serve(app: App, *, admin_token: str, host: str, port: int) -> None:
 
 def _start_feed_loop_if_enabled(
     app: App, log: Any,
-) -> tuple[asyncio.Task[None] | None, asyncio.Task[None] | None, httpx.AsyncClient | None]:
-    """Spawn the live feed loop + clock-drift monitor unless we're in dev mode.
+) -> tuple[
+    asyncio.Task[None] | None,
+    asyncio.Task[None] | None,
+    asyncio.Task[None] | None,
+    httpx.AsyncClient | None,
+]:
+    """Spawn the live feed loop + clock-drift + spot-oracle unless in dev.
 
-    Returns (feed_task, drift_task, http_client) so the caller can cancel
-    each task and close the client on shutdown. All three are None when
-    the live loop is disabled.
+    Returns (feed_task, drift_task, spot_task, http_client) so the caller
+    can cancel each task and close the client on shutdown. All are None
+    when the live loop is disabled.
     """
     if app.settings.mode not in MODES_WITH_FEED_LOOP:
         log.info("boot.feed_loop_disabled", mode=app.settings.mode)
-        return None, None, None
+        return None, None, None, None
     if app.broker is None:
         log.error("boot.feed_loop_missing_broker", mode=app.settings.mode)
-        return None, None, None
+        return None, None, None, None
 
     kalshi_ws = _resolve_feed_url(app.settings.feeds.kalshi)
     rest_url = _resolve_rest_url(app.settings.feeds.kalshi)
@@ -274,7 +297,7 @@ def _start_feed_loop_if_enabled(
     ]
     if missing or kalshi_ws is None or rest_url is None or coinbase_ws is None or kraken_ws is None:
         log.error("boot.feed_loop_missing_config", missing=missing)
-        return None, None, None
+        return None, None, None, None
 
     rest_client = httpx.AsyncClient(base_url=rest_url, timeout=10.0)
 
@@ -302,15 +325,53 @@ def _start_feed_loop_if_enabled(
             )
         except OSError as exc:
             log.error("boot.kalshi_key_read_failed", path=private_key_path, error=str(exc))
-            return None, None, rest_client
+            return None, None, None, rest_client
         except ValueError as exc:
             log.error("boot.kalshi_signer_invalid", error=str(exc))
-            return None, None, rest_client
+            return None, None, None, rest_client
     else:
         log.warning(
             "boot.kalshi_ws_unsigned",
             note="BOT_BTC_1HR_KALSHI_API_KEY / _PRIVATE_KEY_PATH not set; WS handshake will be rejected by live Kalshi",
         )
+
+    # Persistent SpotOracle (Slice 6). Owns the Coinbase + Kraken WS for the
+    # lifetime of the container, not the hourly session — so hour-rolls no
+    # longer start with a blank spot reference (which used to force
+    # alphabetical strike tiebreak and pick deep-ITM markets).
+    coinbase_feed = SpotFeed(
+        name="coinbase",
+        ws_url=coinbase_ws,
+        clock=app.clock,
+        ws_connect=ws_connect_websockets,
+        staleness=StalenessTracker(
+            name="coinbase",
+            clock=app.clock,
+            threshold_ms=app.settings.feeds.coinbase.staleness_halt_ms,
+        ),
+        parse=coinbase_parser(app.clock),
+        subscribe=build_coinbase_subscribe(["BTC-USD"]),
+    )
+    kraken_feed = SpotFeed(
+        name="kraken",
+        ws_url=kraken_ws,
+        clock=app.clock,
+        ws_connect=ws_connect_websockets,
+        staleness=StalenessTracker(
+            name="kraken",
+            clock=app.clock,
+            threshold_ms=app.settings.feeds.kraken.staleness_halt_ms,
+        ),
+        parse=kraken_parser(app.clock),
+        subscribe=build_kraken_subscribe(["BTC/USD"]),
+    )
+    spot_oracle = SpotOracle(
+        primary=coinbase_feed,
+        confirmation=kraken_feed,
+        clock=app.clock,
+    )
+    app.spot_oracle = spot_oracle
+    spot_task = asyncio.create_task(spot_oracle.run(), name="spot-oracle")
 
     task = asyncio.create_task(
         run_feed_forever(
@@ -319,10 +380,8 @@ def _start_feed_loop_if_enabled(
             rest_http_client=rest_client,
             clock=app.clock,
             kalshi_ws_url=kalshi_ws,
-            coinbase_ws_url=coinbase_ws,
-            kraken_ws_url=kraken_ws,
+            spot_oracle=spot_oracle,
             ws_connect=kalshi_ws_connect,
-            spot_ws_connect=ws_connect_websockets,
             rest_base="",  # rest_url already includes /trade-api/v2
             series_ticker=series_ticker,
         ),
@@ -346,8 +405,9 @@ def _start_feed_loop_if_enabled(
         series_ticker=series_ticker,
         kalshi_ws=kalshi_ws,
         clock_drift_threshold_ms=app.settings.risk.clock_drift_halt_ms,
+        spot_staleness_threshold_ms=app.settings.risk.spot_staleness_halt_ms,
     )
-    return task, drift_task, rest_client
+    return task, drift_task, spot_task, rest_client
 
 
 def main(argv: list[str] | None = None) -> int:

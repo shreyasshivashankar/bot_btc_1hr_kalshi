@@ -36,6 +36,11 @@ class RiskSettings(BaseModel):
     single_trade_drawdown_freeze_pct: float = Field(gt=0.0, le=1.0, default=0.15)
     reconcile_interval_sec: int = Field(gt=0, default=60)
     clock_drift_halt_ms: int = Field(gt=0, default=1000)
+    # Hard LastSpot staleness contract (Slice 6). Market discovery and entry
+    # decisions refuse to act when the primary spot tick is older than this.
+    # Matches clock_drift_halt_ms by design: both gate the trading graph
+    # against silent-stale-data-induced decisions.
+    spot_staleness_halt_ms: int = Field(gt=0, default=1000)
 
 
 class SignalSettings(BaseModel):

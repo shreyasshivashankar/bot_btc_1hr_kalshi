@@ -15,6 +15,7 @@ from bot_btc_1hr_kalshi.config.settings import Settings
 from bot_btc_1hr_kalshi.execution.broker.base import Broker
 from bot_btc_1hr_kalshi.execution.oms import OMS
 from bot_btc_1hr_kalshi.market_data.book import L2Book
+from bot_btc_1hr_kalshi.market_data.spot_oracle import SpotOracle
 from bot_btc_1hr_kalshi.monitor.position_monitor import PositionMonitor
 from bot_btc_1hr_kalshi.obs.activity import ActivityTracker
 from bot_btc_1hr_kalshi.obs.clock import Clock
@@ -39,6 +40,11 @@ class App:
     # for every FeedEvent it processes so `make backtest` has a tick archive
     # to replay. Opened/closed by __main__; None in tests and in replay.
     archive_writer: ArchiveWriter | None = None
+    # Persistent BTC spot source. Lives at App scope so discovery and the
+    # FeatureEngine see a continuous price stream across hour-rolls (Slice
+    # 6 — replaces the previous per-session SpotFeed ownership). None when
+    # the feed loop is disabled (dev mode, unit tests).
+    spot_oracle: SpotOracle | None = None
     books: dict[str, L2Book] = field(default_factory=dict)
     trading_halted: bool = False
     tier1_override_active: bool = False

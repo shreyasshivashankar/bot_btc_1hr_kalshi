@@ -84,6 +84,75 @@ async def test_current_btc_hourly_market_no_match_raises() -> None:
         await client.current_btc_hourly_market(now_ns=now_ns)
 
 
+async def test_current_btc_hourly_market_prefers_closest_to_spot() -> None:
+    """With `btc_spot_usd` provided, the tiebreak among same-settlement
+    markets is `|strike - spot|`, NOT alphabetical ticker. Without this
+    Slice 6 fix, the bot systematically picked deep-ITM markets where
+    YES was pinned at ~99¢ and no tradeable edge exists.
+    """
+    now = dt.datetime(2026, 4, 17, 14, 12, 0, tzinfo=dt.UTC)
+    now_ns = int(now.timestamp() * 1_000_000_000)
+    settlement = now.replace(minute=0, second=0) + dt.timedelta(hours=1)
+
+    # All four settle at the same hour; strikes bracket a $78k spot.
+    markets = [
+        {"ticker": "KXBTC-26APR1715-B66000", "expected_expiration_time": _iso(settlement), "floor_strike": 66000},
+        {"ticker": "KXBTC-26APR1715-B77500", "expected_expiration_time": _iso(settlement), "floor_strike": 77500},
+        {"ticker": "KXBTC-26APR1715-B78500", "expected_expiration_time": _iso(settlement), "floor_strike": 78500},
+        {"ticker": "KXBTC-26APR1715-B86000", "expected_expiration_time": _iso(settlement), "floor_strike": 86000},
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=orjson.dumps({"markets": markets}))
+
+    client = KalshiRestClient(client=_client(httpx.MockTransport(handler)))
+    picked = await client.current_btc_hourly_market(now_ns=now_ns, btc_spot_usd=78_000.0)
+    # $77500 is $500 from spot, $78500 is $500 too; tiebreak alphabetically.
+    assert picked.ticker == "KXBTC-26APR1715-B77500"
+
+
+async def test_current_btc_hourly_market_spot_none_uses_alphabetical() -> None:
+    """Back-compat: without spot, tiebreak on ticker (legacy behavior)."""
+    now = dt.datetime(2026, 4, 17, 14, 12, 0, tzinfo=dt.UTC)
+    now_ns = int(now.timestamp() * 1_000_000_000)
+    settlement = now.replace(minute=0, second=0) + dt.timedelta(hours=1)
+    markets = [
+        {"ticker": "KXBTC-26APR1715-B77500", "expected_expiration_time": _iso(settlement), "floor_strike": 77500},
+        {"ticker": "KXBTC-26APR1715-B66000", "expected_expiration_time": _iso(settlement), "floor_strike": 66000},
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=orjson.dumps({"markets": markets}))
+
+    client = KalshiRestClient(client=_client(httpx.MockTransport(handler)))
+    picked = await client.current_btc_hourly_market(now_ns=now_ns)  # no spot
+    # Alphabetical: B66000 sorts before B77500.
+    assert picked.ticker == "KXBTC-26APR1715-B66000"
+
+
+async def test_current_btc_hourly_market_spot_beats_settlement_tie_only() -> None:
+    """Settlement-time remains the primary key — spot proximity only
+    matters within the same settlement. A closer-to-spot market that
+    settles LATER than another must still lose."""
+    now = dt.datetime(2026, 4, 17, 14, 12, 0, tzinfo=dt.UTC)
+    now_ns = int(now.timestamp() * 1_000_000_000)
+    # Both within horizon, different settlements.
+    close_settle = now + dt.timedelta(minutes=30)
+    far_settle = now + dt.timedelta(minutes=55)
+    markets = [
+        {"ticker": "KXBTC-SOON-B66000", "expected_expiration_time": _iso(close_settle), "floor_strike": 66000},
+        {"ticker": "KXBTC-LATE-B78000", "expected_expiration_time": _iso(far_settle), "floor_strike": 78000},
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=orjson.dumps({"markets": markets}))
+
+    client = KalshiRestClient(client=_client(httpx.MockTransport(handler)))
+    picked = await client.current_btc_hourly_market(now_ns=now_ns, btc_spot_usd=78_000.0)
+    # Soonest-settlement wins even though LATE is closer to spot.
+    assert picked.ticker == "KXBTC-SOON-B66000"
+
+
 async def test_current_btc_hourly_market_falls_back_to_ticker_strike() -> None:
     """If floor/cap_strike absent, parse from ticker suffix."""
     now = dt.datetime(2026, 4, 17, 14, 12, 0, tzinfo=dt.UTC)
