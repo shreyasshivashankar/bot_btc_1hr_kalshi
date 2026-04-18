@@ -92,13 +92,16 @@ def _broker_for_mode(mode: Mode, *, clock: SystemClock) -> Broker:
 
     dev / paper: local paper broker (in-proc fill simulation).
     shadow:      no-wire shadow broker (records intents only — hard rule #2).
-    live:        a real Kalshi broker would be wired here; TODO as Slice 4F.
+    live:        KalshiBroker class exists at execution/broker/kalshi.py but
+                 is not wired here yet - the DI (httpx.AsyncClient + Secret
+                 Manager-backed key loading) is a separate change.
 
     Live is deliberately not wired in this function yet: the Kalshi broker
-    needs httpx.AsyncClient + Secret Manager for keys, and that wiring is
-    a separate change. Raise explicitly so `--mode live` fails loudly
-    rather than silently running against PaperBroker — which would be a
-    hard-rule-#2 violation waiting to happen.
+    class is implemented and tested, but plumbing an httpx client plus
+    Secret-Manager-resolved keys through to it is a discrete change. Raise
+    explicitly so `--mode live` fails loudly rather than silently running
+    against PaperBroker — which would be a hard-rule-#2 violation waiting
+    to happen.
     """
     if mode in ("dev", "paper"):
         return PaperBroker(clock=clock)
@@ -106,8 +109,9 @@ def _broker_for_mode(mode: Mode, *, clock: SystemClock) -> Broker:
         return ShadowBroker(clock=clock)
     if mode == "live":
         raise NotImplementedError(
-            "live broker wiring is not yet complete — Kalshi REST broker "
-            "requires httpx client + Secret Manager key loading (Slice 4F)",
+            "live broker wiring is not yet complete — KalshiBroker class "
+            "exists (execution/broker/kalshi.py) but requires httpx client "
+            "+ Secret Manager key loading DI in __main__",
         )
     raise ValueError(f"unknown mode: {mode}")
 

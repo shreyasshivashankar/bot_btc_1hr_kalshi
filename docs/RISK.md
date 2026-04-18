@@ -86,7 +86,7 @@ When end-of-hour IOC escalation fails to find any bid at all (§DESIGN 7.3.3), t
 
 | Breaker                     | Trip condition                        | Action                                      |
 | --------------------------- | ------------------------------------- | ------------------------------------------- |
-| Clock drift                 | NTP offset > 250ms                    | Halt; operator fix required                 |
+| Clock drift                 | Kalshi server-time offset > 1000ms    | Halt; operator fix required                 |
 | Primary feed staleness      | > 2s                                  | Fail-over; if all feeds stale → halt+flatten |
 | Reconciliation mismatch     | Local vs broker > 1 contract          | Halt; page; manual RCA                      |
 | Order ack timeout           | No ack in 3s                          | Cancel-request; if not acked, treat as hung |

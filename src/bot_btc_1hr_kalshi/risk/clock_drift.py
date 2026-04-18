@@ -1,15 +1,18 @@
-"""Clock-drift monitor (hard rule: wall-clock drift > 250ms vs NTP → halt).
+"""Clock-drift monitor (halt on drift > `risk.clock_drift_halt_ms`, default 1000ms).
 
 Our SystemClock wraps `time.time_ns()`. If the host's clock drifts, signed
 Kalshi requests get rejected and event timestamps misorder. This monitor
 takes an injectable async probe that returns an authoritative reference
-time (NTP server, broker `Date` header, etc.) and flips the clock-drift
-breaker if |clock.now_ns() - reference| exceeds the threshold.
+time and flips the clock-drift breaker if
+|clock.now_ns() - reference| exceeds the threshold.
 
-Production is expected to wire a real NTP probe (e.g. ntplib over UDP,
-cached). A no-op probe is shipped for tests; leaving it wired in production
-effectively disables the check, so boot logs a warning if the shipped
-no-op probe is used.
+Production wires `kalshi_date_header_probe` from
+`market_data.kalshi_rest`, which anchors on the RFC 7231 `Date` header
+(second-truncated; the probe shifts +500ms so a synced clock measures
+zero drift on average, giving a ±500ms noise floor — hence the 1000ms
+default threshold). A no-op probe is shipped for tests; leaving it wired
+in production effectively disables the check, so boot logs a warning if
+the shipped no-op probe is used.
 """
 
 from __future__ import annotations

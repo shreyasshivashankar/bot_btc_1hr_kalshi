@@ -2,7 +2,7 @@
 
 Autonomous trading agent for **Kalshi's BTC hourly prediction markets**. Each market resolves YES/NO on whether BTC settles above a strike at the top of the hour; contracts are capped at $1 and pay $1 on correct resolution.
 
-Status: Slices 1–4 shipped (feeds, signal/risk/execution, calendar, ops, Cloud Run deploy). Slice 5 (research / backtest / shadow) deferred — see `CLAUDE.md`.
+Status: Slices 1–4 shipped (feeds, signal/risk/execution, calendar, ops, Cloud Run deploy) plus shadow mode (Slice 4F) and Slice 5 research skeletons (backtest metrics, walk-forward splits, divergence comparator — logic tested, full drivers + live tick capture still to wire). See `CLAUDE.md` § Build status.
 
 ---
 
@@ -69,7 +69,7 @@ src/bot_btc_1hr_kalshi/
   config/        Typed pydantic settings; YAML per mode
   calendar/      Structured economic-calendar poller (pre-emptive flatten)
   archive/       Hour-partitioned JSONL tick archive
-  research/      Replay harness (full backtest/walk-forward deferred to Slice 5)
+  research/      Replay harness, backtest metrics, walk-forward splits, divergence comparator (Slice 5 skeletons; drivers + live tick capture pending)
 
 deploy/        Dockerfile, Cloud Run manifest, setup_gcp.sh, env.example.yaml
 config/        paper.yaml, prod.yaml

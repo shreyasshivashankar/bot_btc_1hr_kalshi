@@ -63,7 +63,7 @@ make reconcile      # reconcile local OMS state vs Kalshi broker state
 
 - `risk.check()` must gate every order submission. It is a pure function returning `Approve | Reject(reason)`.
 - `execution.submit()` returns only after the broker acknowledges — no fire-and-forget.
-- Clock drift >250ms vs NTP → halt.
+- Clock drift >1000ms vs Kalshi server time → halt. Probe anchors on the RFC 7231 `Date` header (1-second truncated); `kalshi_date_header_probe` shifts readings by +500 ms to center zero drift on zero, giving a ±500 ms noise floor — the 1000 ms threshold sits comfortably above this and well below Kalshi's ~5 s signed-request tolerance.
 - Market data staleness >2s on primary feed → halt (fail-over to secondary feed, re-validate).
 - `PositionMonitor` evaluates every open position on every Kalshi tick with priority: early-cashout (≥99¢) > theta-net-target > adaptive-soft-stop. Only one exit order in flight per position.
 - Every `BetOutcome` log record is schema-validated via pydantic before emit — drift between code and BigQuery table breaks tuning queries.
@@ -75,14 +75,21 @@ make reconcile      # reconcile local OMS state vs Kalshi broker state
 - Every module has a unit test. Every trap has a replay test against a canned scenario.
 - No new dependencies without updating `docs/DESIGN.md` § Appendix B (Dependencies).
 
-## Slice 5 — TODO (not implemented)
+## Build status
 
-Research tooling is **deferred**. The current codebase ships Slices 1-4 (feeds, signal/risk/execution, calendar, ops, Cloud Run deploy). `src/bot_btc_1hr_kalshi/research/replay.py` exists as a minimal tick-replay orchestrator used by unit tests, but the full research layer is not built yet.
+**Shipped.** Slices 1-4 complete (feeds, signal/risk/execution, calendar, Cloud Run ops), plus:
 
-Still to do under Slice 5:
-- **Backtest engine**: tick-by-tick replay harness producing Sharpe / maxDD / hit-rate / per-trap PnL attribution. `make backtest` is a placeholder.
-- **Walk-forward param sweeps**: train/validate splits over the captured tick archive (`gs://bot-btc-1hr-kalshi-tick-archive-*`), with deterministic seeds.
-- **Shadow mode**: runs the live decision path against live market data but routes orders to a no-op broker; emits DecisionRecords only. Required by hard rule #2 (≥24h shadow before `make live`).
-- **Param config surface**: YAML-driven sweep definitions + a results table in BigQuery alongside `bet_outcomes`.
+- **Shadow mode (Slice 4F)** — `ShadowBroker` at `execution/broker/shadow.py`, wired in `__main__._broker_for_mode` under `BOT_BTC_1HR_KALSHI_MODE=shadow` / `make shadow`. Satisfies hard rule #2's shadow gate: runs the full live decision pipeline against real feeds, emits `shadow.submit_intent` events, no orders reach Kalshi.
+- **Research skeletons (Slice 5 partial)** — `research/backtest.py` (Sharpe / maxDD / hit-rate math), `research/walkforward.py` (anchored walk-forward splits), `research/divergence.py` (decision-stream comparator), `research/replay.py` (tick orchestrator). The logic is tested; drivers are partial — see below.
+- **Tick archive** — writer/reader for hour-partitioned JSONL archive at `src/bot_btc_1hr_kalshi/archive/`; `make backtest` CLI exists in `research/backtest_cli.py`.
+- **Kalshi REST broker class** — `execution/broker/kalshi.py` implements the `Broker` protocol (signed orders/cancels/positions); tested via `httpx.MockTransport`.
 
-Do not add any of these without reading `docs/DESIGN.md` §10 (Research & Validation) first — the walk-forward methodology is load-bearing for the risk-committee sign-off path.
+**Remaining work before `make live` can graduate past the paper/shadow gates:**
+
+- **Live broker wiring in `__main__._broker_for_mode("live")`** — currently raises `NotImplementedError`. Needs `httpx.AsyncClient` + Secret Manager–backed key loading feeding into `KalshiBroker`. The class is ready; the DI wiring is not.
+- **Live tick capture into the GCS archive** — without ongoing capture, backtests run on synthetic fixtures only; risk-committee sign-off will want replay against real captured hours.
+- **Param-sweep driver** — thread YAML param candidates through `RiskSettings` and emit a results table. Split generator and metrics are ready.
+- **Divergence harness entrypoint** — ties `research/divergence.py`'s tested comparator to a live-vs-replay side-by-side run. Comparator ready; harness wiring not.
+- **Benchmark attribution** — per-regime, per-time-of-day breakouts in the backtest report. Blocked on captured regime-labeled tick data.
+
+Do not extend these without reading `docs/DESIGN.md` §10 (Research & Validation) first — the walk-forward methodology is load-bearing for the risk-committee sign-off path.

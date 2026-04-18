@@ -71,7 +71,7 @@ Each module is an **isolated process or async task** communicating over typed in
 
 - **All timestamps are event-sourced.** Components receive `MarketEvent(ts_ns, ...)` and must never call wall-clock time directly.
 - **Nanosecond precision** across the pipeline. Store as `int64` nanoseconds since epoch.
-- **NTP/chrony** runs on the host; clock skew monitored via Prometheus. >250ms drift halts trading.
+- **Clock-drift probe anchors on Kalshi's server clock** (via the RFC 7231 `Date` response header from `/trade-api/v2/exchange/status`), not NTP. The `kalshi_date_header_probe` helper shifts readings by +500 ms to compensate for the header's 1-second floor truncation, giving a ±500 ms noise floor. Drift >1000 ms (config: `risk.clock_drift_halt_ms`) halts trading; this sits comfortably above the noise floor and well below Kalshi's ~5 s signed-request tolerance.
 - **Backtest determinism:** identical event stream + identical config → identical orders, bit-for-bit. This is gated by a CI test that replays a golden scenario and diffs the decision journal.
 
 ### 3.3 Language / runtime
@@ -208,7 +208,7 @@ Each runs as an independent async task. Any breaker trips → `SystemHalt` event
 - **Drawdown Freeze:** single-trade loss >15% of daily margin → 60min API lockout.
 - **Runaway Train Lockout:** 24h BTC move >5% → Trap 3 disabled for the rest of the session.
 - **Top-Down Alignment Veto:** 1H RSI > 55 vetoes any 5m short setup, and vice versa.
-- **Clock drift breaker:** NTP offset >250ms → halt.
+- **Clock drift breaker:** Kalshi server-time offset >1000ms → halt. Probe anchors on the RFC 7231 `Date` header (+500ms truncation-midpoint offset); see §3.2.
 - **Data staleness breaker:** primary feed silent >2s → halt (see §4 fail-over).
 - **Consecutive loss breaker:** 3 consecutive losses in <30min → pause 15min.
 - **Reconciliation breaker:** local vs broker position mismatch >1 contract → halt, page operator.
@@ -410,7 +410,7 @@ Every page has a runbook entry in `docs/RUNBOOK.md` with: symptom, likely cause,
 | Primary feed down                         | Staleness >2s                     | Fail-over to secondary, re-validate book  | Investigate feed               |
 | All spot feeds down                       | All stale >2s                     | Halt, flatten book via IOC                | Wait for data restoration      |
 | Kalshi API unavailable                    | REST 5xx or WS disconnect >10s    | Halt, hold positions (cannot exit)        | Escalate; manual hedge via spot |
-| Clock drift >250ms                        | NTP offset check                  | Halt                                      | Fix NTP                        |
+| Clock drift >1000ms                       | Kalshi server-time probe (RFC7231 Date) | Halt                                | Investigate local clock / network path |
 | Position mismatch >1 contract             | 60s reconciliation                | Halt, page                                | Manual reconcile + RCA         |
 | Consecutive losses (3 in 30m)             | PnL tracker                       | Pause new entries 15m                     | Review regime, possibly disable trap |
 | Drawdown freeze tripped                   | Single trade loss >15%            | 60m API lockout                           | RCA before resume              |

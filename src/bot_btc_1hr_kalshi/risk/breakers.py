@@ -6,7 +6,7 @@ Breakers:
     process restart inside the freeze window does not silently re-open the
     gate.
   - feed_staleness: primary feed staleness > 2s → halt new entries.
-  - clock_drift: wall-clock drift > 250ms vs NTP → halt.
+  - clock_drift: drift > `risk.clock_drift_halt_ms` (default 1000ms) vs Kalshi server time → halt.
 
 All breaker state is checked by `risk.check()` before order submission.
 """
