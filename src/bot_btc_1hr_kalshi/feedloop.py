@@ -69,7 +69,7 @@ from bot_btc_1hr_kalshi.market_data.types import (
 from bot_btc_1hr_kalshi.obs.clock import Clock
 from bot_btc_1hr_kalshi.obs.schemas import Features
 from bot_btc_1hr_kalshi.risk.breakers import BreakerState
-from bot_btc_1hr_kalshi.signal.features import FeatureEngine
+from bot_btc_1hr_kalshi.signal.features import CVD_ROLLING_PERIODS, FeatureEngine
 from bot_btc_1hr_kalshi.signal.integrity import IntegrityTracker
 from bot_btc_1hr_kalshi.signal.registry import run_traps
 from bot_btc_1hr_kalshi.signal.types import MarketSnapshot
@@ -340,6 +340,7 @@ class FeedLoop:
             rsi_5m=self._features.rsi("5m"),
             rsi_1h=self._features.rsi("1h"),
             move_24h_pct=self._features.move_24h_pct(),
+            cvd_1m_usd=self._features.cvd("1m", periods=CVD_ROLLING_PERIODS),
         )
         return MarketSnapshot(
             market_id=self._market_id,

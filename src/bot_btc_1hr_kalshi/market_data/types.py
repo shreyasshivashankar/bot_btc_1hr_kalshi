@@ -66,12 +66,21 @@ class SpotTick:
     decimals of headroom for sub-cent aggregations and keeps the feature
     engine's rolling windows out of float space entirely. `price_usd` is
     a read-only convenience property for logging and human-facing
-    telemetry — never use it inside arithmetic accumulations."""
+    telemetry — never use it inside arithmetic accumulations.
+
+    `aggressor` is the taker side of the underlying match, normalized to
+    aggressor semantics at the parser layer — Coinbase's `ticker` feed is
+    maker-centric and gets inverted there; Kraken V2's `trade` feed already
+    reports the taker side directly. `None` means the venue frame did not
+    carry side information (initial ticker, quote-only update, or a v1
+    archive written before Slice 9). Bar aggregators that care about signed
+    volume skip `None`-tagged ticks from the buy/sell accumulators."""
 
     ts_ns: int
     venue: Venue
     price_micros: Micros
     size: float
+    aggressor: AggressorSide | None = None
 
     @property
     def price_usd(self) -> float:

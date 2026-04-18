@@ -22,7 +22,7 @@ from bot_btc_1hr_kalshi.obs.money import usd_to_micros
 from bot_btc_1hr_kalshi.portfolio.positions import Portfolio
 from bot_btc_1hr_kalshi.research.replay import ReplayOrchestrator, replay
 from bot_btc_1hr_kalshi.risk.breakers import BreakerState
-from bot_btc_1hr_kalshi.signal.features import FeatureEngine
+from bot_btc_1hr_kalshi.signal.features import CVD_ROLLING_PERIODS, FeatureEngine
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 MARKET = "KBTC-26APR1600-B60000"
@@ -80,7 +80,7 @@ def _build_app_and_orch() -> tuple[App, ReplayOrchestrator, FeatureEngine]:
     # this is a pipeline test, not a signal-tuning test. High ATR thresholds
     # keep the crash from being classified as "high vol".
     features = FeatureEngine(
-        timeframes=["5m", "1h"],
+        timeframes=["1m", "5m", "1h"],
         bollinger_period=10,
         bollinger_std_mult=1.0,
         atr_period=2,
@@ -257,6 +257,42 @@ async def test_replay_respects_trading_halt() -> None:
 
     result = await replay(events, orch)
     assert result.entries_attempted == 0
+    assert app.portfolio.open_positions == ()
+
+
+def _prewarm_1m_cvd_heavy_selling(features: FeatureEngine) -> None:
+    """Fill the 1m CVD deque with persistent aggressor-selling flow.
+
+    `CVD_ROLLING_PERIODS` one-minute bars, each carrying a lopsided
+    $3M sell / $0 buy split -> rolling sum well below the -$5M default
+    veto threshold. The floor trap must read this as a cascade and
+    refuse to fire silently.
+    """
+    for _ in range(CVD_ROLLING_PERIODS):
+        features.ingest_bar_flows("1m", buy_volume_usd=0.0, sell_volume_usd=3_000_000.0)
+
+
+@pytest.mark.integration
+async def test_replay_cvd_veto_blocks_floor_entry_and_stays_silent() -> None:
+    """End-to-end proof: Tape Reader / CVD veto inside detect_floor_reversion
+    refuses to fade a dip that's being driven by unrelenting aggressor
+    selling (Slice 9). Mirror of the HTF-veto test: same 5m setup that
+    otherwise enters and profits, but heavy rolling-5m sell-side flow
+    blocks it silently — no DecisionRecord.
+    """
+    app, orch, features = _build_app_and_orch()
+    _prewarm_bollinger_quiet(features)
+    _prewarm_1m_cvd_heavy_selling(features)
+    _inject_crash_close(features)
+
+    events: list[FeedEvent] = []
+    events.extend(_warmup_events(NS_PER_SEC))
+    events.extend(_fill_and_rebound_events(events[-1].ts_ns + NS_PER_SEC))
+    result = await replay(events, orch)
+
+    assert result.entries_attempted == 0
+    assert result.entries_rejected == 0
+    assert result.reject_reasons == []
     assert app.portfolio.open_positions == ()
 
 

@@ -50,6 +50,11 @@ class Features(BaseModel):
     rsi_5m: float | None = Field(default=None, ge=0.0, le=100.0)
     rsi_1h: float | None = Field(default=None, ge=0.0, le=100.0)
     move_24h_pct: float | None = None
+    # CVD / Tape Reader (Slice 9). Rolling net aggressor-driven USD flow
+    # over the last 5 closed 1m bars. `None` during warmup (first 5 minutes
+    # after a bar-bus start). NULLABLE in BigQuery for back-compat with
+    # pre-Slice-9 rows.
+    cvd_1m_usd: float | None = None
 
 
 class Sizing(BaseModel):

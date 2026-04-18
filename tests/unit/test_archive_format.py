@@ -52,11 +52,30 @@ def test_spottick_roundtrip_preserves_integer_micros() -> None:
         venue="coinbase",
         price_micros=Micros(60_123_456_789),
         size=0.01234,
+        aggressor="buy",
     )
     out = from_dict(to_dict(ev))
     assert out == ev
     assert isinstance(out.price_micros, int)
     assert out.price_micros == 60_123_456_789
+    assert out.aggressor == "buy"
+
+
+def test_spottick_legacy_line_without_aggressor_deserializes_as_none() -> None:
+    # Back-compat: v1 archive lines written before Slice 9 have no `aggressor`
+    # key. The reader must default to None, matching the SpotTick dataclass
+    # default — otherwise old captured history becomes unreadable.
+    legacy = {
+        "v": ARCHIVE_FORMAT_VERSION,
+        "kind": "spot",
+        "ts_ns": 1_700_000_000_000_000_000,
+        "venue": "coinbase",
+        "price_micros": 60_000_000_000,
+        "size": 0.01,
+    }
+    out = from_dict(legacy)
+    assert isinstance(out, SpotTick)
+    assert out.aggressor is None
 
 
 def test_version_mismatch_is_fatal() -> None:

@@ -273,3 +273,101 @@ def test_bollinger_stddev_matches_population_formula() -> None:
     assert mid == pytest.approx(mean)
     assert upper == pytest.approx(mean + 2.0 * pop_std)
     assert lower == pytest.approx(mean - 2.0 * pop_std)
+
+
+# --------------------------- rolling CVD (Slice 9) ------------------------
+
+
+def test_cvd_warmup_returns_none_until_periods_bars_closed() -> None:
+    fe = _engine(timeframes=["1m"])
+    assert fe.cvd("1m", periods=5) is None  # no bars closed
+    for _ in range(4):
+        fe.ingest_bar_flows("1m", buy_volume_usd=1000.0, sell_volume_usd=0.0)
+    assert fe.cvd("1m", periods=5) is None  # 4 < 5
+    fe.ingest_bar_flows("1m", buy_volume_usd=1000.0, sell_volume_usd=0.0)
+    assert fe.cvd("1m", periods=5) == pytest.approx(5_000.0)
+
+
+def test_cvd_rolling_sum_signed() -> None:
+    fe = _engine(timeframes=["1m"])
+    # 5 bars: +2000, -1500, +500, -800, +300 → net +500
+    bars = [
+        (2_000.0, 0.0),
+        (0.0, 1_500.0),
+        (500.0, 0.0),
+        (0.0, 800.0),
+        (300.0, 0.0),
+    ]
+    for buy, sell in bars:
+        fe.ingest_bar_flows("1m", buy_volume_usd=buy, sell_volume_usd=sell)
+    assert fe.cvd("1m", periods=5) == pytest.approx(500.0)
+
+
+def test_cvd_drops_oldest_bar_on_rolling_advance() -> None:
+    """A new bar should evict the oldest — window is strictly rolling."""
+    fe = _engine(timeframes=["1m"])
+    # First 5 bars all +1000 buy → rolling CVD = +5000.
+    for _ in range(5):
+        fe.ingest_bar_flows("1m", buy_volume_usd=1_000.0, sell_volume_usd=0.0)
+    assert fe.cvd("1m", periods=5) == pytest.approx(5_000.0)
+    # Sixth bar is a hard sell → oldest buy evicts, net = +4000 - 3000 = +1000.
+    fe.ingest_bar_flows("1m", buy_volume_usd=0.0, sell_volume_usd=3_000.0)
+    assert fe.cvd("1m", periods=5) == pytest.approx(1_000.0)
+
+
+def test_cvd_shorter_periods_slice_is_correct() -> None:
+    fe = _engine(timeframes=["1m"])
+    # Last 3 bars: +500, +500, -2000 → rolling-3 = -1000; rolling-5 = -1000
+    # as well because first 2 bars are 0,0.
+    for buy, sell in [
+        (0.0, 0.0),
+        (0.0, 0.0),
+        (500.0, 0.0),
+        (500.0, 0.0),
+        (0.0, 2_000.0),
+    ]:
+        fe.ingest_bar_flows("1m", buy_volume_usd=buy, sell_volume_usd=sell)
+    assert fe.cvd("1m", periods=3) == pytest.approx(-1_000.0)
+    assert fe.cvd("1m", periods=5) == pytest.approx(-1_000.0)
+
+
+def test_cvd_rejects_invalid_periods() -> None:
+    fe = _engine(timeframes=["1m"])
+    with pytest.raises(ValueError, match="periods must be > 0"):
+        fe.cvd("1m", periods=0)
+    with pytest.raises(ValueError, match="periods must be > 0"):
+        fe.cvd("1m", periods=-1)
+    with pytest.raises(ValueError, match="exceeds CVD deque capacity"):
+        # deque capacity is CVD_WINDOW_BARS = 10
+        fe.cvd("1m", periods=11)
+
+
+def test_cvd_returns_none_for_unconfigured_tf() -> None:
+    fe = _engine(timeframes=["1m"])
+    # 15m isn't configured on this engine — reader is non-throwing for
+    # "unconfigured TF" the same way rsi/bollinger are (returns None).
+    assert fe.cvd("15m", periods=3) is None
+
+
+def test_cvd_populates_from_bus_path() -> None:
+    """End-to-end: a `Bar` with `buy_volume_usd`/`sell_volume_usd` fired via
+    the bus subscription should be consumed by the CVD deque (no need to
+    call `ingest_bar_flows` explicitly)."""
+    bus = MultiTimeframeBus(tf_secs=[60])
+    fe = FeatureEngine(
+        timeframes=["1m"], bollinger_period=5, bollinger_std_mult=2.0
+    )
+    fe.attach(bus)
+    t0 = 1_713_312_000_000_000_000  # UTC-aligned, from test_bars.T0
+
+    # 6 bars, 60s each, each with a single aggressive buy print for $1k USD.
+    for i in range(7):
+        bus.ingest(SpotTick(
+            ts_ns=t0 + i * 60_000_000_000,
+            venue="coinbase",
+            price_micros=usd_to_micros(100_000.0),
+            size=0.01,  # 100k * 0.01 = $1k
+            aggressor="buy",
+        ))
+    # After the 7th tick, 6 bars closed; last 5 all +$1k buy → CVD = +$5k.
+    assert fe.cvd("1m", periods=5) == pytest.approx(5_000.0)

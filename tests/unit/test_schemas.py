@@ -39,11 +39,27 @@ def _sizing() -> Sizing:
 def test_features_happy_path() -> None:
     f = _features()
     assert f.signal_confidence == 0.7
-    # HTF fields default to None during warmup — existing callers that
+    # HTF + CVD fields default to None during warmup — existing callers that
     # omit them must still validate.
     assert f.rsi_5m is None
     assert f.rsi_1h is None
     assert f.move_24h_pct is None
+    assert f.cvd_1m_usd is None
+
+
+def test_features_cvd_field_populated_and_signed() -> None:
+    """cvd_1m_usd is signed (buy minus sell); both negative and positive
+    values must round-trip unchanged — no stray `ge=0` constraint."""
+    pos = Features(
+        regime_trend="up", regime_vol="normal",
+        signal_confidence=0.5, bollinger_pct_b=0.0, atr_cents=1.0,
+        book_depth_at_entry=1.0, spread_cents=1, spot_btc_usd=1.0,
+        minutes_to_settlement=1.0,
+        cvd_1m_usd=12_345.67,
+    )
+    neg = pos.model_copy(update={"cvd_1m_usd": -9_876.54})
+    assert pos.cvd_1m_usd == 12_345.67
+    assert neg.cvd_1m_usd == -9_876.54
 
 
 def test_features_htf_fields_populated() -> None:

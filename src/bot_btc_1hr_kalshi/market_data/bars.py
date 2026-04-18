@@ -29,9 +29,16 @@ Design choices (see the Slice 7 discussion):
   sits open; for BTC this never happens in practice and for backtests it
   is deterministic. `flush()` force-closes the open bar on teardown.
 
-Not in this slice (intentionally): CVD / signed volume (needs side-tagged
-`SpotTick`, wired in Slice 9), per-timeframe FeatureEngine wiring (Slice
-8), and VWAP state (Slice 10).
+Slice 9 extends the bar with **side-split USD notional** (`buy_volume_usd` /
+`sell_volume_usd`). The aggressor flag lives on `SpotTick`; the aggregator
+computes `notional_usd = price_usd * size` per tick and routes it to the
+buy or sell lane based on `tick.aggressor`. Ticks with `aggressor is None`
+(initial ticker frames, v1 archive lines) still update OHLC and the
+unsigned `volume` counter, but contribute to neither signed lane — this
+is the conservative choice for CVD (counts only verified taker prints).
+
+Not in this slice (intentionally): per-timeframe FeatureEngine wiring was
+Slice 8, and VWAP state is Slice 10.
 """
 
 from __future__ import annotations
@@ -56,6 +63,14 @@ class Bar:
     `tf_sec * 1e9`). `ts_close_ns` is the exclusive upper bound — equal
     to the open of the next bar — so consumers can compute bar age with
     `(now_ns - ts_close_ns)` without off-by-one arithmetic.
+
+    `buy_volume_usd` / `sell_volume_usd` are the **USD-notional** taker
+    flow split (Slice 9 / CVD). USD-denomination is deliberate: a
+    BTC-denominated threshold would fire 2.5x more readily at $40k than at
+    $100k for the same "real" aggression, so the veto would decay in high
+    regimes. `volume` (unsigned BTC size) is retained for any caller that
+    wants coin-denominated flow, but the CVD gate in the traps consumes
+    only the USD lanes.
     """
 
     tf_sec: int
@@ -66,6 +81,8 @@ class Bar:
     low_micros: Micros
     close_micros: Micros
     volume: float
+    buy_volume_usd: float
+    sell_volume_usd: float
     trade_count: int
 
     @property
@@ -84,6 +101,14 @@ class Bar:
     def close_usd(self) -> float:
         return self.close_micros / MICROS_PER_USD
 
+    @property
+    def cvd_usd(self) -> float:
+        """Net aggressor-driven USD flow inside this bar: taker buys minus
+        taker sells. Positive = net buying pressure; negative = net selling.
+        Ticks without an aggressor tag are excluded from both lanes, so the
+        CVD is "verified taker flow only."""
+        return self.buy_volume_usd - self.sell_volume_usd
+
 
 BarCloseCallback = Callable[[Bar], None]
 
@@ -100,12 +125,14 @@ class TimeframeAggregator:
 
     __slots__ = (
         "_close_cbs",
+        "_cur_buy_usd",
         "_cur_close_micros",
         "_cur_close_ns",
         "_cur_high_micros",
         "_cur_low_micros",
         "_cur_open_micros",
         "_cur_open_ns",
+        "_cur_sell_usd",
         "_cur_trade_count",
         "_cur_volume",
         "_tf_ns",
@@ -125,6 +152,8 @@ class TimeframeAggregator:
         self._cur_low_micros: Micros = Micros(0)
         self._cur_close_micros: Micros = Micros(0)
         self._cur_volume: float = 0.0
+        self._cur_buy_usd: float = 0.0
+        self._cur_sell_usd: float = 0.0
         self._cur_trade_count: int = 0
 
     @property
@@ -165,6 +194,11 @@ class TimeframeAggregator:
             self._cur_low_micros = tick.price_micros
         self._cur_close_micros = tick.price_micros
         self._cur_volume += tick.size
+        notional_usd = (tick.price_micros / MICROS_PER_USD) * tick.size
+        if tick.aggressor == "buy":
+            self._cur_buy_usd += notional_usd
+        elif tick.aggressor == "sell":
+            self._cur_sell_usd += notional_usd
         self._cur_trade_count += 1
 
     def flush(self) -> None:
@@ -182,6 +216,9 @@ class TimeframeAggregator:
         self._cur_low_micros = tick.price_micros
         self._cur_close_micros = tick.price_micros
         self._cur_volume = tick.size
+        notional_usd = (tick.price_micros / MICROS_PER_USD) * tick.size
+        self._cur_buy_usd = notional_usd if tick.aggressor == "buy" else 0.0
+        self._cur_sell_usd = notional_usd if tick.aggressor == "sell" else 0.0
         self._cur_trade_count = 1
 
     def _emit_close(self) -> None:
@@ -196,6 +233,8 @@ class TimeframeAggregator:
             low_micros=self._cur_low_micros,
             close_micros=self._cur_close_micros,
             volume=self._cur_volume,
+            buy_volume_usd=self._cur_buy_usd,
+            sell_volume_usd=self._cur_sell_usd,
             trade_count=self._cur_trade_count,
         )
         for cb in list(self._close_cbs):
