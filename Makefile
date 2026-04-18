@@ -8,7 +8,7 @@ VENV_PY := $(VENV)/bin/python
 VENV_PIP := $(VENV)/bin/pip
 
 .DEFAULT_GOAL := help
-.PHONY: help install venv fmt lint typecheck test test-fast replay backtest paper live \
+.PHONY: help install venv fmt lint typecheck clock-lint test test-fast replay backtest paper live \
         reconcile shadow clean bq-query docker-build
 
 help:  ## Show this help
@@ -32,7 +32,17 @@ lint:  ## Lint with ruff
 typecheck:  ## Strict mypy over src/
 	$(VENV)/bin/mypy src
 
-test: lint typecheck  ## Full suite (lint + typecheck + unit + integration, excludes slow)
+# Hard rule #5: trading logic must use the injected clock, never the wall
+# clock directly. Ruff DTZ catches datetime.now() / datetime.utcnow() with
+# no tz — but does not catch time.time(), time.time_ns(), time.monotonic(),
+# or time.monotonic_ns(), which would sneak past the lint. scripts/
+# check_clock_usage.py walks src/ as AST (no docstring false positives)
+# and allow-lists the one file permitted to call time.time_ns() — obs/
+# clock.py, which IS the SystemClock implementation.
+clock-lint:  ## AST-check src/ for banned wall-clock calls (hard rule #5)
+	$(VENV_PY) scripts/check_clock_usage.py
+
+test: lint typecheck clock-lint  ## Full suite (lint + typecheck + clock-lint + unit + integration, excludes slow)
 	$(VENV)/bin/pytest -m "not slow"
 
 test-fast:  ## Unit tests only, skip lint/typecheck
