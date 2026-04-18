@@ -8,13 +8,16 @@ Fires when:
      long against a declared macro downtrend is fighting the tape — the
      HTF veto lives inside the trap so rejected candidates never hit the
      decision journal (DESIGN.md §6.3, Slice 8).
-  5. Confidence (|pct_b|, weighted by 5m RSI alignment) clears the floor.
+  5. Rolling-5m CVD is NOT deeply negative (Slice 9). A dip with persistent
+     net aggressor selling is a cascade, not a dip to fade — "falling
+     knife" veto. Lives inside the trap for the same reason as HTF.
+  6. Confidence (|pct_b|, weighted by 5m RSI alignment) clears the floor.
 
 Side = YES: we're betting the spot will revert upward, making YES more valuable.
 
-Warmup (rsi_1h / rsi_5m == None): both HTF veto and RSI weighting fail-open
-— matches pre-Slice-8 behavior while the accumulators fill on cold start
-(1H RSI needs ~14 hours of 1h closes).
+Warmup (rsi_1h / rsi_5m / cvd_1m_usd == None): HTF veto, RSI weighting, and
+CVD veto all fail-open — matches pre-Slice-8/9 behavior while accumulators
+fill on cold start (1H RSI needs ~14 hours of 1h closes).
 
 Edge: Normal-CDF settlement probability (DESIGN.md §6.2 / signal/edge_model.py)
 minus the maker-entry price in cents. A trap with zero edge is dropped by the
@@ -55,6 +58,7 @@ def detect_floor_reversion(
     *,
     min_confidence: float,
     htf_bearish_veto_rsi: float = 45.0,
+    cvd_1m_veto_threshold_usd: float = 5_000_000.0,
 ) -> TrapSignal | None:
     if not snap.book.valid:
         return None
@@ -74,6 +78,13 @@ def detect_floor_reversion(
     # HTF alignment veto — fail-open during warmup.
     rsi_1h = snap.features.rsi_1h
     if rsi_1h is not None and rsi_1h < htf_bearish_veto_rsi:
+        return None
+
+    # Tape Reader veto (Slice 9) — persistent aggressor selling over the
+    # rolling 5m window means the dip is a cascade, not a reversion. Fail-
+    # open on warmup (cvd None).
+    cvd = snap.features.cvd_1m_usd
+    if cvd is not None and cvd <= -cvd_1m_veto_threshold_usd:
         return None
 
     confidence = min(1.0, abs(pct_b)) * _floor_rsi_weight(snap.features.rsi_5m)

@@ -20,19 +20,25 @@ from bot_btc_1hr_kalshi.market_data.bars import (
     MultiTimeframeBus,
     TimeframeAggregator,
 )
-from bot_btc_1hr_kalshi.market_data.types import SpotTick
+from bot_btc_1hr_kalshi.market_data.types import AggressorSide, SpotTick
 from bot_btc_1hr_kalshi.obs.money import usd_to_micros
 
 # Midnight UTC on 2026-04-17 (chosen so 1m / 1h / 1d boundaries all fall on it).
 T0 = 1_713_312_000_000_000_000
 
 
-def _tick(offset_ns: int, price: float, size: float = 0.01) -> SpotTick:
+def _tick(
+    offset_ns: int,
+    price: float,
+    size: float = 0.01,
+    aggressor: AggressorSide | None = None,
+) -> SpotTick:
     return SpotTick(
         ts_ns=T0 + offset_ns,
         venue="coinbase",
         price_micros=usd_to_micros(price),
         size=size,
+        aggressor=aggressor,
     )
 
 
@@ -215,6 +221,72 @@ def test_multi_tf_bus_nested_boundaries_cofire() -> None:
     assert closes[60][0].ts_close_ns == T0 + 3600_000_000_000
     assert closes[300][0].ts_close_ns == T0 + 3600_000_000_000
     assert closes[3600][0].ts_close_ns == T0 + 3600_000_000_000
+
+
+def test_bar_signed_usd_volume_routes_by_aggressor() -> None:
+    """Slice 9: each tick's USD notional is routed to buy/sell lane via
+    `tick.aggressor`. Untagged ticks update OHLC but contribute to neither
+    lane — CVD counts only verified taker prints."""
+    closed: list[Bar] = []
+    agg = TimeframeAggregator(tf_sec=60)
+    agg.subscribe(closed.append)
+
+    # Tick 1: aggressor=buy @ $80k x 0.10 BTC -> 8,000 USD into buy lane.
+    agg.ingest(_tick(1_000_000_000, 80_000.0, size=0.10, aggressor="buy"))
+    # Tick 2: aggressor=sell @ $80k x 0.05 BTC -> 4,000 USD into sell lane.
+    agg.ingest(_tick(10_000_000_000, 80_000.0, size=0.05, aggressor="sell"))
+    # Tick 3: untagged (None) @ $80k x 0.01 -> NO signed accumulation, but
+    # `volume` (unsigned BTC) still grows by 0.01.
+    agg.ingest(_tick(20_000_000_000, 80_000.0, size=0.01, aggressor=None))
+    # Close the bar.
+    agg.ingest(_tick(60_000_000_000, 80_000.0, size=0.001, aggressor="buy"))
+
+    assert len(closed) == 1
+    bar = closed[0]
+    assert bar.buy_volume_usd == pytest.approx(8_000.0)
+    assert bar.sell_volume_usd == pytest.approx(4_000.0)
+    assert bar.cvd_usd == pytest.approx(4_000.0)
+    # Unsigned BTC volume sums all three prints (0.10 + 0.05 + 0.01 = 0.16).
+    assert bar.volume == pytest.approx(0.16)
+    assert bar.trade_count == 3
+
+
+def test_bar_signed_usd_volume_zero_when_bar_opened_by_untagged_tick() -> None:
+    """A bar opened by an aggressor=None tick must start both signed lanes
+    at 0, not at the tick's notional. Regression guard on `_start_bar`."""
+    closed: list[Bar] = []
+    agg = TimeframeAggregator(tf_sec=60)
+    agg.subscribe(closed.append)
+
+    # Opener is untagged → both lanes start at 0.
+    agg.ingest(_tick(1_000_000_000, 80_000.0, size=0.10, aggressor=None))
+    # Close the bar.
+    agg.ingest(_tick(60_000_000_000, 80_000.0, size=0.001, aggressor=None))
+
+    assert len(closed) == 1
+    bar = closed[0]
+    assert bar.buy_volume_usd == 0.0
+    assert bar.sell_volume_usd == 0.0
+    assert bar.cvd_usd == 0.0
+    # Unsigned volume still captures the untagged prints.
+    assert bar.volume == pytest.approx(0.10)
+
+
+def test_bar_cvd_sign_at_price_extremes_is_price_weighted() -> None:
+    """CVD is USD-denominated: a sell at $100k carries more weight than a
+    buy at $40k for the same coin-size. Regime-robustness smoke test."""
+    closed: list[Bar] = []
+    agg = TimeframeAggregator(tf_sec=60)
+    agg.subscribe(closed.append)
+
+    # Buy 1 BTC @ 40k ($40k). Sell 0.5 BTC @ 100k ($50k). Net CVD should be
+    # -$10k even though coin flow (+1 vs -0.5) is net positive.
+    agg.ingest(_tick(1_000_000_000, 40_000.0, size=1.0, aggressor="buy"))
+    agg.ingest(_tick(30_000_000_000, 100_000.0, size=0.5, aggressor="sell"))
+    agg.ingest(_tick(60_000_000_000, 100_000.0, size=0.001))  # close
+
+    assert len(closed) == 1
+    assert closed[0].cvd_usd == pytest.approx(-10_000.0)
 
 
 def test_multi_tf_bus_flush_propagates() -> None:

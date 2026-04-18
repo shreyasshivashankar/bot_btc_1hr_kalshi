@@ -62,6 +62,15 @@ class SignalSettings(BaseModel):
     # exceeds this fraction, disable Trap 3 — mean-reversion against a
     # parabolic / capitulation phase has no edge.
     runaway_train_halt_pct: float = Field(gt=0.0, le=1.0, default=0.05)
+    # CVD / Tape Reader veto (Slice 9). The floor trap refuses to buy into
+    # a dip when the rolling 5-minute net aggressor flow is `<= -threshold`
+    # (unrelenting taker selling into the lows); the ceiling trap refuses
+    # to short into a pump when flow is `>= +threshold`. USD-denominated so
+    # the threshold is regime-robust — a fixed BTC-denominated bar would
+    # fire ~2.5x more readily at $40k BTC than at $100k BTC. Default $5M
+    # of net rolling-5m flow is "substantial but not catastrophic" — above
+    # normal reversion volume, below cascade scale. Fail-open on warmup.
+    cvd_1m_veto_threshold_usd: float = Field(gt=0.0, default=5_000_000.0)
 
 
 class SoftStopSettings(BaseModel):

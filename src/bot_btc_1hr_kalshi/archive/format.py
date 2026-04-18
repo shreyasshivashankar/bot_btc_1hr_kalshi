@@ -65,6 +65,10 @@ def to_dict(event: FeedEvent) -> dict[str, Any]:
             "venue": event.venue,
             "price_micros": int(event.price_micros),
             "size": event.size,
+            # Aggressor is additive per the stability contract — v1 archives
+            # written before Slice 9 emit no `aggressor` key; the reader uses
+            # `.get()` so they deserialize cleanly with `aggressor=None`.
+            "aggressor": event.aggressor,
         }
     raise ArchiveFormatError(f"unknown FeedEvent type: {type(event).__name__}")
 
@@ -103,5 +107,6 @@ def from_dict(d: dict[str, Any]) -> FeedEvent:
             venue=d["venue"],
             price_micros=Micros(int(d["price_micros"])),
             size=float(d["size"]),
+            aggressor=d.get("aggressor"),
         )
     raise ArchiveFormatError(f"unknown kind: {kind!r}")

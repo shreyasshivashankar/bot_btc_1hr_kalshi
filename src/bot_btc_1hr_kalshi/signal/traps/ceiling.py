@@ -14,14 +14,18 @@ Fires when:
      entirely rather than fade them (DESIGN.md §6.3). Applied only to
      the ceiling trap — the floor trap sets its own bar via pct_b and
      the high-vol regime gate.
-  6. Confidence (|pct_b|, weighted by 5m RSI alignment) clears the floor.
+  6. Rolling-5m CVD is NOT deeply positive (Slice 9). A pump with
+     persistent net aggressor buying is a breakout, not a rip to fade
+     — mirror of the floor's falling-knife veto.
+  7. Confidence (|pct_b|, weighted by 5m RSI alignment) clears the floor.
 
 Side = NO: we bet spot reverts downward -> YES becomes less valuable
 -> NO pays off. Entry is a maker BUY on the NO side at NO best bid
 (= 100 - YES best ask by parity), honoring hard rule #1.
 
-Warmup (rsi_1h / rsi_5m / move_24h_pct == None): all Slice-8 gates
-fail-open — matches pre-Slice-8 behavior while accumulators fill.
+Warmup (rsi_1h / rsi_5m / move_24h_pct / cvd_1m_usd == None): all
+Slice-8/9 gates fail-open — matches pre-slice behavior while
+accumulators fill.
 
 Edge is the Normal-CDF settlement probability for NO minus the NO entry
 price in cents (see signal/edge_model.py).
@@ -57,6 +61,7 @@ def detect_ceiling_reversion(
     min_confidence: float,
     htf_bullish_veto_rsi: float = 55.0,
     runaway_train_halt_pct: float = 0.05,
+    cvd_1m_veto_threshold_usd: float = 5_000_000.0,
 ) -> TrapSignal | None:
     if not snap.book.valid:
         return None
@@ -81,6 +86,13 @@ def detect_ceiling_reversion(
     # capitulation drops are excluded.
     move_24h = snap.features.move_24h_pct
     if move_24h is not None and abs(move_24h) >= runaway_train_halt_pct:
+        return None
+
+    # Tape Reader veto (Slice 9) — persistent aggressor buying over the
+    # rolling 5m window means the rip is a breakout, not a reversion.
+    # Fail-open on warmup (cvd None).
+    cvd = snap.features.cvd_1m_usd
+    if cvd is not None and cvd >= cvd_1m_veto_threshold_usd:
         return None
 
     confidence = min(1.0, abs(pct_b)) * _ceiling_rsi_weight(snap.features.rsi_5m)

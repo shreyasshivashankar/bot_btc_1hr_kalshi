@@ -27,6 +27,14 @@ Design choices
 * **`move_24h_pct()` is 1h-specific.** 25 rolling 1h closes span exactly
   24 hours at the endpoints; kept here (not in `indicators.py`) because
   it's a cross-TF derivative, not a pure per-TF indicator.
+
+* **`cvd(tf, periods)` is rolling-bar, not single-bar (Slice 9).** Reading
+  one just-closed 5m bar exposes the trap to a boundary-lag trap: a
+  cascade at 10:09:45 is invisible if we read the 10:00-10:05 bar. By
+  anchoring the deque to the 1m TF and summing the last N closed bars,
+  the signal updates every minute with a 5-minute (or configurable)
+  lookback, cutting boundary lag without the single-bar noise. Fail-open
+  on warmup (fewer than N closed bars) matches the HTF gate pattern.
 """
 
 from __future__ import annotations
@@ -59,6 +67,19 @@ _SEC_TO_LABEL: dict[int, str] = {v: k for k, v in TF_LABEL_TO_SEC.items()}
 # these on cold start so the ~24h warmup disappears.
 MOVE_24H_WINDOW_BARS = 25
 
+# Rolling CVD window: the trap gate reads `cvd("1m", periods=5)` = last five
+# closed 1m bars, i.e. a 5-minute lookback that updates every 60s. Keeping
+# more than 5 here means callers can cheaply ask for shorter slices too
+# (periods=1 for the most recent minute, periods=3 for a 3m rolling sum);
+# memory cost is ~16 bytes per bar and we only hold this for timeframes
+# actually configured on the engine.
+CVD_WINDOW_BARS = 10
+
+# Default rolling CVD window used by `_snapshot()` callers (feedloop /
+# replay). A separate constant from the deque capacity so a future settings
+# knob can surface this without touching the engine's internal capacity.
+CVD_ROLLING_PERIODS = 5
+
 
 @dataclass(slots=True)
 class _TimeframeState:
@@ -69,6 +90,15 @@ class _TimeframeState:
     # classifier (first-vs-last 5-bar block).
     closes_window: deque[float] = field(default_factory=lambda: deque(maxlen=20))
     last_close: float | None = None
+    # Per-bar signed USD flow (Slice 9). One (buy_usd, sell_usd) tuple per
+    # closed bar; deque drops the oldest on overflow. Only populated from
+    # `_on_bar` (the bus path) because the tuple is taken straight off
+    # `Bar.buy_volume_usd` / `sell_volume_usd`. Direct `ingest_bar` calls
+    # used by unit tests bypass this lane intentionally — CVD-specific
+    # tests use `ingest_bar_flows` (below) to push flows explicitly.
+    cvd_window: deque[tuple[float, float]] = field(
+        default_factory=lambda: deque(maxlen=10)
+    )
 
 
 class FeatureEngine:
@@ -119,6 +149,7 @@ class FeatureEngine:
                 ),
                 atr=ATRAccumulator(period=atr_period),
                 closes_window=deque(maxlen=bollinger_period),
+                cvd_window=deque(maxlen=CVD_WINDOW_BARS),
             )
             for tf in timeframes
         }
@@ -149,6 +180,11 @@ class FeatureEngine:
         if state is None:
             return
         self.ingest_bar(label, close=bar.close_usd, high=bar.high_usd, low=bar.low_usd)
+        # CVD is bar-close-driven on the bus path; direct `ingest_bar` calls
+        # from tests don't carry flow context, so the flow deque only moves
+        # from here (or `ingest_bar_flows`). This split keeps all existing
+        # FeatureEngine unit tests unchanged.
+        state.cvd_window.append((bar.buy_volume_usd, bar.sell_volume_usd))
 
     def ingest_bar(self, tf: str, *, close: float, high: float, low: float) -> None:
         """Route a single bar close into the TF's accumulators.
@@ -167,6 +203,20 @@ class FeatureEngine:
         state.last_close = close
         if tf == "1h":
             self._bars_1h_closes_usd.append(close)
+
+    def ingest_bar_flows(
+        self, tf: str, *, buy_volume_usd: float, sell_volume_usd: float
+    ) -> None:
+        """Push one closed bar's signed USD flow into the TF's CVD deque.
+
+        The bus path (`_on_bar`) does this automatically from `Bar` objects.
+        Tests and replay harnesses that want CVD to be live without running
+        a full `MultiTimeframeBus` pipeline call this directly.
+        """
+        state = self._states.get(tf)
+        if state is None:
+            raise KeyError(f"timeframe {tf!r} not configured on this engine")
+        state.cvd_window.append((buy_volume_usd, sell_volume_usd))
 
     # ---- per-TF readers ---------------------------------------------------
 
@@ -225,6 +275,44 @@ class FeatureEngine:
         if abs(delta) < flat_threshold_usd:
             return "flat"
         return "up" if delta > 0 else "down"
+
+    def cvd(self, tf: str, *, periods: int) -> float | None:
+        """Rolling net aggressor-driven USD flow over the last `periods`
+        closed bars on `tf`. Positive = net taker buying; negative = net
+        taker selling.
+
+        Returns `None` during warmup (fewer than `periods` closed bars)
+        so the trap's CVD gate fails open — identical semantics to the
+        HTF RSI and Runaway Train gates from Slice 8.
+
+        `periods` is bounded above by this TF's deque capacity; asking
+        for more raises `ValueError` so a caller can't silently get a
+        shorter window than they asked for.
+        """
+        if periods <= 0:
+            raise ValueError(f"periods must be > 0, got {periods}")
+        state = self._states.get(tf)
+        if state is None:
+            return None
+        window = state.cvd_window
+        # `deque.maxlen` is typed `int | None`; the `maxlen=CVD_WINDOW_BARS`
+        # at construction guarantees it's non-None, but narrow explicitly so
+        # mypy --strict doesn't have to infer.
+        maxlen = window.maxlen if window.maxlen is not None else CVD_WINDOW_BARS
+        if periods > maxlen:
+            raise ValueError(
+                f"periods={periods} exceeds CVD deque capacity "
+                f"{maxlen} for tf={tf!r}"
+            )
+        if len(window) < periods:
+            return None
+        # Slice the rightmost `periods` tuples. `deque` slicing requires a
+        # list conversion; CVD_WINDOW_BARS is small (10) so the allocation
+        # cost is negligible on the hot path.
+        recent = list(window)[-periods:]
+        buy_total = sum(buy for buy, _ in recent)
+        sell_total = sum(sell for _, sell in recent)
+        return buy_total - sell_total
 
     # ---- cross-TF derivatives --------------------------------------------
 

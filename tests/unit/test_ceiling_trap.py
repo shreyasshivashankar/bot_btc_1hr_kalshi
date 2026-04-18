@@ -36,6 +36,7 @@ def _features(
     rsi_5m: float | None = None,
     rsi_1h: float | None = None,
     move_24h_pct: float | None = None,
+    cvd_1m_usd: float | None = None,
 ) -> Features:
     return Features(
         regime_trend=regime_trend,
@@ -50,6 +51,7 @@ def _features(
         rsi_5m=rsi_5m,
         rsi_1h=rsi_1h,
         move_24h_pct=move_24h_pct,
+        cvd_1m_usd=cvd_1m_usd,
     )
 
 
@@ -65,6 +67,7 @@ def _snap(
     rsi_5m: float | None = None,
     rsi_1h: float | None = None,
     move_24h_pct: float | None = None,
+    cvd_1m_usd: float | None = None,
 ) -> MarketSnapshot:
     return MarketSnapshot(
         market_id="BTC-1H",
@@ -75,6 +78,7 @@ def _snap(
             rsi_5m=rsi_5m,
             rsi_1h=rsi_1h,
             move_24h_pct=move_24h_pct,
+            cvd_1m_usd=cvd_1m_usd,
         ),
         spot_btc_usd=spot,
         minutes_to_settlement=30.0,
@@ -263,3 +267,62 @@ def test_runaway_train_boundary_at_exact_threshold_is_blocking() -> None:
         runaway_train_halt_pct=0.05,
     )
     assert sig is None
+
+
+# ---- Tape Reader / CVD veto (Slice 9) ---------------------------------------
+
+
+def test_cvd_veto_blocks_on_heavy_aggressor_buying() -> None:
+    # Rolling-5m net aggressor flow +$10M >= +$5M default threshold — the
+    # "pump" is a breakout driven by taker buying, not a reversion candidate.
+    sig = detect_ceiling_reversion(
+        _snap(yes_ask=80, yes_bid=78, pct_b=0.9, cvd_1m_usd=10_000_000.0),
+        min_confidence=0.3,
+    )
+    assert sig is None
+
+
+def test_cvd_veto_passes_on_balanced_or_negative_flow() -> None:
+    # Net aggressor selling during a pump is exactly the reversion setup.
+    sig = detect_ceiling_reversion(
+        _snap(yes_ask=80, yes_bid=78, pct_b=0.9, cvd_1m_usd=-2_000_000.0),
+        min_confidence=0.3,
+    )
+    assert sig is not None
+
+
+def test_cvd_veto_fails_open_during_warmup() -> None:
+    sig = detect_ceiling_reversion(
+        _snap(yes_ask=80, yes_bid=78, pct_b=0.9, cvd_1m_usd=None),
+        min_confidence=0.3,
+    )
+    assert sig is not None
+
+
+def test_cvd_veto_threshold_is_configurable() -> None:
+    sig = detect_ceiling_reversion(
+        _snap(yes_ask=80, yes_bid=78, pct_b=0.9, cvd_1m_usd=2_000_000.0),
+        min_confidence=0.3,
+        cvd_1m_veto_threshold_usd=1_000_000.0,
+    )
+    assert sig is None
+
+
+def test_cvd_veto_boundary_at_exact_threshold_is_blocking() -> None:
+    # cvd >= +threshold is the comparison — the exact threshold blocks.
+    sig = detect_ceiling_reversion(
+        _snap(yes_ask=80, yes_bid=78, pct_b=0.9, cvd_1m_usd=5_000_000.0),
+        min_confidence=0.3,
+        cvd_1m_veto_threshold_usd=5_000_000.0,
+    )
+    assert sig is None
+
+
+def test_cvd_veto_does_not_block_on_negative_flow_of_equal_magnitude() -> None:
+    # Symmetric safeguard: a -$10M sell-side flow must NOT block the ceiling
+    # trap — only aggressor buying into the pump indicates a breakout.
+    sig = detect_ceiling_reversion(
+        _snap(yes_ask=80, yes_bid=78, pct_b=0.9, cvd_1m_usd=-10_000_000.0),
+        min_confidence=0.3,
+    )
+    assert sig is not None

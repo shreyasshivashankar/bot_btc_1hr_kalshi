@@ -30,6 +30,7 @@ def _features(
     regime_trend: Literal["up", "down", "flat"] = "flat",
     rsi_5m: float | None = None,
     rsi_1h: float | None = None,
+    cvd_1m_usd: float | None = None,
 ) -> Features:
     return Features(
         regime_trend=regime_trend,
@@ -43,6 +44,7 @@ def _features(
         minutes_to_settlement=30.0,
         rsi_5m=rsi_5m,
         rsi_1h=rsi_1h,
+        cvd_1m_usd=cvd_1m_usd,
     )
 
 
@@ -182,5 +184,67 @@ def test_htf_veto_rsi_threshold_is_configurable() -> None:
         _snap(ask_price=20, pct_b=-0.9, rsi_1h=42.0),
         min_confidence=0.3,
         htf_bearish_veto_rsi=40.0,
+    )
+    assert sig is not None
+
+
+# ---- Tape Reader / CVD veto (Slice 9) ---------------------------------------
+
+
+def test_cvd_veto_blocks_on_heavy_aggressor_selling() -> None:
+    # Rolling-5m net aggressor flow -$10M <= -$5M default threshold — the
+    # "dip" is a cascade driven by taker selling, not a reversion candidate.
+    sig = detect_floor_reversion(
+        _snap(ask_price=20, pct_b=-0.9, cvd_1m_usd=-10_000_000.0),
+        min_confidence=0.3,
+    )
+    assert sig is None
+
+
+def test_cvd_veto_passes_on_balanced_or_positive_flow() -> None:
+    # Net aggressor buying during a dip is exactly the reversion setup.
+    sig = detect_floor_reversion(
+        _snap(ask_price=20, pct_b=-0.9, cvd_1m_usd=2_000_000.0),
+        min_confidence=0.3,
+    )
+    assert sig is not None
+
+
+def test_cvd_veto_fails_open_during_warmup() -> None:
+    # cvd None (fewer than CVD_ROLLING_PERIODS 1m bars accumulated) must
+    # not block the trap — pre-Slice-9 behavior preserved on cold start.
+    sig = detect_floor_reversion(
+        _snap(ask_price=20, pct_b=-0.9, cvd_1m_usd=None),
+        min_confidence=0.3,
+    )
+    assert sig is not None
+
+
+def test_cvd_veto_threshold_is_configurable() -> None:
+    # Tighten to $1M — a -$2M flow that would pass at default now blocks.
+    sig = detect_floor_reversion(
+        _snap(ask_price=20, pct_b=-0.9, cvd_1m_usd=-2_000_000.0),
+        min_confidence=0.3,
+        cvd_1m_veto_threshold_usd=1_000_000.0,
+    )
+    assert sig is None
+
+
+def test_cvd_veto_boundary_at_exact_threshold_is_blocking() -> None:
+    # cvd <= -threshold is the comparison — the exact threshold blocks.
+    sig = detect_floor_reversion(
+        _snap(ask_price=20, pct_b=-0.9, cvd_1m_usd=-5_000_000.0),
+        min_confidence=0.3,
+        cvd_1m_veto_threshold_usd=5_000_000.0,
+    )
+    assert sig is None
+
+
+def test_cvd_veto_does_not_block_on_positive_flow_of_equal_magnitude() -> None:
+    # Symmetric safeguard: a +$10M buy-side flow must NOT block the floor
+    # trap — only aggressor selling into the dip indicates a cascade.
+    sig = detect_floor_reversion(
+        _snap(ask_price=20, pct_b=-0.9, cvd_1m_usd=10_000_000.0),
+        min_confidence=0.3,
     )
     assert sig is not None

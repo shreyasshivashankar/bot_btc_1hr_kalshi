@@ -29,7 +29,7 @@ import structlog
 
 from bot_btc_1hr_kalshi.market_data.feeds.kalshi import SessionEndedError, WSConnect
 from bot_btc_1hr_kalshi.market_data.feeds.staleness import StalenessTracker
-from bot_btc_1hr_kalshi.market_data.types import SpotTick, Venue
+from bot_btc_1hr_kalshi.market_data.types import AggressorSide, SpotTick, Venue
 from bot_btc_1hr_kalshi.obs.clock import Clock
 from bot_btc_1hr_kalshi.obs.money import usd_to_micros
 
@@ -66,11 +66,24 @@ def parse_coinbase(raw: bytes | str, *, recv_ts_ns: int) -> SpotTick | None:
     except (KeyError, ValueError, TypeError) as exc:
         raise SpotParseError(f"missing price: {exc}") from exc
     ts_ns = _iso_to_ns(str(data.get("time", "")), fallback_ns=recv_ts_ns)
+    # Coinbase's `ticker` channel is maker-centric: `side` is the side of the
+    # resting (maker) order that was matched. An uptick (side=="sell") means a
+    # resting sell was lifted by a taker BUY; a downtick (side=="buy") means a
+    # resting buy was hit by a taker SELL. Invert so the downstream CVD
+    # accumulators always receive the taker/aggressor side.
+    raw_side = data.get("side")
+    if raw_side == "sell":
+        aggressor: AggressorSide | None = "buy"
+    elif raw_side == "buy":
+        aggressor = "sell"
+    else:
+        aggressor = None
     return SpotTick(
         ts_ns=ts_ns,
         venue="coinbase",
         price_micros=usd_to_micros(price),
         size=size,
+        aggressor=aggressor,
     )
 
 
@@ -105,11 +118,20 @@ def parse_kraken(raw: bytes | str, *, recv_ts_ns: int) -> SpotTick | None:
     except (KeyError, ValueError, TypeError) as exc:
         raise SpotParseError(f"missing fields: {exc}") from exc
     ts_ns = _iso_to_ns(str(last.get("timestamp", "")), fallback_ns=recv_ts_ns)
+    # Kraken V2 `trade` channel reports the taker side directly, so no
+    # inversion is needed — this mirrors Coinbase's parser inverting for its
+    # maker-centric semantics.
+    raw_side = last.get("side")
+    if raw_side in ("buy", "sell"):
+        aggressor: AggressorSide | None = raw_side
+    else:
+        aggressor = None
     return SpotTick(
         ts_ns=ts_ns,
         venue="kraken",
         price_micros=usd_to_micros(price),
         size=size,
+        aggressor=aggressor,
     )
 
 
