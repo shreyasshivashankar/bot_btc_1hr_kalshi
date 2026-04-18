@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run canned BigQuery queries from docs/RUNBOOK.md against the 5-day bet-outcome dataset.
+# Run canned BigQuery queries from docs/RUNBOOK.md against the 7-day bet-outcome dataset.
 # Usage: ./scripts/query_bets.sh [q1|q2|q3|q4|q5]  (default: q1)
 set -euo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

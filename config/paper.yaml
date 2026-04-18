@@ -16,9 +16,13 @@ feeds:
     staleness_halt_ms: 2000
 
 risk:
+  # Sized for a $50 starter bankroll; bot restarts each session at $50 (see
+  # --bankroll default in __main__.py). Per-position cap = bankroll / 2 so
+  # at-most one position is open at full size. Intra-session the bot sizes
+  # adaptively on remaining bankroll (losses shrink the next bet).
   kelly_fraction: 0.25
-  max_position_notional_usd: 100
-  max_daily_loss_pct: 0.05
+  max_position_notional_usd: 25
+  max_daily_loss_pct: 0.15
   single_trade_drawdown_freeze_pct: 0.15
   reconcile_interval_sec: 60
   clock_drift_halt_ms: 250

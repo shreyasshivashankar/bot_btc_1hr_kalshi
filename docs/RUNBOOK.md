@@ -4,6 +4,63 @@ Every paging alert must have a runbook entry here. Keep entries short: symptom, 
 
 ---
 
+## Quick start: launch in paper mode on Cloud Run
+
+Paper mode = live Kalshi + spot market data, **simulated fills against the local L2 book**, no real orders at the exchange. Every decision (approved or rejected) and every simulated closed bet is emitted as a structured log record and mirrored to BigQuery via the logging sink — those are the rows the weekly parameter-tuning query reads.
+
+One-time setup (first deploy only):
+```bash
+./deploy/setup_gcp.sh          # enables APIs, creates Secret Manager entries, BQ dataset + sink, log bucket
+```
+
+Set secrets + non-secret env:
+```bash
+# Secrets — via Secret Manager; referenced by Cloud Run at runtime
+gcloud secrets versions add BOT_BTC_1HR_KALSHI_ADMIN_TOKEN --data-file=<(openssl rand -hex 32)
+gcloud secrets versions add BOT_BTC_1HR_KALSHI_API_KEY     --data-file=<(echo -n "$KALSHI_KEY_ID")
+gcloud secrets versions add BOT_BTC_1HR_KALSHI_API_SECRET  --data-file=kalshi_private_key.pem
+
+# Non-secrets — imported from deploy/env.yaml
+gcloud run services update bot-btc-1hr-kalshi \
+  --env-vars-file=deploy/env.yaml
+```
+
+Deploy + start:
+```bash
+gcloud run deploy bot-btc-1hr-kalshi \
+  --source=. \
+  --region="${BOT_BTC_1HR_KALSHI_GCP_REGION:-us-central1}" \
+  --set-secrets=BOT_BTC_1HR_KALSHI_ADMIN_TOKEN=BOT_BTC_1HR_KALSHI_ADMIN_TOKEN:latest \
+  --set-secrets=BOT_BTC_1HR_KALSHI_API_KEY=BOT_BTC_1HR_KALSHI_API_KEY:latest \
+  --set-secrets=BOT_BTC_1HR_KALSHI_API_SECRET=BOT_BTC_1HR_KALSHI_API_SECRET:latest \
+  --args="--mode,paper,--bankroll,50"
+# Note: each container start resets session bankroll to the --bankroll value.
+# Stop + start (or redeploy) to begin a new $50 session.
+./scripts/start.sh               # scales min=max=1 (idempotent if already running)
+```
+
+Verify it's trading:
+```bash
+./scripts/status.sh              # should show mode=paper, trading_halted=false, activity.seconds_since_last_tick < 5
+./scripts/view_logs.sh stream    # live-tails logs; look for "decision" and "market_discovery.selected"
+```
+
+Toggle on/off without redeploy:
+```bash
+./scripts/halt.sh                # stop new entries; existing positions still monitored
+./scripts/resume.sh              # resume entries
+./scripts/stop.sh                # scale container to zero (only if no open positions)
+./scripts/start.sh               # scale back up
+```
+
+Market discovery is automatic: the feed loop hits `GET /trade-api/v2/markets?series_ticker=KXBTC&status=open` at each hour boundary, picks the market whose expiration is the next top-of-hour, and subscribes to its WS book. Override the series via `BOT_BTC_1HR_KALSHI_SERIES_TICKER` if Kalshi renames it.
+
+### Flipping paper → live
+
+Live mode is identical to paper except `--mode live` and `RISK_COMMITTEE_SIGNED=yes` must be set. Hard rule #2 requires 48h paper + 24h shadow + risk committee sign-off before flipping. See Gate 1-4 below.
+
+---
+
 ## Promotion checklist (Dev → Live)
 
 ### Gate 1: Backtest
@@ -162,6 +219,26 @@ Flattens the book immediately. 2-hour stabilization follows (no new entries). Lo
 ```
 Prints: mode (paper/shadow/live), halt state, open positions, session PnL, circuit breaker states, feed health.
 
+### Viewing logs
+```bash
+./scripts/view_logs.sh              # last 100 entries, 60m window
+./scripts/view_logs.sh bets         # bet_outcome records only
+./scripts/view_logs.sh decisions    # per-tick DecisionRecords
+./scripts/view_logs.sh errors       # severity >= ERROR
+./scripts/view_logs.sh stream       # live tail (Ctrl-C to stop)
+./scripts/view_logs.sh bets --minutes 1440   # last 24h of closed trades
+```
+Long-term closed-trade analysis lives in BigQuery (`scripts/query_bets.sh`); these modes are for the recent Cloud Logging window.
+
+### Log retention / cleanup
+Cloud Logging retains entries for 14 days by default (policy set by `deploy/setup_gcp.sh`). To prune on demand (e.g. after a noisy debug run):
+```bash
+./scripts/prune_logs.sh              # delete entries older than 14 days
+./scripts/prune_logs.sh --days 7     # tighter window
+./scripts/prune_logs.sh --dry-run    # preview what would be deleted
+```
+`bet_outcomes` records are mirrored to BigQuery via the logging sink — pruning Cloud Logging does **not** delete the BQ rows, so tuning queries stay intact.
+
 ### Tick archive capture (for `make backtest`)
 
 Set `BOT_BTC_1HR_KALSHI_ARCHIVE_DIR=/var/lib/bot_btc_1hr_kalshi/archive` before starting the bot. Every `FeedEvent` consumed by the live loop is appended to hour-partitioned JSONL files (`events-YYYY-MM-DDTHH.jsonl`). Sync the directory to GCS periodically:
@@ -208,7 +285,7 @@ Values are `null` until the first tick/decision of a run — treat null as OK on
 
 ## Bet-outcome log queries (for parameter tuning)
 
-All queries run against BigQuery dataset `bot_btc_1hr_kalshi_bet_outcomes.outcomes` (5-day retention). Same data is queryable in **Cloud Logging → Logs Explorer** with filter `logName:"projects/$PROJECT/logs/bot_btc_1hr_kalshi.bet_outcomes"` for one-off investigations.
+All queries run against BigQuery dataset `bot_btc_1hr_kalshi_bet_outcomes.outcomes` (7-day retention). Same data is queryable in **Cloud Logging → Logs Explorer** with filter `logName:"projects/$PROJECT/logs/bot_btc_1hr_kalshi.bet_outcomes"` for one-off investigations.
 
 ### Q1 — Hit rate & PnL by trap
 ```sql
@@ -254,7 +331,7 @@ GROUP BY trend, vol
 HAVING n >= 10
 ORDER BY total_pnl_usd ASC;    -- worst regimes surface first
 ```
-Any (trend, vol) bucket with n ≥ 20 and negative total_pnl_usd over 5 days → disable that cell in the regime×trap matrix (DESIGN §13) for the next session.
+Any (trend, vol) bucket with n ≥ 20 and negative total_pnl_usd over 7 days → disable that cell in the regime×trap matrix (DESIGN §13) for the next session.
 
 ### Q4 — Early cash-out EV validation
 ```sql
@@ -268,7 +345,7 @@ SELECT
 FROM `bot_btc_1hr_kalshi_bet_outcomes.outcomes`
 WHERE exit_reason = 'early_cashout_99';
 ```
-If `missed_upside` > 30% of realized over 5 days, the threshold is too aggressive — consider raising from 99 to 97.
+If `missed_upside` > 30% of realized over 7 days, the threshold is too aggressive — consider raising from 99 to 97.
 
 ### Q5 — Confidence score calibration
 ```sql
@@ -287,7 +364,7 @@ Confidence should monotonically track hit rate. If not, the confidence formula n
 
 ## Tuning procedure — weekly, data-driven
 
-Run every Monday on Friday-close data (rolls with the 5-day retention window):
+Run every Monday on prior-week data (rolls with the 7-day retention window):
 
 1. Run Q1–Q5 in BigQuery. Capture results into `docs/tuning/YYYY-MM-DD.md`.
 2. Identify the **one** highest-signal change. Never tune more than one parameter per week — you can't attribute PnL deltas to multiple simultaneous changes.

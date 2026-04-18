@@ -1,7 +1,7 @@
 """Process entrypoint. Wires config -> feeds -> risk -> execution -> monitor -> admin.
 
 Usage:
-    python -m bot_btc_1hr_kalshi --mode paper [--port 8080] [--bankroll 1000] \
+    python -m bot_btc_1hr_kalshi --mode paper [--port 8080] [--bankroll 50] \
         [--admin-token-env BOT_BTC_1HR_KALSHI_ADMIN_TOKEN]
 
 The current boot path covers `dev` and `paper` modes: it loads config, assembles
@@ -18,18 +18,21 @@ import os
 import signal
 import sys
 from pathlib import Path
+from typing import Any
 
+import httpx
 import uvicorn
 
 from bot_btc_1hr_kalshi.admin.server import create_app as create_admin_app
 from bot_btc_1hr_kalshi.app import App
 from bot_btc_1hr_kalshi.archive.writer import ArchiveWriter
 from bot_btc_1hr_kalshi.config.loader import load_settings
-from bot_btc_1hr_kalshi.config.settings import Mode
+from bot_btc_1hr_kalshi.config.settings import FeedSettings, Mode
 from bot_btc_1hr_kalshi.execution.broker.base import Broker
 from bot_btc_1hr_kalshi.execution.broker.paper import PaperBroker
 from bot_btc_1hr_kalshi.execution.broker.shadow import ShadowBroker
 from bot_btc_1hr_kalshi.execution.oms import OMS
+from bot_btc_1hr_kalshi.feedloop import run_forever as run_feed_forever
 from bot_btc_1hr_kalshi.monitor.position_monitor import PositionMonitor
 from bot_btc_1hr_kalshi.obs.activity import ActivityTracker
 from bot_btc_1hr_kalshi.obs.clock import SystemClock
@@ -42,9 +45,30 @@ from bot_btc_1hr_kalshi.risk.breakers import BreakerState
 
 BREAKER_STATE_PATH_ENV = "BOT_BTC_1HR_KALSHI_BREAKER_STATE_PATH"
 ARCHIVE_DIR_ENV = "BOT_BTC_1HR_KALSHI_ARCHIVE_DIR"
+COINBASE_WS_URL_ENV = "BOT_BTC_1HR_KALSHI_COINBASE_WS_URL"
+BINANCE_WS_URL_ENV = "BOT_BTC_1HR_KALSHI_BINANCE_WS_URL"
+SERIES_TICKER_ENV = "BOT_BTC_1HR_KALSHI_SERIES_TICKER"
 
 DEFAULT_ADMIN_TOKEN_ENV = "BOT_BTC_1HR_KALSHI_ADMIN_TOKEN"  # noqa: S105 — env var name, not a secret
 PAPER_LIVE_MODES: tuple[Mode, ...] = ("dev", "paper", "shadow", "live")
+MODES_WITH_FEED_LOOP: tuple[Mode, ...] = ("paper", "shadow", "live")
+
+
+def _resolve_feed_url(feed: FeedSettings) -> str | None:
+    """Resolve a feed's WS URL from explicit value or env-var indirection."""
+    if feed.ws_url:
+        return feed.ws_url
+    if feed.ws_url_env:
+        return os.getenv(feed.ws_url_env)
+    return None
+
+
+def _resolve_rest_url(feed: FeedSettings) -> str | None:
+    if feed.rest_url:
+        return feed.rest_url
+    if feed.rest_url_env:
+        return os.getenv(feed.rest_url_env)
+    return None
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -52,7 +76,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--mode", choices=PAPER_LIVE_MODES, required=True)
     p.add_argument("--port", type=int, default=8080)
     p.add_argument("--host", default="0.0.0.0")  # noqa: S104 — Cloud Run needs this
-    p.add_argument("--bankroll", type=float, default=1000.0)
+    # Session bankroll. Each container start resets to this value — stop/start
+    # the Cloud Run service to begin a new session. Sized intra-session by
+    # fractional-Kelly against remaining bankroll (via Portfolio).
+    p.add_argument("--bankroll", type=float, default=50.0)
     p.add_argument("--admin-token-env", default=DEFAULT_ADMIN_TOKEN_ENV)
     p.add_argument("--config-dir", default=None)
     return p.parse_args(argv)
@@ -121,6 +148,7 @@ def build_app(
         portfolio=portfolio,
         oms=oms,
         monitor=monitor,
+        broker=broker,
         lifecycle=lifecycle,
         activity=activity,
         archive_writer=archive_writer,
@@ -150,6 +178,9 @@ async def serve(app: App, *, admin_token: str, host: str, port: int) -> None:
     setattr(server, "install_signal_handlers", lambda: None)  # noqa: B010
     loop = asyncio.get_running_loop()
 
+    feed_task: asyncio.Task[None] | None = None
+    rest_client: httpx.AsyncClient | None = None
+
     def _on_term() -> None:
         log.warning(
             "shutdown.sigterm_received",
@@ -157,15 +188,29 @@ async def serve(app: App, *, admin_token: str, host: str, port: int) -> None:
             trading_halted_before=app.trading_halted,
         )
         app.halt(reason="sigterm")
+        if feed_task is not None:
+            feed_task.cancel()
         server.should_exit = True
 
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, _on_term)
 
+    feed_task, rest_client = _start_feed_loop_if_enabled(app, log)
+
     log.info("boot.serving", mode=app.settings.mode, host=host, port=port)
     try:
         await server.serve()
     finally:
+        if feed_task is not None:
+            feed_task.cancel()
+            try:
+                await feed_task
+            except asyncio.CancelledError:
+                pass
+            except Exception as exc:
+                log.warning("shutdown.feed_loop_error", error=str(exc))
+        if rest_client is not None:
+            await rest_client.aclose()
         if app.archive_writer is not None:
             app.archive_writer.close()
         if app.portfolio.open_positions:
@@ -174,6 +219,62 @@ async def serve(app: App, *, admin_token: str, host: str, port: int) -> None:
                 count=len(app.portfolio.open_positions),
                 note="hard rule #10: container should not exit with open positions; run scripts/flatten.sh first",
             )
+
+
+def _start_feed_loop_if_enabled(
+    app: App, log: Any,
+) -> tuple[asyncio.Task[None] | None, httpx.AsyncClient | None]:
+    """Spawn the live feed loop unless we're in `dev` mode (no network).
+
+    Returns (task, http_client) so the caller can cancel the task and close
+    the client on shutdown. Both are None when the loop is disabled.
+    """
+    if app.settings.mode not in MODES_WITH_FEED_LOOP:
+        log.info("boot.feed_loop_disabled", mode=app.settings.mode)
+        return None, None
+    if app.broker is None:
+        log.error("boot.feed_loop_missing_broker", mode=app.settings.mode)
+        return None, None
+
+    kalshi_ws = _resolve_feed_url(app.settings.feeds.kalshi)
+    rest_url = _resolve_rest_url(app.settings.feeds.kalshi)
+    coinbase_ws = _resolve_feed_url(app.settings.feeds.coinbase) or os.getenv(COINBASE_WS_URL_ENV)
+    binance_ws = _resolve_feed_url(app.settings.feeds.binance) or os.getenv(BINANCE_WS_URL_ENV)
+    series_ticker = os.getenv(SERIES_TICKER_ENV, "KXBTC")
+
+    missing = [
+        name for name, val in (
+            ("kalshi.ws_url", kalshi_ws),
+            ("kalshi.rest_url", rest_url),
+            ("coinbase.ws_url", coinbase_ws),
+            ("binance.ws_url", binance_ws),
+        ) if not val
+    ]
+    if missing or kalshi_ws is None or rest_url is None or coinbase_ws is None or binance_ws is None:
+        log.error("boot.feed_loop_missing_config", missing=missing)
+        return None, None
+
+    rest_client = httpx.AsyncClient(base_url=rest_url, timeout=10.0)
+    task = asyncio.create_task(
+        run_feed_forever(
+            app=app,
+            broker=app.broker,
+            rest_http_client=rest_client,
+            clock=app.clock,
+            kalshi_ws_url=kalshi_ws,
+            coinbase_ws_url=coinbase_ws,
+            binance_ws_url=binance_ws,
+            rest_base="",  # rest_url already includes /trade-api/v2
+            series_ticker=series_ticker,
+        ),
+        name="feed-loop",
+    )
+    log.info(
+        "boot.feed_loop_started",
+        series_ticker=series_ticker,
+        kalshi_ws=kalshi_ws,
+    )
+    return task, rest_client
 
 
 def main(argv: list[str] | None = None) -> int:

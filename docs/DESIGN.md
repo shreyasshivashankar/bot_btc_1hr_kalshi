@@ -432,8 +432,8 @@ bot_btc_1hr_kalshi runs entirely on **Google Cloud Platform managed services**. 
 | Long-running trading process | **Cloud Run** (service, not job)              | `min-instances=1`, `max-instances=1`, CPU always allocated   |
 | Secrets (Kalshi API key) | **Secret Manager**                                | Mounted as env vars at container boot                        |
 | Non-sensitive config     | **Cloud Run env vars**                            | Settable via console or `env.yaml` import                    |
-| Structured logs          | **Cloud Logging**                                 | JSON via stdout → auto-ingested; 5-day retention log bucket  |
-| Bet-outcome telemetry    | **BigQuery** (via Log Router sink)                | 5-day partition expiration for auto-cleanup                  |
+| Structured logs          | **Cloud Logging**                                 | JSON via stdout → auto-ingested; 7-day retention log bucket  |
+| Bet-outcome telemetry    | **BigQuery** (via Log Router sink)                | 7-day partition expiration for auto-cleanup                  |
 | Scheduler (daily ops)    | **Cloud Scheduler**                               | Triggers reconciliation, daily close, walk-forward re-fit    |
 | Operator control         | **HTTP admin endpoints** + `gcloud` CLI scripts   | IAM-gated, no public ingress                                 |
 | Historical tick storage  | **Cloud Storage** (GCS bucket)                    | Parquet tick archive, nightly sync                           |
@@ -514,12 +514,14 @@ One-time bootstrap via `deploy/setup_gcp.sh`:
 1. Enable APIs: `run`, `secretmanager`, `logging`, `bigquery`, `cloudscheduler`, `cloudbuild`.
 2. Create service account `bot-btc-1hr-kalshi-runtime@<project>.iam.gserviceaccount.com` with minimum-scope roles.
 3. Create secrets in Secret Manager (values entered interactively).
-4. Create Cloud Logging log bucket `bot-btc-1hr-kalshi-bets-5d` with `retentionDays=5` in the same region.
-5. Create a log sink routing `logName:"projects/<project>/logs/bot_btc_1hr_kalshi.bet_outcomes"` to:
-   - The `bot-btc-1hr-kalshi-bets-5d` log bucket (for Logs Explorer queries).
-   - A BigQuery dataset `bot_btc_1hr_kalshi_bet_outcomes` with `defaultPartitionExpirationMs=5*24*3600*1000` (5 days, for SQL queries).
-6. Exclude `bot_btc_1hr_kalshi.bet_outcomes` from the default `_Default` sink to avoid dual storage and cost.
-7. Create GCS bucket `bot-btc-1hr-kalshi-tick-archive-<project>` with lifecycle rule (move to COLDLINE at 30d, delete at 365d).
+4. Set the project's `_Default` log bucket to `retentionDays=7` (app/operational logs auto-expire at 7 days).
+5. Create Cloud Logging log bucket `bot-btc-1hr-kalshi-bets-7d` with `retentionDays=7` in the same region.
+6. Create a log sink routing `logName:"projects/<project>/logs/bot_btc_1hr_kalshi.bet_outcomes"` to:
+   - The `bot-btc-1hr-kalshi-bets-7d` log bucket (for Logs Explorer queries).
+   - A BigQuery dataset `bot_btc_1hr_kalshi_bet_outcomes` with `defaultPartitionExpirationMs=7*24*3600*1000` (7 days, for SQL queries).
+7. Exclude `bot_btc_1hr_kalshi.bet_outcomes` from the default `_Default` sink to avoid dual storage and cost.
+8. Create GCS bucket `bot-btc-1hr-kalshi-tick-archive-<project>` with lifecycle rule (move to COLDLINE at 30d, delete at 365d).
+9. Create a monthly `$80` budget on the project's billing account with email alerts at 50%, 90%, and 100%.
 
 The script is idempotent: rerunning it detects existing resources and skips creation.
 
@@ -592,11 +594,11 @@ Written at the moment a position is closed (or when Kalshi resolution is receive
 
 ### 12.2 Tuning loop — reaching convergence
 
-The goal: use 5 days of outcome logs to **converge on parameter settings** that maximize risk-adjusted PnL. This is not ML — it's deliberate, weekly, human-driven parameter adjustment informed by data.
+The goal: use 7 days of outcome logs to **converge on parameter settings** that maximize risk-adjusted PnL. This is not ML — it's deliberate, weekly, human-driven parameter adjustment informed by data.
 
 Weekly procedure (see `docs/RUNBOOK.md` for exact queries):
 
-1. **Per-trap hit rate and EV.** If a trap's hit rate < 48% or EV < 0 over 5 days, either disable it or tighten its preconditions.
+1. **Per-trap hit rate and EV.** If a trap's hit rate < 48% or EV < 0 over 7 days, either disable it or tighten its preconditions.
 2. **Per-exit-reason distribution.** If `soft_stop` fires > 20% of trades, `SOFT_STOP_FRACTION` may be too tight. If `abandoned_to_settlement` resolves as `settled_loss` more than `settled_win`, the `p_settle > 0.60` abandon threshold is too aggressive — raise it.
 3. **Regime conditional PnL.** Group by `features_at_entry.regime_vol`. If chaotic-vol trades lose money net, disable traps in that regime.
 4. **Early-cashout EV check.** Compare `early_cashout_99` realized PnL against the theoretical PnL if we had held to theta target. If holding would have produced materially more (accounting for capital lock-up cost), raise the threshold to 97¢ or 95¢.
@@ -606,20 +608,20 @@ Parameter changes go into `config/params.yaml`, versioned in git. A PR labeled `
 
 ### 12.3 Log retention & cleanup
 
-- `bot_btc_1hr_kalshi.bet_outcomes` log → Cloud Logging bucket `bot-btc-1hr-kalshi-bets-5d` (5-day retention, auto-expiry) **AND** BigQuery table `bot_btc_1hr_kalshi_bet_outcomes.outcomes` (5-day partition expiration).
-- All other `bot_btc_1hr_kalshi.*` logs → default `_Default` bucket (30-day GCP default).
+- `bot_btc_1hr_kalshi.bet_outcomes` log → Cloud Logging bucket `bot-btc-1hr-kalshi-bets-7d` (7-day retention, auto-expiry) **AND** BigQuery table `bot_btc_1hr_kalshi_bet_outcomes.outcomes` (7-day partition expiration).
+- All other `bot_btc_1hr_kalshi.*` logs → `_Default` bucket, which `setup_gcp.sh` pins to 7-day retention (overriding GCP's 30-day default) so app/ops logs stay inside the monthly budget.
 - **No manual cleanup required.** Cloud Logging bucket retention and BigQuery partition expiration enforce cleanup automatically.
-- If 5 days proves insufficient for tuning (needing month-over-month trends), a second sink can archive to GCS Parquet for cheap cold storage without violating the "hot data = 5 days" principle.
+- If 7 days proves insufficient for tuning (needing month-over-month trends), a second sink can archive to GCS Parquet for cheap cold storage without violating the "hot data = 7 days" principle.
 
 ### 12.4 Querying
 
 Two paths, both documented in `docs/RUNBOOK.md`:
 
 - **Logs Explorer (GCP console):** natural language-ish filter like `logName:"bot_btc_1hr_kalshi.bet_outcomes" AND jsonPayload.trap="floor_bounce"`. Fast, no setup. Best for one-off investigations.
-- **BigQuery (recommended for tuning):** SQL over the 5-day partitioned table. Examples:
+- **BigQuery (recommended for tuning):** SQL over the 7-day partitioned table. Examples:
 
   ```sql
-  -- Hit rate by trap, last 5 days
+  -- Hit rate by trap, last 7 days
   SELECT trap, COUNT(*) n,
          AVG(CAST(net_pnl_usd > 0 AS INT64)) hit_rate,
          SUM(net_pnl_usd) total_pnl,

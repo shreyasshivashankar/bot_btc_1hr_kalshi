@@ -41,14 +41,16 @@ What it does (in order):
    - `BOT_BTC_1HR_KALSHI_API_KEY`
    - `BOT_BTC_1HR_KALSHI_API_SECRET`
    - `BOT_BTC_1HR_KALSHI_ADMIN_TOKEN` (generated with `openssl rand -hex 32` if you press enter)
-4. Creates a **5-day retention log bucket** `bot-btc-1hr-kalshi-bets-5d` in your region.
-5. Creates the BigQuery dataset `bot_btc_1hr_kalshi_bet_outcomes` with `default_partition_expiration=432000` (5 days in seconds).
-6. Creates a log sink `bot-btc-1hr-kalshi-bet-outcomes-sink` routing `logName="projects/$PROJECT/logs/bot_btc_1hr_kalshi.bet_outcomes"` to:
-   - The `bot-btc-1hr-kalshi-bets-5d` bucket (Logs Explorer)
+4. Sets the project's `_Default` log bucket to **7-day retention** (application / operational logs auto-expire).
+5. Creates a **7-day retention log bucket** `bot-btc-1hr-kalshi-bets-7d` in your region for bet-outcome records.
+6. Creates the BigQuery dataset `bot_btc_1hr_kalshi_bet_outcomes` with `default_partition_expiration=604800` (7 days in seconds).
+7. Creates a log sink `bot-btc-1hr-kalshi-bet-outcomes-sink` routing `logName="projects/$PROJECT/logs/bot_btc_1hr_kalshi.bet_outcomes"` to:
+   - The `bot-btc-1hr-kalshi-bets-7d` bucket (Logs Explorer)
    - The `bot_btc_1hr_kalshi_bet_outcomes.outcomes` BigQuery table (SQL queries)
-7. Adds an exclusion to the default `_Default` sink so bet-outcome logs aren't double-stored.
-8. Creates Artifact Registry repo `bot-btc-1hr-kalshi` for container images.
-9. Creates GCS bucket `bot-btc-1hr-kalshi-tick-archive-$PROJECT` (tick archive) with lifecycle: COLDLINE at 30d, delete at 365d.
+8. Adds an exclusion to the default `_Default` sink so bet-outcome logs aren't double-stored.
+9. Creates Artifact Registry repo `bot-btc-1hr-kalshi` for container images.
+10. Creates GCS bucket `bot-btc-1hr-kalshi-tick-archive-$PROJECT` (tick archive) with lifecycle: COLDLINE at 30d, delete at 365d.
+11. Creates a **monthly $80 budget** on the project's billing account with email alerts at 50%, 90%, and 100%.
 
 The script prints next steps on success. Rerun is safe.
 
@@ -225,29 +227,33 @@ Alert channels: email or SMS. Pager duties are operator-defined.
 
 | Log name                         | Destination                         | Retention | Cleanup             |
 | -------------------------------- | ----------------------------------- | --------- | ------------------- |
-| `bot_btc_1hr_kalshi.bet_outcomes`             | `bot-btc-1hr-kalshi-bets-5d` log bucket          | 5 days    | Automatic (bucket)  |
-| `bot_btc_1hr_kalshi.bet_outcomes`             | BigQuery `bot_btc_1hr_kalshi_bet_outcomes.outcomes` | 5 days (partition expiry) | Automatic (BQ) |
-| `bot_btc_1hr_kalshi.admin_audit`              | `_Default` bucket                   | 30 days   | Automatic (bucket)  |
-| `bot_btc_1hr_kalshi.market_data`, `bot_btc_1hr_kalshi.risk`, `bot_btc_1hr_kalshi.execution`, others | `_Default` bucket | 30 days | Automatic |
+| `bot_btc_1hr_kalshi.bet_outcomes`             | `bot-btc-1hr-kalshi-bets-7d` log bucket          | 7 days    | Automatic (bucket)  |
+| `bot_btc_1hr_kalshi.bet_outcomes`             | BigQuery `bot_btc_1hr_kalshi_bet_outcomes.outcomes` | 7 days (partition expiry) | Automatic (BQ) |
+| `bot_btc_1hr_kalshi.admin_audit`              | `_Default` bucket                   | 7 days    | Automatic (bucket)  |
+| `bot_btc_1hr_kalshi.market_data`, `bot_btc_1hr_kalshi.risk`, `bot_btc_1hr_kalshi.execution`, others | `_Default` bucket | 7 days | Automatic |
 | Tick archive (Parquet)           | GCS `bot-btc-1hr-kalshi-tick-archive-$PROJECT`   | 365 days, COLDLINE at 30d | Lifecycle rule |
 
-**Manual cleanup is never required for bet outcomes** — GCP enforces retention at both the log bucket and BigQuery partition level.
+**Manual cleanup is never required** — GCP enforces retention at both the log bucket and BigQuery partition level. The `_Default` bucket is explicitly capped at 7 days by `setup_gcp.sh` (default would otherwise be 30 days).
 
-If you need longer-than-5-days analysis, route a second sink to GCS as Parquet. Document rationale in a PR — the 5-day hot window is deliberate (forces the tuning loop to care about recent performance).
+If you need longer-than-7-days analysis, route a second sink to GCS as Parquet. Document rationale in a PR — the 7-day hot window is deliberate (forces the tuning loop to care about recent performance and keeps monthly cost inside the $80 budget alert).
 
 ---
 
 ## 8. Cost estimate (rough)
 
 At `min=max=1, cpu=2, 2Gi, no CPU throttling`:
-- Cloud Run: ~$55–75/month (continuous 2-vCPU allocation)
-- Cloud Logging: free tier covers <50 GiB ingestion/month. Bet-outcome volume is tiny (~<100 records/day × <2 KB = negligible).
-- BigQuery: 5-day partitioned storage of outcomes is < 1 MiB. Query costs negligible at 5-day retention.
-- Secret Manager: $0.06 per secret per month.
-- Artifact Registry: first 0.5 GB free; container images typically fit.
-- GCS tick archive: depends on volume; Parquet-compressed BTC ticks ~2–5 GiB/month, COLDLINE after 30d → < $2/month.
+- Cloud Run: ~$55–75/month **continuous** (24×7, 2-vCPU allocation); **~$23–32/month for 10 hrs/day** — scaling to zero outside trading hours via `scripts/stop.sh` is the big lever. CPU is the dominant line item.
+- Cloud Logging: free tier covers <50 GiB ingestion/month. Even with every `decision` record emitted (~1-10/tick × 5 Hz), ingestion stays under the free tier at 10 hrs/day. Beyond the free tier, $0.50/GiB ingested.
+- BigQuery: 14-day partitioned storage of outcomes is < 10 MiB total. Storage and slot-hours both well under $1/month.
+- Secret Manager: 3 secrets × $0.06 = $0.18/month.
+- Artifact Registry: first 0.5 GB free; container image ≈ 300 MB after first push.
+- GCS tick archive: BTC L2 + spot at ~3 hops/sec compresses to ~50-150 MiB/day; 10 hrs/day ≈ 2 GiB/month STANDARD + free COLDLINE transition → < $0.50/month.
+- Cloud Scheduler (for external watchdog): 1 job at 1-min cadence = free tier.
+- Egress (WS + REST to Kalshi/Coinbase/Binance): ~1 GiB/month → negligible.
 
-Total: ~$60–80/month for paper mode, similar for live (same compute profile).
+**10-hours-a-day paper mode total: ~$28–35/month.** 24×7 live mode: ~$60–80/month.
+
+Cut by another ~40% if you set `cpu=1, memory=1Gi` — the bot's hot path fits comfortably. Keep the headroom while in paper mode; revisit once you have 2 weeks of steady-state metrics.
 
 ---
 

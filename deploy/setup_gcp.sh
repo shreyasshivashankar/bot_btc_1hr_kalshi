@@ -20,7 +20,7 @@ PROJECT="$BOT_BTC_1HR_KALSHI_GCP_PROJECT"
 REGION="$BOT_BTC_1HR_KALSHI_GCP_REGION"
 SA_NAME="bot-btc-1hr-kalshi-runtime"
 SA_EMAIL="${SA_NAME}@${PROJECT}.iam.gserviceaccount.com"
-LOG_BUCKET="bot-btc-1hr-kalshi-bets-5d"
+LOG_BUCKET="bot-btc-1hr-kalshi-bets-7d"
 BQ_DATASET="bot_btc_1hr_kalshi_bet_outcomes"
 BQ_TABLE="outcomes"
 TICK_BUCKET="bot-btc-1hr-kalshi-tick-archive-${PROJECT}"
@@ -117,31 +117,45 @@ create_secret_interactive "BOT_BTC_1HR_KALSHI_API_SECRET" "Paste your Kalshi API
 create_secret_interactive "BOT_BTC_1HR_KALSHI_ADMIN_TOKEN"       "Admin bearer token (leave blank to auto-generate):" true
 
 # ----------------------------------------------------------------------------
-# 4. Cloud Logging: 5-day log bucket for bet outcomes
+# 4. Cloud Logging: 7-day retention on BOTH buckets (app logs + bet outcomes)
 # ----------------------------------------------------------------------------
+# Application / operational logs land in the project's _Default bucket. Bet
+# outcomes are routed to a dedicated bucket (see sink in §6). Both are capped
+# at 7 days to bound storage cost — BigQuery is the long-term store for
+# tunable telemetry.
+log "Setting _Default log bucket retention to 7 days (app/ops logs)..."
+gcloud logging buckets update _Default \
+  --location=global \
+  --retention-days=7 \
+  --project="$PROJECT" >/dev/null
+
 if gcloud logging buckets describe "$LOG_BUCKET" --location="$REGION" --project="$PROJECT" &>/dev/null; then
-  log "Log bucket $LOG_BUCKET already exists — skipping create."
+  log "Log bucket $LOG_BUCKET already exists — ensuring 7-day retention."
+  gcloud logging buckets update "$LOG_BUCKET" \
+    --location="$REGION" \
+    --retention-days=7 \
+    --project="$PROJECT" >/dev/null
 else
-  log "Creating 5-day log bucket $LOG_BUCKET in $REGION ..."
+  log "Creating 7-day log bucket $LOG_BUCKET in $REGION ..."
   gcloud logging buckets create "$LOG_BUCKET" \
     --location="$REGION" \
-    --retention-days=5 \
+    --retention-days=7 \
     --project="$PROJECT" \
-    --description="bot_btc_1hr_kalshi bet-outcome logs (auto-expire at 5 days)"
+    --description="bot_btc_1hr_kalshi bet-outcome logs (auto-expire at 7 days)"
 fi
 
 # ----------------------------------------------------------------------------
-# 5. BigQuery dataset with 5-day partition expiration
+# 5. BigQuery dataset with 7-day partition expiration
 # ----------------------------------------------------------------------------
 if bq --project_id="$PROJECT" show --format=none "${PROJECT}:${BQ_DATASET}" &>/dev/null; then
   log "BigQuery dataset $BQ_DATASET already exists — skipping create."
 else
   log "Creating BigQuery dataset $BQ_DATASET ..."
-  # 432000s = 5 days.
+  # 604800s = 7 days.
   bq --project_id="$PROJECT" mk \
     --location="$REGION" \
-    --default_partition_expiration=432000 \
-    --description="bot_btc_1hr_kalshi bet outcomes. 5-day partition expiration." \
+    --default_partition_expiration=604800 \
+    --description="bot_btc_1hr_kalshi bet outcomes. 7-day partition expiration." \
     "${BQ_DATASET}"
 fi
 
@@ -152,7 +166,7 @@ fi
 #
 #   bq --project_id="$PROJECT" mk --table \
 #     --time_partitioning_type=DAY \
-#     --time_partitioning_expiration=432000 \
+#     --time_partitioning_expiration=604800 \
 #     "${PROJECT}:${BQ_DATASET}.${BQ_TABLE}" \
 #     deploy/bq_schema.json
 #
@@ -245,6 +259,59 @@ EOF
     --member="serviceAccount:${SA_EMAIL}" \
     --role="roles/storage.objectAdmin" \
     --project="$PROJECT" >/dev/null
+fi
+
+# ----------------------------------------------------------------------------
+# 9. Budget alert: $80/month on this project
+# ----------------------------------------------------------------------------
+# Creates (or re-creates) a monthly budget for the project with email alerts
+# at 50%, 90%, and 100% of $80. Requires the billing-budgets API and the
+# caller to have roles/billing.admin on the billing account.
+#
+# If auto-discovery of the billing account fails (some org setups restrict
+# projects.describe on the billing side), the budget step is skipped with a
+# warning; run the documented gcloud command manually after bootstrap.
+BUDGET_AMOUNT_USD=80
+BUDGET_NAME="bot-btc-1hr-kalshi-monthly"
+
+BILLING_ACCOUNT_FULL="$(gcloud billing projects describe "$PROJECT" \
+  --format='value(billingAccountName)' 2>/dev/null || true)"
+BILLING_ACCOUNT_ID="${BILLING_ACCOUNT_FULL#billingAccounts/}"
+
+if [[ -z "$BILLING_ACCOUNT_ID" ]]; then
+  warn "Could not auto-discover billing account for project $PROJECT — skipping budget."
+  warn "Create it manually once you know the billing-account ID:"
+  warn "  gcloud billing budgets create \\"
+  warn "    --billing-account=BILLING_ACCOUNT_ID \\"
+  warn "    --display-name='${BUDGET_NAME}' \\"
+  warn "    --budget-amount=${BUDGET_AMOUNT_USD}USD \\"
+  warn "    --filter-projects=projects/${PROJECT} \\"
+  warn "    --threshold-rule=percent=0.5 \\"
+  warn "    --threshold-rule=percent=0.9 \\"
+  warn "    --threshold-rule=percent=1.0"
+else
+  gcloud services enable billingbudgets.googleapis.com --project="$PROJECT" >/dev/null
+
+  EXISTING_BUDGET="$(gcloud billing budgets list \
+    --billing-account="$BILLING_ACCOUNT_ID" \
+    --filter="displayName:${BUDGET_NAME}" \
+    --format='value(name)' 2>/dev/null | head -n1 || true)"
+
+  if [[ -n "$EXISTING_BUDGET" ]]; then
+    log "Budget '${BUDGET_NAME}' already exists on billing account ${BILLING_ACCOUNT_ID} — skipping."
+  else
+    log "Creating \$${BUDGET_AMOUNT_USD}/month budget on billing account ${BILLING_ACCOUNT_ID} ..."
+    gcloud billing budgets create \
+      --billing-account="$BILLING_ACCOUNT_ID" \
+      --display-name="$BUDGET_NAME" \
+      --budget-amount="${BUDGET_AMOUNT_USD}USD" \
+      --filter-projects="projects/${PROJECT}" \
+      --threshold-rule=percent=0.5 \
+      --threshold-rule=percent=0.9 \
+      --threshold-rule=percent=1.0 \
+      --quiet >/dev/null || \
+    warn "Budget creation failed — check roles/billing.admin on ${BILLING_ACCOUNT_ID}."
+  fi
 fi
 
 # ----------------------------------------------------------------------------

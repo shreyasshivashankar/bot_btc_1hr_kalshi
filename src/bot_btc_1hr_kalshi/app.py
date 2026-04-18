@@ -12,6 +12,7 @@ from typing import Any
 
 from bot_btc_1hr_kalshi.archive.writer import ArchiveWriter
 from bot_btc_1hr_kalshi.config.settings import Settings
+from bot_btc_1hr_kalshi.execution.broker.base import Broker
 from bot_btc_1hr_kalshi.execution.oms import OMS
 from bot_btc_1hr_kalshi.market_data.book import L2Book
 from bot_btc_1hr_kalshi.monitor.position_monitor import PositionMonitor
@@ -31,6 +32,7 @@ class App:
     portfolio: Portfolio
     oms: OMS
     monitor: PositionMonitor
+    broker: Broker | None = None
     lifecycle: LifecycleEmitter | None = None
     activity: ActivityTracker | None = None
     # When set, the feed-loop consumer should call `archive_writer.write(event)`
