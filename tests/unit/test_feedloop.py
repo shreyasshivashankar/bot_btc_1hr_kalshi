@@ -193,9 +193,13 @@ async def test_feedloop_routes_events_and_exits_at_settlement() -> None:
         staleness=StalenessTracker(name="kalshi", clock=clock, threshold_ms=2000),
     )
     oracle = StubOracle(clock)
-    # Seed a fresh primary tick BEFORE run() so the FeatureEngine warms up.
+    # Seed a fresh primary tick BEFORE run() so the activity tracker
+    # records it — FeatureEngine is now bar-driven (Slice 8) and no
+    # longer warms up from raw ticks, so we assert on activity below.
     oracle.push_primary(60_000.0)
-    features = FeatureEngine(bollinger_period=20, bollinger_std_mult=2.0)
+    features = FeatureEngine(
+        timeframes=["5m"], bollinger_period=20, bollinger_std_mult=2.0
+    )
     book = L2Book("KXBTC-TEST")
 
     loop = FeedLoop(
@@ -218,7 +222,6 @@ async def test_feedloop_routes_events_and_exits_at_settlement() -> None:
     await asyncio.wait_for(run_task, timeout=5.0)
 
     assert book.valid
-    assert features.last_price == 60_000.0
     snap = app.activity.snapshot(now_ns=clock.now_ns())  # type: ignore[union-attr]
     assert snap["last_tick_ns"] is not None
     assert kalshi_conn.sent, "Kalshi feed should have sent subscribe frame"
@@ -233,9 +236,11 @@ def test_minutes_to_settlement_fn_counts_down() -> None:
 
 
 @pytest.mark.asyncio
-async def test_feedloop_routes_primary_to_features_and_confirmation_to_integrity_only() -> None:
-    """Coinbase prints must feed FeatureEngine; Kraken prints must feed
-    IntegrityTracker only. Verified via oracle callbacks."""
+async def test_feedloop_routes_primary_and_confirmation_to_integrity() -> None:
+    """Primary (Coinbase) and confirmation (Kraken) ticks both route into
+    IntegrityTracker with the correct direction. FeatureEngine is now
+    bar-driven and fed via the App-scope bar bus in production — the
+    FeedLoop's per-tick handler no longer touches it."""
     from bot_btc_1hr_kalshi.signal.integrity import IntegrityTracker
 
     start_ns = 1_800_000_000_000_000_000
@@ -256,7 +261,9 @@ async def test_feedloop_routes_primary_to_features_and_confirmation_to_integrity
         staleness=StalenessTracker(name="kalshi", clock=clock, threshold_ms=2000),
     )
     oracle = StubOracle(clock)
-    features = FeatureEngine(bollinger_period=20, bollinger_std_mult=2.0)
+    features = FeatureEngine(
+        timeframes=["5m"], bollinger_period=20, bollinger_std_mult=2.0
+    )
     integrity = IntegrityTracker(
         velocity_window_sec=1.0,
         active_disagreement_floor_usd=25.0,
@@ -281,11 +288,9 @@ async def test_feedloop_routes_primary_to_features_and_confirmation_to_integrity
     clock.set_ns(settlement_ns + 1_000_000_000)
     await asyncio.wait_for(run_task, timeout=5.0)
 
-    # FeatureEngine only saw Coinbase primary.
-    assert features.last_price == 61_000.0
-    # IntegrityTracker saw both venues.
-    assert integrity.confirmation_last_ns is not None
+    # IntegrityTracker saw both venues with correct routing.
     assert integrity.primary_last_ns is not None
+    assert integrity.confirmation_last_ns is not None
 
 
 @pytest.mark.asyncio
@@ -308,7 +313,9 @@ async def test_feedloop_snapshot_refuses_when_spot_stale() -> None:
     # Push a tick; then advance the clock past the staleness threshold.
     oracle.push_primary(78_000.0, ts_ns=start_ns)
     clock.set_ns(start_ns + 5_000_000_000)  # +5s → well past 1000ms
-    features = FeatureEngine(bollinger_period=20, bollinger_std_mult=2.0)
+    features = FeatureEngine(
+        timeframes=["5m"], bollinger_period=20, bollinger_std_mult=2.0
+    )
     book = L2Book("KXBTC-TEST")
     # Seed the book so _snapshot's book-valid gate passes; staleness is the
     # only remaining reason snapshot should return None.
@@ -319,9 +326,11 @@ async def test_feedloop_snapshot_refuses_when_spot_stale() -> None:
         asks=(BookLevel(price_cents=55, size=100),),
         is_snapshot=True,
     ))
-    # Feed enough prices to make bollinger_pct_b + atr non-None.
+    # Feed enough bar closes to make bollinger_pct_b + atr non-None on 5m.
     for p in range(60_000, 60_050):
-        features.update_spot(float(p))
+        features.ingest_bar(
+            "5m", close=float(p), high=float(p) + 1.0, low=float(p) - 1.0
+        )
 
     loop = FeedLoop(
         app=app, broker=broker, book=book, kalshi_feed=kalshi_feed,

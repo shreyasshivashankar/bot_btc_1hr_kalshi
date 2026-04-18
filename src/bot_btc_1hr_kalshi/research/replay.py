@@ -18,6 +18,7 @@ from bot_btc_1hr_kalshi.app import App
 from bot_btc_1hr_kalshi.execution.broker.base import Fill
 from bot_btc_1hr_kalshi.execution.broker.paper import PaperBroker
 from bot_btc_1hr_kalshi.execution.oms import EntryResult
+from bot_btc_1hr_kalshi.market_data.bars import MultiTimeframeBus
 from bot_btc_1hr_kalshi.market_data.book import L2Book
 from bot_btc_1hr_kalshi.market_data.types import BookUpdate, FeedEvent, SpotTick, TradeEvent
 from bot_btc_1hr_kalshi.obs.clock import ManualClock
@@ -44,7 +45,14 @@ class ReplayResult:
 
 
 class ReplayOrchestrator:
-    """Drives the trading graph from a replay feed. All state lives in `App`."""
+    """Drives the trading graph from a replay feed. All state lives in `App`.
+
+    Owns a `MultiTimeframeBus` for bar aggregation; the `feature_engine`
+    passed in is attached to it once on construction. SpotTicks flow into
+    the bus and bar closes update the engine — matching production wiring
+    in `__main__`. `primary_tf` selects which TF's feature values drive
+    the trap-trigger path (DESIGN.md §5 defaults to 5m).
+    """
 
     def __init__(
         self,
@@ -56,12 +64,14 @@ class ReplayOrchestrator:
         feature_engine: FeatureEngine,
         strike_usd: float,
         minutes_to_settlement_fn: Any | None = None,
+        primary_tf: str = "5m",
     ) -> None:
         self._app = app
         self._broker = broker
         self._clock = clock
         self._market_id = market_id
         self._features = feature_engine
+        self._primary_tf = primary_tf
         self._strike_usd = strike_usd
         self._book = L2Book(market_id)
         self._app.register_book(self._book)
@@ -70,6 +80,8 @@ class ReplayOrchestrator:
         self._spot_price: float | None = None
         self._mts_fn = minutes_to_settlement_fn or (lambda _ns: 30.0)
         self.result = ReplayResult()
+        self._bar_bus = MultiTimeframeBus(tf_secs=[60, 300, 900, 3600, 86400])
+        feature_engine.attach(self._bar_bus)
 
     @property
     def book(self) -> L2Book:
@@ -87,7 +99,10 @@ class ReplayOrchestrator:
                 self._apply_entry_fill(fill)
                 self.result.fills.append(fill)
         elif isinstance(event, SpotTick):
-            self._features.update_spot(event.price_usd)
+            # Ticks drive the bar bus, which fires bar closes into
+            # FeatureEngine on crossing a TF boundary — same path as
+            # production spot_oracle → bar_bus wiring in __main__.
+            self._bar_bus.ingest(event)
             self._spot_price = event.price_usd
 
         await self._maybe_enter()
@@ -113,7 +128,7 @@ class ReplayOrchestrator:
         snap = self._snapshot()
         if snap is None:
             return
-        signal = run_traps(snap, min_confidence=self._app.settings.signal.min_signal_confidence)
+        signal = run_traps(snap, settings=self._app.settings.signal)
         if signal is None:
             return
 
@@ -141,15 +156,15 @@ class ReplayOrchestrator:
         await self._app.monitor.evaluate(
             book=self._book,
             minutes_to_settlement=self._mts_fn(self._clock.now_ns()),
-            regime_vol=self._features.regime_vol(),
-            regime_trend=self._features.regime_trend(),
+            regime_vol=self._features.regime_vol(self._primary_tf),
+            regime_trend=self._features.regime_trend(self._primary_tf),
         )
 
     def _snapshot(self) -> MarketSnapshot | None:
         if not self._book.valid:
             return None
-        pct_b = self._features.bollinger_pct_b()
-        atr = self._features.atr()
+        pct_b = self._features.bollinger_pct_b(self._primary_tf)
+        atr = self._features.atr(self._primary_tf)
         if pct_b is None or atr is None or self._spot_price is None:
             return None
         spread = self._book.spread_cents
@@ -157,8 +172,8 @@ class ReplayOrchestrator:
             return None
 
         features = Features(
-            regime_trend=self._features.regime_trend(),
-            regime_vol=self._features.regime_vol(),
+            regime_trend=self._features.regime_trend(self._primary_tf),
+            regime_vol=self._features.regime_vol(self._primary_tf),
             signal_confidence=min(1.0, abs(pct_b)),
             bollinger_pct_b=pct_b,
             atr_cents=float(atr),
@@ -166,6 +181,9 @@ class ReplayOrchestrator:
             spread_cents=spread,
             spot_btc_usd=self._spot_price,
             minutes_to_settlement=self._mts_fn(self._clock.now_ns()),
+            rsi_5m=self._features.rsi("5m"),
+            rsi_1h=self._features.rsi("1h"),
+            move_24h_pct=self._features.move_24h_pct(),
         )
         return MarketSnapshot(
             market_id=self._market_id,

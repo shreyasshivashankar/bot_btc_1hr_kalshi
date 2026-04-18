@@ -76,6 +76,12 @@ from bot_btc_1hr_kalshi.signal.types import MarketSnapshot
 
 _log = structlog.get_logger("bot_btc_1hr_kalshi.feedloop")
 
+# The trap-trigger TF (DESIGN.md §5). FeatureEngine is keyed by TF label;
+# the snapshot builder here reads pct_b / ATR / regime at this TF and the
+# Slice-8 HTF fields (1H RSI, 24h move) from their respective TFs. Traps
+# consume all of them via `snap.features` — no parameterless reads remain.
+_PRIMARY_TF: str = "5m"
+
 
 @dataclass(slots=True)
 class _PendingEntry:
@@ -201,9 +207,14 @@ class FeedLoop:
             await self._handle_event(event)
 
     def _on_primary_tick(self, tick: SpotTick) -> None:
-        """Oracle callback: Coinbase (primary) — drives FeatureEngine + integrity."""
+        """Oracle callback: Coinbase (primary) — feeds integrity only.
+
+        FeatureEngine is fed via the MultiTimeframeBus (attached at App
+        scope in `__main__`). Raw ticks drive the bus; the bus fires
+        bar closes into the engine's subscribed callback — so this
+        handler no longer poke the engine directly.
+        """
         self._archive_and_mark(tick)
-        self._features.update_spot(tick.price_usd)
         if self._integrity is not None:
             self._integrity.record_primary(tick.ts_ns, tick.price_usd)
 
@@ -251,10 +262,7 @@ class FeedLoop:
         snap = self._snapshot()
         if snap is None:
             return
-        signal = run_traps(
-            snap,
-            min_confidence=self._app.settings.signal.min_signal_confidence,
-        )
+        signal = run_traps(snap, settings=self._app.settings.signal)
         if signal is None:
             return
 
@@ -294,15 +302,15 @@ class FeedLoop:
         await self._app.monitor.evaluate(
             book=self._book,
             minutes_to_settlement=self._mts_fn(self._clock.now_ns()),
-            regime_vol=self._features.regime_vol(),
-            regime_trend=self._features.regime_trend(),
+            regime_vol=self._features.regime_vol(_PRIMARY_TF),
+            regime_trend=self._features.regime_trend(_PRIMARY_TF),
         )
 
     def _snapshot(self) -> MarketSnapshot | None:
         if not self._book.valid:
             return None
-        pct_b = self._features.bollinger_pct_b()
-        atr = self._features.atr()
+        pct_b = self._features.bollinger_pct_b(_PRIMARY_TF)
+        atr = self._features.atr(_PRIMARY_TF)
         if pct_b is None or atr is None:
             return None
         # Hard LastSpot contract: if the primary spot is stale, sit this
@@ -320,8 +328,8 @@ class FeedLoop:
             return None
         mts = self._mts_fn(self._clock.now_ns())
         features = Features(
-            regime_trend=self._features.regime_trend(),
-            regime_vol=self._features.regime_vol(),
+            regime_trend=self._features.regime_trend(_PRIMARY_TF),
+            regime_vol=self._features.regime_vol(_PRIMARY_TF),
             signal_confidence=min(1.0, abs(pct_b)),
             bollinger_pct_b=pct_b,
             atr_cents=float(atr),
@@ -329,6 +337,9 @@ class FeedLoop:
             spread_cents=spread,
             spot_btc_usd=spot,
             minutes_to_settlement=mts,
+            rsi_5m=self._features.rsi("5m"),
+            rsi_1h=self._features.rsi("1h"),
+            move_24h_pct=self._features.move_24h_pct(),
         )
         return MarketSnapshot(
             market_id=self._market_id,
@@ -497,10 +508,12 @@ async def _run_one_session(
         on_reconnect=_invalidate,
     )
 
-    feature_engine = FeatureEngine(
-        bollinger_period=app.settings.signal.bollinger_period_bars,
-        bollinger_std_mult=app.settings.signal.bollinger_std_mult,
-    )
+    # FeatureEngine is App-scoped (Slice 8) — its accumulator state must
+    # persist across hourly market rolls. `__main__` builds and attaches
+    # it to the bar_bus once; each session just reads the reference.
+    if app.feature_engine is None:  # pragma: no cover — wiring invariant
+        raise RuntimeError("app.feature_engine must be set before run_forever")
+    feature_engine = app.feature_engine
     integrity = IntegrityTracker(
         velocity_window_sec=app.settings.integrity.velocity_window_sec,
         active_disagreement_floor_usd=app.settings.integrity.active_disagreement_floor_usd,

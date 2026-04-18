@@ -24,6 +24,7 @@ from bot_btc_1hr_kalshi.obs.lifecycle import LifecycleEmitter
 from bot_btc_1hr_kalshi.obs.schemas import BetOutcome
 from bot_btc_1hr_kalshi.portfolio.positions import Portfolio
 from bot_btc_1hr_kalshi.risk.breakers import BreakerState
+from bot_btc_1hr_kalshi.signal.features import FeatureEngine
 
 
 @dataclass(slots=True)
@@ -52,6 +53,12 @@ class App:
     # `spot_oracle.subscribe_primary(bar_bus.ingest)` at startup so its
     # lifetime tracks the oracle's. None when the feed loop is disabled.
     bar_bus: MultiTimeframeBus | None = None
+    # TF-keyed feature engine (Slice 8, Phase 2). Lives at App scope
+    # alongside bar_bus — accumulator state must survive hourly market
+    # rolls (the 1H RSI alone needs ~14 hours of 1h closes to warm up).
+    # `__main__` attaches it to the bar bus once; each per-session
+    # FeedLoop receives the same reference.
+    feature_engine: FeatureEngine | None = None
     books: dict[str, L2Book] = field(default_factory=dict)
     trading_halted: bool = False
     tier1_override_active: bool = False

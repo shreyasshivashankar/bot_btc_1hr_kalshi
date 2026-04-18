@@ -62,6 +62,7 @@ from bot_btc_1hr_kalshi.portfolio.positions import Portfolio
 from bot_btc_1hr_kalshi.risk.breaker_store import JsonFileBreakerStore, NullBreakerStore
 from bot_btc_1hr_kalshi.risk.breakers import BreakerState
 from bot_btc_1hr_kalshi.risk.clock_drift import ClockDriftMonitor
+from bot_btc_1hr_kalshi.signal.features import FeatureEngine
 
 BREAKER_STATE_PATH_ENV = "BOT_BTC_1HR_KALSHI_BREAKER_STATE_PATH"
 ARCHIVE_DIR_ENV = "BOT_BTC_1HR_KALSHI_ARCHIVE_DIR"
@@ -381,6 +382,18 @@ def _start_feed_loop_if_enabled(
     bar_bus = MultiTimeframeBus(tf_secs=[60, 300, 900, 3600, 86400])
     app.bar_bus = bar_bus
     spot_oracle.subscribe_primary(bar_bus.ingest)
+
+    # App-scope FeatureEngine (Slice 8, Phase 2). TF labels must match the
+    # bar_bus seconds table above. Kept at App scope so 1H/1d accumulator
+    # state persists across hourly market rolls (§DESIGN.md #6.3 HTF veto
+    # reads `rsi("1h")` which needs ~14h of 1h closes to warm up).
+    feature_engine = FeatureEngine(
+        timeframes=["1m", "5m", "15m", "1h", "1d"],
+        bollinger_period=app.settings.signal.bollinger_period_bars,
+        bollinger_std_mult=app.settings.signal.bollinger_std_mult,
+    )
+    feature_engine.attach(bar_bus)
+    app.feature_engine = feature_engine
 
     task = asyncio.create_task(
         run_feed_forever(

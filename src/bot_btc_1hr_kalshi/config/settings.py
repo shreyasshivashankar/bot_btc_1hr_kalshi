@@ -49,6 +49,19 @@ class SignalSettings(BaseModel):
     bollinger_period_bars: int = Field(gt=0)
     bollinger_std_mult: float = Field(gt=0.0)
     min_signal_confidence: float = Field(ge=0.0, le=1.0)
+    # Top-down alignment veto (DESIGN.md §6.3, Slice 8). The gate lives
+    # inside the traps, not in risk.check, so rejected candidates do not
+    # pollute the decision journal. If 1H RSI is bullish (> `htf_bullish_
+    # veto_rsi`), reject any 5m SHORT setup; if bearish (< `htf_bearish_
+    # veto_rsi`), reject any 5m LONG setup. 45/55 is the standard Wilder
+    # dead band around RSI 50.
+    htf_bullish_veto_rsi: float = Field(gt=0.0, lt=100.0, default=55.0)
+    htf_bearish_veto_rsi: float = Field(gt=0.0, lt=100.0, default=45.0)
+    # Runaway Train lockout (DESIGN.md §6.3, Slice 8; applied inside
+    # detect_ceiling_reversion). When the rolling 24h move magnitude
+    # exceeds this fraction, disable Trap 3 — mean-reversion against a
+    # parabolic / capitulation phase has no edge.
+    runaway_train_halt_pct: float = Field(gt=0.0, le=1.0, default=0.05)
 
 
 class SoftStopSettings(BaseModel):
