@@ -40,6 +40,7 @@ from bot_btc_1hr_kalshi.feedloop import (
     ws_connect_kalshi_signed,
     ws_connect_websockets,
 )
+from bot_btc_1hr_kalshi.market_data.bars import MultiTimeframeBus
 from bot_btc_1hr_kalshi.market_data.feeds.kalshi import WSConnect
 from bot_btc_1hr_kalshi.market_data.feeds.spot import (
     SpotFeed,
@@ -372,6 +373,14 @@ def _start_feed_loop_if_enabled(
     )
     app.spot_oracle = spot_oracle
     spot_task = asyncio.create_task(spot_oracle.run(), name="spot-oracle")
+
+    # Multi-timeframe bar bus (Slice 7). Timeframes mirror DESIGN.md §5 —
+    # 1m/5m/15m for intra-hour features, 1h for the top-down alignment veto,
+    # 1d for the 24h runaway-train breaker. Fed from the oracle's primary
+    # callback; downstream feature consumers wire in on later slices.
+    bar_bus = MultiTimeframeBus(tf_secs=[60, 300, 900, 3600, 86400])
+    app.bar_bus = bar_bus
+    spot_oracle.subscribe_primary(bar_bus.ingest)
 
     task = asyncio.create_task(
         run_feed_forever(

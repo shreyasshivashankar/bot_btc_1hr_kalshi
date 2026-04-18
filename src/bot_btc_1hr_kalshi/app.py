@@ -14,6 +14,7 @@ from bot_btc_1hr_kalshi.archive.writer import ArchiveWriter
 from bot_btc_1hr_kalshi.config.settings import Settings
 from bot_btc_1hr_kalshi.execution.broker.base import Broker
 from bot_btc_1hr_kalshi.execution.oms import OMS
+from bot_btc_1hr_kalshi.market_data.bars import MultiTimeframeBus
 from bot_btc_1hr_kalshi.market_data.book import L2Book
 from bot_btc_1hr_kalshi.market_data.spot_oracle import SpotOracle
 from bot_btc_1hr_kalshi.monitor.position_monitor import PositionMonitor
@@ -45,6 +46,12 @@ class App:
     # 6 — replaces the previous per-session SpotFeed ownership). None when
     # the feed loop is disabled (dev mode, unit tests).
     spot_oracle: SpotOracle | None = None
+    # Multi-timeframe bar bus (Slice 7). Downstreams that need candle-closed
+    # views of spot (RSI, VWAP, HTF alignment) subscribe to the relevant
+    # timeframe here instead of re-aggregating from raw ticks. Fed by
+    # `spot_oracle.subscribe_primary(bar_bus.ingest)` at startup so its
+    # lifetime tracks the oracle's. None when the feed loop is disabled.
+    bar_bus: MultiTimeframeBus | None = None
     books: dict[str, L2Book] = field(default_factory=dict)
     trading_halted: bool = False
     tier1_override_active: bool = False
