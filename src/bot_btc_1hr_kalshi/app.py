@@ -15,6 +15,7 @@ from bot_btc_1hr_kalshi.execution.oms import OMS
 from bot_btc_1hr_kalshi.market_data.book import L2Book
 from bot_btc_1hr_kalshi.monitor.position_monitor import PositionMonitor
 from bot_btc_1hr_kalshi.obs.clock import Clock
+from bot_btc_1hr_kalshi.obs.lifecycle import LifecycleEmitter
 from bot_btc_1hr_kalshi.obs.schemas import BetOutcome
 from bot_btc_1hr_kalshi.portfolio.positions import Portfolio
 from bot_btc_1hr_kalshi.risk.breakers import BreakerState
@@ -28,6 +29,7 @@ class App:
     portfolio: Portfolio
     oms: OMS
     monitor: PositionMonitor
+    lifecycle: LifecycleEmitter | None = None
     books: dict[str, L2Book] = field(default_factory=dict)
     trading_halted: bool = False
     tier1_override_active: bool = False
@@ -46,13 +48,17 @@ class App:
             "markets_tracked": sorted(self.books.keys()),
         }
 
-    def halt(self) -> None:
+    def halt(self, *, reason: str = "operator") -> None:
         self.trading_halted = True
+        if self.lifecycle is not None:
+            self.lifecycle.halt(reason=reason)
 
-    def resume(self) -> None:
+    def resume(self, *, reason: str = "operator") -> None:
         if self.tier1_override_active:
             raise RuntimeError("cannot resume while tier1_override_active is true")
         self.trading_halted = False
+        if self.lifecycle is not None:
+            self.lifecycle.resume(reason=reason)
 
     async def flatten(self) -> list[BetOutcome]:
         """Submit IOC exits for every open position. Tier-1 flatten semantics

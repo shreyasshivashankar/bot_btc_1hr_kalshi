@@ -130,7 +130,7 @@ class Reconciler:
                     for m in persistent
                 ],
             )
-            self._app.halt()
+            self._app.halt(reason="reconciler_mismatch")
             return ReconcileResult(mismatches=tuple(mismatches), halted=True)
 
         return ReconcileResult(mismatches=tuple(mismatches), halted=False)

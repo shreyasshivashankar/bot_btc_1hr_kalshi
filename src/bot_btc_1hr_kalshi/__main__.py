@@ -30,6 +30,7 @@ from bot_btc_1hr_kalshi.execution.broker.shadow import ShadowBroker
 from bot_btc_1hr_kalshi.execution.oms import OMS
 from bot_btc_1hr_kalshi.monitor.position_monitor import PositionMonitor
 from bot_btc_1hr_kalshi.obs.clock import SystemClock
+from bot_btc_1hr_kalshi.obs.lifecycle import LifecycleEmitter
 from bot_btc_1hr_kalshi.obs.logging import configure as configure_logging
 from bot_btc_1hr_kalshi.obs.logging import get_logger
 from bot_btc_1hr_kalshi.portfolio.positions import Portfolio
@@ -96,6 +97,7 @@ def build_app(
     breakers = BreakerState(store=store)
     portfolio = Portfolio(bankroll_usd=bankroll)
     broker: Broker = _broker_for_mode(mode, clock=clock)
+    lifecycle = LifecycleEmitter(clock=clock)
     oms = OMS(
         broker=broker,
         portfolio=portfolio,
@@ -103,6 +105,7 @@ def build_app(
         risk_settings=settings.risk,
         min_signal_confidence=settings.signal.min_signal_confidence,
         clock=clock,
+        lifecycle=lifecycle,
     )
     monitor = PositionMonitor(oms=oms, portfolio=portfolio, settings=settings.monitor)
     return App(
@@ -112,6 +115,7 @@ def build_app(
         portfolio=portfolio,
         oms=oms,
         monitor=monitor,
+        lifecycle=lifecycle,
     )
 
 
@@ -144,7 +148,7 @@ async def serve(app: App, *, admin_token: str, host: str, port: int) -> None:
             open_positions=len(app.portfolio.open_positions),
             trading_halted_before=app.trading_halted,
         )
-        app.halt()
+        app.halt(reason="sigterm")
         server.should_exit = True
 
     for sig in (signal.SIGTERM, signal.SIGINT):

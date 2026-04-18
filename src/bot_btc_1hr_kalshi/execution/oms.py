@@ -22,6 +22,7 @@ from bot_btc_1hr_kalshi.execution.broker.base import (
     OrderRequest,
 )
 from bot_btc_1hr_kalshi.obs.clock import Clock
+from bot_btc_1hr_kalshi.obs.lifecycle import LifecycleEmitter
 from bot_btc_1hr_kalshi.obs.logging import BET_OUTCOMES_LOGGER, get_logger
 from bot_btc_1hr_kalshi.obs.schemas import (
     BetOutcome,
@@ -60,6 +61,7 @@ class OMS:
         risk_settings: RiskSettings,
         min_signal_confidence: float,
         clock: Clock,
+        lifecycle: LifecycleEmitter | None = None,
     ) -> None:
         self._broker = broker
         self._portfolio = portfolio
@@ -69,6 +71,10 @@ class OMS:
         self._clock = clock
         self._log = get_logger("bot_btc_1hr_kalshi.oms")
         self._outcomes_log = get_logger(BET_OUTCOMES_LOGGER)
+        # Optional — when None the OMS is silent on the lifecycle channel.
+        # Tests wire None; production wires a real emitter so the audit
+        # trail covers every order transition.
+        self._lifecycle = lifecycle
         # Counter for partial-close bet_id suffixing. A position that fully
         # closes after N partials will have emitted outcomes p1..pN plus a
         # final unsuffixed outcome for the remainder.
@@ -129,6 +135,16 @@ class OMS:
             reject_reason=reject_reason,
         )
         self._log.info("decision", **decision.model_dump())
+        if self._lifecycle is not None:
+            self._lifecycle.decision(
+                decision_id=decision_id,
+                market_id=market_id,
+                trap=signal.trap,
+                side=signal.side,
+                approved=approved,
+                contracts=sized,
+                reject_reason=reject_reason,
+            )
 
         if not approved:
             return EntryResult(decision=decision, ack=None, position_id=None)
@@ -143,7 +159,28 @@ class OMS:
             contracts=approved_contracts,
             order_type="maker",
         )
+        if self._lifecycle is not None:
+            self._lifecycle.order_submitted(
+                decision_id=decision_id,
+                client_order_id=req.client_order_id,
+                market_id=req.market_id,
+                side=req.side,
+                action=req.action,
+                contracts=req.contracts,
+                limit_price_cents=req.limit_price_cents,
+                order_type=req.order_type,
+            )
         ack = await self._broker.submit(req)
+        if self._lifecycle is not None:
+            self._lifecycle.order_ack(
+                decision_id=decision_id,
+                client_order_id=ack.client_order_id,
+                order_id=ack.order_id,
+                status=ack.status,
+                filled_contracts=ack.filled_contracts,
+                remaining_contracts=ack.remaining_contracts,
+                reason=ack.reason,
+            )
         return EntryResult(decision=decision, ack=ack, position_id=decision_id)
 
     def on_entry_fill(
@@ -161,6 +198,15 @@ class OMS:
             trap=trap,
             features_at_entry=features_at_entry,
         )
+        if self._lifecycle is not None:
+            self._lifecycle.position_opened(
+                position_id=decision_id,
+                decision_id=decision_id,
+                market_id=fill.market_id,
+                side=fill.side,
+                contracts=fill.contracts,
+                entry_price_cents=fill.price_cents,
+            )
 
     async def submit_exit(
         self,
@@ -196,6 +242,13 @@ class OMS:
             )
             self._outcomes_log.info("bet_outcome", **bet_outcome.model_dump())
             self._partial_seq.pop(position_id, None)
+            if self._lifecycle is not None:
+                self._lifecycle.position_closed(
+                    position_id=position_id,
+                    exit_price_cents=exit_fill.price_cents,
+                    net_pnl_usd=bet_outcome.net_pnl_usd,
+                    exit_reason=exit_reason,
+                )
         elif ack.status == "partially_filled" and len(ack.fills) > 0:
             # Kalshi IOC cancels the remainder automatically, so there is no
             # orphaned resting order — we close the filled slice and let the
@@ -211,6 +264,16 @@ class OMS:
                 partial_seq=seq,
             )
             self._outcomes_log.info("bet_outcome", **bet_outcome.model_dump())
+            if self._lifecycle is not None:
+                # partial_close mutates pos.contracts in place to the new
+                # (reduced) count, so pos.contracts is already the remainder.
+                self._lifecycle.position_partial_closed(
+                    position_id=position_id,
+                    closed_contracts=exit_fill.contracts,
+                    remaining_contracts=pos.contracts,
+                    exit_price_cents=exit_fill.price_cents,
+                    partial_seq=seq,
+                )
         elif ack.status in ("rejected", "cancelled"):
             # No fills, no state change. Log so repeated rejections are visible;
             # caller / monitor decides whether to retry.
