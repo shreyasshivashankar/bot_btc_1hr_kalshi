@@ -7,7 +7,12 @@ feeds:
   kalshi:
     ws_url_env:   BOT_BTC_1HR_KALSHI_WS_URL
     rest_url_env: BOT_BTC_1HR_KALSHI_REST_URL
-    staleness_halt_ms: 2000
+    # 10s aligns with Kalshi's WS open_timeout. Quiet hourly books can go
+    # 5–20s without a book delta on low-OI strikes; a 2s threshold flapped
+    # in/out of the feed_staleness breaker constantly and polluted the
+    # decision journal with breaker_tripped rejects. We care whether the
+    # tape is alive, not whether the book has moved every 2 seconds.
+    staleness_halt_ms: 10000
   coinbase:
     ws_url: wss://ws-feed.exchange.coinbase.com
     staleness_halt_ms: 2000
