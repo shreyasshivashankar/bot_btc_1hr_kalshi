@@ -65,6 +65,7 @@ class ReplayOrchestrator:
         strike_usd: float,
         minutes_to_settlement_fn: Any | None = None,
         primary_tf: str = "5m",
+        settlement_ts_ns: int = 0,
     ) -> None:
         self._app = app
         self._broker = broker
@@ -73,6 +74,7 @@ class ReplayOrchestrator:
         self._features = feature_engine
         self._primary_tf = primary_tf
         self._strike_usd = strike_usd
+        self._settlement_ts_ns = settlement_ts_ns
         self._book = L2Book(market_id)
         self._app.register_book(self._book)
         self._broker.register_book(self._book)
@@ -117,6 +119,7 @@ class ReplayOrchestrator:
             fill=fill,
             trap=pending.trap,
             features_at_entry=pending.features_at_entry,
+            settlement_ts_ns=self._settlement_ts_ns,
         )
 
     async def _maybe_enter(self) -> None:
@@ -134,7 +137,9 @@ class ReplayOrchestrator:
 
         self.result.entries_attempted += 1
         result: EntryResult = await self._app.oms.consider_entry(
-            signal=signal, market_id=self._market_id
+            signal=signal,
+            market_id=self._market_id,
+            settlement_ts_ns=self._settlement_ts_ns,
         )
         if not result.decision.approved:
             self.result.entries_rejected += 1

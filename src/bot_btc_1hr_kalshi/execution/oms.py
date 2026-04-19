@@ -90,6 +90,7 @@ class OMS:
         *,
         signal: TrapSignal,
         market_id: str,
+        settlement_ts_ns: int = 0,
     ) -> EntryResult:
         decision_id = str(uuid.uuid4())
         now_ns = self._clock.now_ns()
@@ -112,6 +113,9 @@ class OMS:
             contracts=sized,
         )
 
+        correlated_count = self._portfolio.count_correlated_open(
+            side=signal.side, settlement_ts_ns=settlement_ts_ns
+        )
         verdict = check(
             RiskInput(
                 signal=signal,
@@ -122,6 +126,7 @@ class OMS:
                 breakers=self._breakers,
                 now_ns=now_ns,
                 min_signal_confidence=self._min_conf,
+                correlated_open_positions_count=correlated_count,
             ),
             self._risk,
         )
@@ -197,6 +202,7 @@ class OMS:
         fill: Fill,
         trap: str,
         features_at_entry: Features,
+        settlement_ts_ns: int = 0,
     ) -> None:
         self._portfolio.open_from_fill(
             position_id=decision_id,
@@ -204,6 +210,7 @@ class OMS:
             fill=fill,
             trap=trap,
             features_at_entry=features_at_entry,
+            settlement_ts_ns=settlement_ts_ns,
         )
         if self._lifecycle is not None:
             self._lifecycle.position_opened(

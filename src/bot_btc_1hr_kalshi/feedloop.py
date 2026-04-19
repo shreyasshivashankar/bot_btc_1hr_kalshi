@@ -285,7 +285,9 @@ class FeedLoop:
             if self._pending or self._app.portfolio.open_positions:
                 return
             result: EntryResult = await self._app.oms.consider_entry(
-                signal=signal, market_id=self._market_id
+                signal=signal,
+                market_id=self._market_id,
+                settlement_ts_ns=self._settlement_ns,
             )
             if not result.decision.approved:
                 return
