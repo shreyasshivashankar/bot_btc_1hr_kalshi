@@ -84,19 +84,13 @@ spec:
               bucketName: bot-btc-1hr-kalshi-tick-archive-${PROJECT_ID}
               mountOptions: "uid=10001,gid=10001,implicit-dirs"
 
-      # SIGTERM → SIGKILL grace, best-effort. Knative/Kubernetes honors this
-      # field; Cloud Run managed does NOT document it (the YAML reference
-      # at cloud.google.com/run/docs/reference/yaml/v1 lists neither this
-      # field nor the `run.googleapis.com/container-shutdown-timeout`
-      # annotation, and the container-runtime contract states a fixed 10s
-      # SIGTERM→SIGKILL window). We set it anyway — if Cloud Run ever honors
-      # the Knative field we benefit; if not, nothing breaks.
-      #
-      # CRITICAL: the system MUST be safe to die in 10 seconds. Any order
-      # the IOC ladder has started but not finished is recovered via the
-      # OMS `ABANDONED_TO_SETTLEMENT` ledger state on next boot — capital
-      # stays locked in Kalshi's settlement engine, portfolio reconciles.
-      terminationGracePeriodSeconds: 600
+      # Cloud Run managed gives a fixed 10s SIGTERM→SIGKILL window per the
+      # container-runtime contract and rejects the Knative
+      # `terminationGracePeriodSeconds` field at parse time. Our system is
+      # required to be safe to die in 10 seconds: any order the IOC ladder
+      # has started but not finished is recovered via the OMS
+      # `ABANDONED_TO_SETTLEMENT` ledger state on next boot — capital stays
+      # locked in Kalshi's settlement engine, portfolio reconciles on restart.
       containers:
         - name: bot-btc-1hr-kalshi
           image: ${REGION}-docker.pkg.dev/${PROJECT_ID}/bot-btc-1hr-kalshi/bot-btc-1hr-kalshi:latest
