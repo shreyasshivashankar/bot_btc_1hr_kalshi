@@ -72,7 +72,7 @@ src/bot_btc_1hr_kalshi/
   research/      Replay harness, backtest metrics, walk-forward splits, divergence comparator (Slice 5 skeletons; drivers + live tick capture pending)
 
 deploy/        Dockerfile, Cloud Run manifest, setup_gcp.sh, env.example.yaml
-config/        paper.yaml, prod.yaml
+config/        paper.yaml, live.yaml
 scripts/       Runtime + ops scripts (see table above)
 tests/         unit + integration
 ```

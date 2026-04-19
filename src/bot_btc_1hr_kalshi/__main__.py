@@ -18,7 +18,7 @@ import os
 import signal
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import httpx
 import uvicorn
@@ -27,8 +27,9 @@ from bot_btc_1hr_kalshi.admin.server import create_app as create_admin_app
 from bot_btc_1hr_kalshi.app import App
 from bot_btc_1hr_kalshi.archive.writer import ArchiveWriter
 from bot_btc_1hr_kalshi.config.loader import load_settings
-from bot_btc_1hr_kalshi.config.settings import FeedSettings, Mode
+from bot_btc_1hr_kalshi.config.settings import FeedSettings, Mode, Settings
 from bot_btc_1hr_kalshi.execution.broker.base import Broker
+from bot_btc_1hr_kalshi.execution.broker.kalshi import KalshiBroker
 from bot_btc_1hr_kalshi.execution.broker.kalshi_signer import KalshiSigner
 from bot_btc_1hr_kalshi.execution.broker.paper import PaperBroker
 from bot_btc_1hr_kalshi.execution.broker.shadow import ShadowBroker
@@ -108,33 +109,61 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return p.parse_args(argv)
 
 
-def _broker_for_mode(mode: Mode, *, clock: SystemClock) -> Broker:
+def _broker_for_mode(
+    mode: Mode, *, settings: Settings, clock: SystemClock,
+) -> tuple[Broker, httpx.AsyncClient | None]:
     """Select the broker for the given mode.
 
     dev / paper: local paper broker (in-proc fill simulation).
     shadow:      no-wire shadow broker (records intents only — hard rule #2).
-    live:        KalshiBroker class exists at execution/broker/kalshi.py but
-                 is not wired here yet - the DI (httpx.AsyncClient + Secret
-                 Manager-backed key loading) is a separate change.
+    live:        KalshiBroker with an httpx.AsyncClient + KalshiSigner
+                 constructed from Secret-Manager-backed env vars.
 
-    Live is deliberately not wired in this function yet: the Kalshi broker
-    class is implemented and tested, but plumbing an httpx client plus
-    Secret-Manager-resolved keys through to it is a discrete change. Raise
-    explicitly so `--mode live` fails loudly rather than silently running
-    against PaperBroker — which would be a hard-rule-#2 violation waiting
-    to happen.
+    Returns `(broker, client_to_close)`. The caller is responsible for
+    `aclose()`-ing the returned client on shutdown; it is None for
+    in-proc brokers that hold no network resources.
     """
     if mode in ("dev", "paper"):
-        return PaperBroker(clock=clock)
+        return PaperBroker(clock=clock), None
     if mode == "shadow":
-        return ShadowBroker(clock=clock)
+        return ShadowBroker(clock=clock), None
     if mode == "live":
-        raise NotImplementedError(
-            "live broker wiring is not yet complete — KalshiBroker class "
-            "exists (execution/broker/kalshi.py) but requires httpx client "
-            "+ Secret Manager key loading DI in __main__",
-        )
+        return _build_kalshi_broker(settings=settings, clock=clock)
     raise ValueError(f"unknown mode: {mode}")
+
+
+def _build_kalshi_broker(
+    *, settings: Settings, clock: SystemClock,
+) -> tuple[KalshiBroker, httpx.AsyncClient]:
+    """Instantiate the live Kalshi REST broker from env-var-backed creds.
+
+    Fails loudly on missing API key / private key path / REST URL — live
+    mode must not silently degrade to an unauthenticated session. The
+    private key is mounted from Secret Manager as a file; we read the
+    path from `BOT_BTC_1HR_KALSHI_PRIVATE_KEY_PATH` (hard rule #4).
+    """
+    api_key = os.getenv(KALSHI_API_KEY_ENV)
+    priv_path = os.getenv(KALSHI_PRIVATE_KEY_PATH_ENV)
+    rest_url = _resolve_rest_url(settings.feeds.kalshi)
+    missing = [
+        name for name, val in (
+            (KALSHI_API_KEY_ENV, api_key),
+            (KALSHI_PRIVATE_KEY_PATH_ENV, priv_path),
+            ("kalshi.rest_url (settings or env)", rest_url),
+        ) if not val
+    ]
+    if missing:
+        raise ValueError(
+            "live mode broker wiring requires: " + ", ".join(missing)
+        )
+    # `missing` being empty means each of the three is set; narrow for mypy.
+    pem_bytes = Path(cast(str, priv_path)).read_bytes()
+    signer = KalshiSigner(
+        api_key_id=cast(str, api_key), private_key_pem=pem_bytes, clock=clock,
+    )
+    client = httpx.AsyncClient(base_url=cast(str, rest_url), timeout=10.0)
+    broker = KalshiBroker(client=client, signer=signer, clock=clock)
+    return broker, client
 
 
 def build_app(
@@ -152,7 +181,9 @@ def build_app(
     store = JsonFileBreakerStore(state_path) if state_path else NullBreakerStore()
     breakers = BreakerState(store=store)
     portfolio = Portfolio(bankroll_usd=bankroll)
-    broker: Broker = _broker_for_mode(mode, clock=clock)
+    broker, kalshi_rest_client = _broker_for_mode(
+        mode, settings=settings, clock=clock,
+    )
     lifecycle = LifecycleEmitter(clock=clock)
     activity = ActivityTracker(boot_ns=clock.now_ns())
     archive_dir = os.getenv(ARCHIVE_DIR_ENV)
@@ -179,6 +210,7 @@ def build_app(
         lifecycle=lifecycle,
         activity=activity,
         archive_writer=archive_writer,
+        kalshi_rest_client=kalshi_rest_client,
     )
 
 
@@ -252,6 +284,8 @@ async def serve(app: App, *, admin_token: str, host: str, port: int) -> None:
                 log.warning("shutdown.task_error", task=name, error=str(exc))
         if rest_client is not None:
             await rest_client.aclose()
+        if app.kalshi_rest_client is not None:
+            await app.kalshi_rest_client.aclose()
         if app.archive_writer is not None:
             app.archive_writer.close()
         if app.portfolio.open_positions:

@@ -10,6 +10,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+import httpx
+
 from bot_btc_1hr_kalshi.archive.writer import ArchiveWriter
 from bot_btc_1hr_kalshi.config.settings import Settings
 from bot_btc_1hr_kalshi.execution.broker.base import Broker
@@ -59,6 +61,10 @@ class App:
     # `__main__` attaches it to the bar bus once; each per-session
     # FeedLoop receives the same reference.
     feature_engine: FeatureEngine | None = None
+    # Live-mode KalshiBroker's REST client. Held here so the process
+    # shutdown path in `__main__.serve()` can `aclose()` it alongside
+    # other async resources. None in dev / paper / shadow modes.
+    kalshi_rest_client: httpx.AsyncClient | None = None
     books: dict[str, L2Book] = field(default_factory=dict)
     trading_halted: bool = False
     tier1_override_active: bool = False
