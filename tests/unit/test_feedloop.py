@@ -269,6 +269,7 @@ async def test_feedloop_routes_book_updates_to_correct_book_by_market_id() -> No
         feature_engine=features,
         market_id="KXBTC-ATM",
         strike_usd=60_000.0,
+        strikes={"KXBTC-ATM": 60_000.0, "KXBTC-LOW": 59_000.0},
         settlement_ts_ns=settlement_ns,
         clock=clock,
         grace_sec=0.1,
@@ -317,6 +318,72 @@ async def test_feedloop_rejects_missing_primary_market_id() -> None:
             settlement_ts_ns=start_ns + 1_000_000_000,
             clock=clock,
         )
+
+
+@pytest.mark.asyncio
+async def test_feedloop_build_snapshots_covers_every_valid_book() -> None:
+    """Cross-sectional evaluator needs one `MarketSnapshot` per valid book.
+    A book that's not yet valid (no snapshot frame) is simply absent from
+    the list — it doesn't block evaluation of its siblings."""
+    from bot_btc_1hr_kalshi.market_data.types import BookLevel, BookUpdate
+
+    start_ns = 1_800_000_000_000_000_000
+    settlement_ns = start_ns + 3_600_000_000_000
+    clock = ManualClock(start_ns)
+    app, broker = _build_app(clock)
+
+    kalshi_feed = KalshiFeed(
+        ws_url="ws://kalshi/test",
+        market_tickers=["KXBTC-A", "KXBTC-B", "KXBTC-C"],
+        clock=clock,
+        ws_connect=lambda url: _never(),
+        staleness=StalenessTracker(name="kalshi", clock=clock, threshold_ms=2000),
+    )
+    oracle = StubOracle(clock)
+    oracle.push_primary(60_000.0)
+    features = FeatureEngine(
+        timeframes=["5m"], bollinger_period=20, bollinger_std_mult=2.0
+    )
+    # Warm BollingerBands + ATR so `_build_snapshots` has feature data to work with.
+    for p in range(60_000, 60_050):
+        features.ingest_bar("5m", close=float(p), high=float(p) + 1.0, low=float(p) - 1.0)
+
+    a = L2Book("KXBTC-A")
+    b = L2Book("KXBTC-B")
+    c = L2Book("KXBTC-C")  # intentionally left invalid (no snapshot applied)
+    # Seed A and B with snapshots; C stays cold.
+    for book in (a, b):
+        book.apply(BookUpdate(
+            seq=1, ts_ns=start_ns, market_id=book.market_id,
+            bids=(BookLevel(price_cents=40, size=100),),
+            asks=(BookLevel(price_cents=55, size=100),),
+            is_snapshot=True,
+        ))
+
+    loop = FeedLoop(
+        app=app, broker=broker,
+        books={"KXBTC-A": a, "KXBTC-B": b, "KXBTC-C": c},
+        kalshi_feed=kalshi_feed,
+        spot_oracle=oracle,  # type: ignore[arg-type]
+        feature_engine=features,
+        market_id="KXBTC-A",
+        strike_usd=59_000.0,
+        strikes={"KXBTC-A": 59_000.0, "KXBTC-B": 60_000.0, "KXBTC-C": 61_000.0},
+        settlement_ts_ns=settlement_ns,
+        clock=clock,
+        spot_staleness_max_age_ms=1000,
+    )
+
+    snaps = loop._build_snapshots()
+    by_id = {s.market_id: s for s in snaps}
+    assert set(by_id) == {"KXBTC-A", "KXBTC-B"}, "cold book C must be absent"
+    assert by_id["KXBTC-A"].strike_usd == 59_000.0
+    assert by_id["KXBTC-B"].strike_usd == 60_000.0
+    # Shared features across all snapshots — they're spot-driven, not book-driven.
+    assert (
+        by_id["KXBTC-A"].features.bollinger_pct_b
+        == by_id["KXBTC-B"].features.bollinger_pct_b
+    )
 
 
 def test_minutes_to_settlement_fn_counts_down() -> None:
