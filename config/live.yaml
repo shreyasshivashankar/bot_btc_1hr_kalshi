@@ -8,12 +8,15 @@ feeds:
   kalshi:
     ws_url_env:   BOT_BTC_1HR_KALSHI_WS_URL
     rest_url_env: BOT_BTC_1HR_KALSHI_REST_URL
-    # 10s aligns with Kalshi's WS open_timeout. Quiet hourly books can go
-    # 5–20s without a book delta on low-OI strikes; a 2s threshold flaps
-    # in/out of the feed_staleness breaker and starves the decision journal
-    # with breaker_tripped rejects. We care whether the tape is alive, not
-    # whether the book has moved every 2 seconds.
-    staleness_halt_ms: 10000
+    # Kalshi's hourly BTC books legitimately sit untouched by MMs for 12–18s
+    # when underlying spot is flat — first paper soak (2026-04-19) observed
+    # age_ms 10065–10216 on a 10s threshold, flapping repeatedly. Sized to
+    # 30s with headroom: the breaker exists for *broken* tape, not *quiet*
+    # tape. kalshi_parser.py drops ping/pong/control frames on purpose — we
+    # track liquidity, not connectivity; a healthy WS with no book activity
+    # still trips this budget. If spot moves, MMs reprice and emit deltas
+    # immediately, so a dead socket still fails-closed within the window.
+    staleness_halt_ms: 30000
   coinbase:
     ws_url: wss://ws-feed.exchange.coinbase.com
     staleness_halt_ms: 2000
