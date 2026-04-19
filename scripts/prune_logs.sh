@@ -1,67 +1,86 @@
 #!/usr/bin/env bash
-# Prune Cloud Run logs older than N days (default: 14) for bot_btc_1hr_kalshi.
+# Clear Cloud Run log entries for bot_btc_1hr_kalshi.
 #
 # Usage:
-#   ./scripts/prune_logs.sh               # prune entries older than 14d
-#   ./scripts/prune_logs.sh --days 30     # override retention window
-#   ./scripts/prune_logs.sh --dry-run     # show filter, don't delete
+#   ./scripts/prune_logs.sh              # delete all Cloud Run log entries
+#   ./scripts/prune_logs.sh --dry-run    # show what would be deleted
 #
-# Retention policy: we keep 14 days of Cloud Run logs in Logging. The
-# BigQuery sink (bot_btc_1hr_kalshi.bet_outcomes) is the long-term store
-# for closed-trade records — we never prune those from here.
+# Retention (14 days by default) is enforced at the log-bucket level by
+# `deploy/setup_gcp.sh` via `gcloud logging buckets update _Default
+# --retention-days=N`. That is the source of truth for steady-state retention;
+# this script is for on-demand clean cuts (e.g. before a fresh soak).
 #
-# Implementation: `gcloud logging delete` deletes matching *log entries*,
-# not the log itself. Safe to re-run.
+# The BigQuery sink (bot_btc_1hr_kalshi.bet_outcomes) is the long-term store
+# for closed-trade records — we never touch it from here. Only Cloud Run
+# log streams (run.googleapis.com/*) are deleted; audit, ops-agent, and
+# cloudbuild logs are left alone.
 #
-# Requires: gcloud Logging Admin role.
+# Implementation note: `gcloud logging logs delete LOG_NAME` deletes all
+# entries for a named log. gcloud has no filter-based entry delete
+# (contrary to older docs — `gcloud logging delete` with a filter doesn't
+# exist as a subcommand). Deletion is accepted synchronously but entries
+# may take up to ~1h to fully drain from read paths.
+#
+# Requires: Logging Admin role.
 set -euo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 for arg in "$@"; do
   if [[ "$arg" == "-h" || "$arg" == "--help" ]]; then
-    sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'
     exit 0
   fi
 done
 
 source "${DIR}/_common.sh"
 
-DAYS=14
 DRY_RUN=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --days) DAYS="$2"; shift 2 ;;
     --dry-run) DRY_RUN=1; shift ;;
     -h|--help)
-      sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'
+      sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'
       exit 0 ;;
     *) _fatal "Unknown flag: $1" ;;
   esac
 done
 
-SERVICE="${BOT_BTC_1HR_KALSHI_SERVICE_NAME}"
 PROJECT="${BOT_BTC_1HR_KALSHI_GCP_PROJECT}"
-CUTOFF=$(date -u -v-"${DAYS}"d "+%Y-%m-%dT%H:%M:%SZ" 2>/dev/null \
-         || date -u -d "-${DAYS} days" "+%Y-%m-%dT%H:%M:%SZ")
 
-FILTER="resource.type=\"cloud_run_revision\" AND resource.labels.service_name=\"${SERVICE}\" AND timestamp < \"${CUTOFF}\""
+# Enumerate Cloud Run log streams. `gcloud logging logs list` returns
+# fully-qualified names like `projects/PROJECT/logs/run.googleapis.com%2Fstdout`.
+# Strip the `projects/.../logs/` prefix; gcloud accepts either the encoded
+# (`run.googleapis.com%2Fstdout`) or decoded (`run.googleapis.com/stdout`) form
+# when passed to `logs delete`.
+# macOS ships bash 3.2 which lacks `mapfile`; use a portable read loop.
+LOGS=()
+while IFS= read -r line; do
+  [ -n "$line" ] && LOGS+=("$line")
+done < <(
+  gcloud logging logs list --project="$PROJECT" --format='value(NAME)' \
+    | sed -n 's|^projects/[^/]*/logs/||p' \
+    | grep -E '^run\.googleapis\.com' \
+    || true
+)
 
-_info "Deleting log entries older than ${DAYS} days (before ${CUTOFF})"
-_info "Filter: ${FILTER}"
-
-if [[ "$DRY_RUN" -eq 1 ]]; then
-  _info "[dry-run] preview first 5 matching entries:"
-  gcloud logging read "$FILTER" \
-    --project="$PROJECT" \
-    --limit=5 \
-    --order=asc \
-    --format='value(timestamp,jsonPayload.event,textPayload)'
+if [ "${#LOGS[@]}" -eq 0 ]; then
+  _info "No Cloud Run log streams present — nothing to prune."
   exit 0
 fi
 
-# gcloud prompts for confirmation; --quiet auto-accepts.
-gcloud logging delete "$FILTER" \
-  --project="$PROJECT" \
-  --quiet
+_info "Cloud Run log streams queued for deletion (${#LOGS[@]}):"
+for LOG in "${LOGS[@]}"; do
+  printf "  - %s\n" "$(printf '%s' "$LOG" | sed 's|%2F|/|g')"
+done
 
-_info "Prune complete."
+if [[ "$DRY_RUN" -eq 1 ]]; then
+  _info "[dry-run] nothing deleted."
+  exit 0
+fi
+
+for LOG in "${LOGS[@]}"; do
+  _info "Deleting: ${LOG//%2F/\/}"
+  gcloud logging logs delete "$LOG" --project="$PROJECT" --quiet
+done
+
+_info "Prune accepted. Entries drain from read paths within ~1h."
