@@ -176,6 +176,79 @@ async def test_early_cashout_takes_precedence_over_soft_stop() -> None:
     assert ticks[0].action == "early_cashout_99"
 
 
+async def test_arb_basis_closed_fires_when_bid_converges_to_fair() -> None:
+    """An implied-basis-arb position fast-exits the moment market price
+    on its side converges to within 3c of current fair value. spot==strike
+    → q_yes≈0.5 → fair≈50c; a YES bid at 50 closes the basis exactly."""
+    _oms, portfolio, monitor, broker, _clock = _build()
+    pid = "pos-arb"
+    portfolio.open_from_fill(
+        position_id=pid,
+        decision_id=pid,
+        fill=Fill(
+            order_id="o1",
+            client_order_id="c1",
+            market_id=MARKET,
+            side="YES",
+            action="BUY",
+            price_cents=30,
+            contracts=10,
+            ts_ns=1_000,
+            fees_usd=0.0,
+        ),
+        trap="implied_basis_arb",
+        features_at_entry=_features(),
+    )
+    book = _book_with_bid(50, bid_size=500)
+    broker.register_book(book)
+
+    ticks = await monitor.evaluate(
+        book=book,
+        minutes_to_settlement=30.0,
+        regime_vol="normal",
+        regime_trend="flat",
+        spot_btc_usd=60_000.0,
+        strike_usd=60_000.0,
+    )
+    assert len(ticks) == 1
+    assert ticks[0].action == "arb_basis_closed"
+    assert portfolio.get(pid) is None
+
+
+async def test_arb_basis_closed_skipped_without_spot_context() -> None:
+    """When FeedLoop can't hand us a fresh spot (stale oracle), the arb
+    exit branch cleanly short-circuits — other priorities still apply."""
+    _oms, portfolio, monitor, broker, _clock = _build()
+    portfolio.open_from_fill(
+        position_id="pos-arb2",
+        decision_id="pos-arb2",
+        fill=Fill(
+            order_id="o1",
+            client_order_id="c1",
+            market_id=MARKET,
+            side="YES",
+            action="BUY",
+            price_cents=30,
+            contracts=10,
+            ts_ns=1_000,
+            fees_usd=0.0,
+        ),
+        trap="implied_basis_arb",
+        features_at_entry=_features(),
+    )
+    book = _book_with_bid(50)
+    broker.register_book(book)
+    ticks = await monitor.evaluate(
+        book=book,
+        minutes_to_settlement=30.0,
+        regime_vol="normal",
+        regime_trend="flat",
+    )
+    # No arb exit without spot context; bid at 50 vs entry 30 is a 20c
+    # gain but well above soft-stop so noop.
+    assert ticks[0].action == "noop"
+
+
 async def test_mark_exit_cleared_releases_pending() -> None:
     _oms, _portfolio, monitor, _broker, _clock = _build()
     monitor._pending_exit.add("x1")  # type: ignore[attr-defined]

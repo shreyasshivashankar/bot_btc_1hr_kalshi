@@ -78,6 +78,15 @@ class SignalSettings(BaseModel):
     # of net rolling-5m flow is "substantial but not catastrophic" — above
     # normal reversion volume, below cascade scale. Fail-open on warmup.
     cvd_1m_veto_threshold_usd: float = Field(gt=0.0, default=5_000_000.0)
+    # Implied-basis arb (DESIGN.md §6.4, Slice 10). Fair value comes from the
+    # same Normal-CDF settlement model the other traps use for edge; when
+    # Kalshi's best quote on either side is mispriced by `arb_basis_threshold
+    # _cents` or more vs fair, we maker-buy the cheap side. The dead-spot
+    # gate kills the trap whenever the underlying's 60s range exceeds
+    # `arb_dead_spot_range_usd` — a sweeping spot means fair value is stale
+    # relative to the inbound print and the "edge" is adverse selection.
+    arb_basis_threshold_cents: int = Field(gt=0, default=15)
+    arb_dead_spot_range_usd: float = Field(gt=0.0, default=20.0)
 
 
 class SoftStopSettings(BaseModel):

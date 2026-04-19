@@ -49,6 +49,12 @@ signal:
   bollinger_period_bars: 20
   bollinger_std_mult: 2.0
   min_signal_confidence: 0.60
+  # Implied-basis arb (Slice 10). Fair value via Normal-CDF settlement model;
+  # maker-buy the cheap side when mispricing is >= threshold_cents. Dead-spot
+  # veto fires when the underlying's rolling 60s range exceeds
+  # `arb_dead_spot_range_usd` — any basis during a sweep is adverse selection.
+  arb_basis_threshold_cents: 15
+  arb_dead_spot_range_usd: 20.0
 
 monitor:
   early_cashout_price_cents: 99

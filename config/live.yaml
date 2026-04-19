@@ -44,6 +44,10 @@ signal:
   bollinger_period_bars: 20
   bollinger_std_mult: 2.0
   min_signal_confidence: 0.65
+  # Implied-basis arb (Slice 10). Same thresholds as paper — promote with
+  # explicit sign-off before loosening. See SignalSettings in config/settings.py.
+  arb_basis_threshold_cents: 15
+  arb_dead_spot_range_usd: 20.0
 
 monitor:
   early_cashout_price_cents: 99

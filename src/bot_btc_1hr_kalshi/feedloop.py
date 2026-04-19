@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+from collections import deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
@@ -81,6 +82,11 @@ _log = structlog.get_logger("bot_btc_1hr_kalshi.feedloop")
 # Slice-8 HTF fields (1H RSI, 24h move) from their respective TFs. Traps
 # consume all of them via `snap.features` — no parameterless reads remain.
 _PRIMARY_TF: str = "5m"
+
+# Rolling spot-range window used by the implied-basis-arb dead-spot gate.
+# A raw ns bound is simpler than a per-bar aggregator and we only need
+# max-min over the window; both are O(window) on the deque.
+_SPOT_RANGE_WINDOW_NS: int = 60_000_000_000
 
 # How many strikes of the current hourly series to maintain L2 books for.
 # The WS is multiplexed — one connection, N subscriptions. 5 covers the
@@ -201,6 +207,11 @@ class FeedLoop:
         self._mts_fn = minutes_to_settlement_fn(settlement_ts_ns)
         self._integrity = integrity
         self._spot_staleness_max_age_ms = spot_staleness_max_age_ms
+        # Rolling 60s primary-spot history (ts_ns, price_usd) for the
+        # implied-basis-arb dead-spot gate. Appended in _on_primary_tick
+        # and read at snapshot build time — per-session lifetime matches
+        # the other integrity state here.
+        self._spot_history: deque[tuple[int, float]] = deque()
 
     async def run(self) -> None:
         for book in self._books.values():
@@ -246,6 +257,10 @@ class FeedLoop:
         self._archive_and_mark(tick)
         if self._integrity is not None:
             self._integrity.record_primary(tick.ts_ns, tick.price_usd)
+        self._spot_history.append((tick.ts_ns, tick.price_usd))
+        cutoff = tick.ts_ns - _SPOT_RANGE_WINDOW_NS
+        while self._spot_history and self._spot_history[0][0] < cutoff:
+            self._spot_history.popleft()
 
     def _on_confirmation_tick(self, tick: SpotTick) -> None:
         """Oracle callback: Kraken (confirmation) — feeds integrity only."""
@@ -355,11 +370,20 @@ class FeedLoop:
     async def _monitor_tick(self) -> None:
         if not self._app.portfolio.open_positions:
             return
+        # Arb-basis-closed exit needs current spot + strike to recompute
+        # fair value; other exits don't. Missing spot (stale oracle) just
+        # disables that branch — the legacy priorities (early cashout /
+        # theta / soft stop) still fire off the book alone.
+        spot = self._spot_oracle.get_primary_or_none(
+            max_age_ms=self._spot_staleness_max_age_ms
+        )
         await self._app.monitor.evaluate(
             book=self._book,
             minutes_to_settlement=self._mts_fn(self._clock.now_ns()),
             regime_vol=self._features.regime_vol(_PRIMARY_TF),
             regime_trend=self._features.regime_trend(_PRIMARY_TF),
+            spot_btc_usd=spot,
+            strike_usd=self._strike_usd,
         )
 
     def _build_snapshots(self) -> list[MarketSnapshot]:
@@ -395,6 +419,7 @@ class FeedLoop:
         rsi_1h = self._features.rsi("1h")
         move_24h = self._features.move_24h_pct()
         cvd_1m = self._features.cvd("1m", periods=CVD_ROLLING_PERIODS)
+        spot_range_60s = self._spot_range_60s()
 
         snaps: list[MarketSnapshot] = []
         for market_id, book in self._books.items():
@@ -420,6 +445,7 @@ class FeedLoop:
                 rsi_1h=rsi_1h,
                 move_24h_pct=move_24h,
                 cvd_1m_usd=cvd_1m,
+                spot_range_60s=spot_range_60s,
             )
             snaps.append(MarketSnapshot(
                 market_id=market_id,
@@ -430,6 +456,19 @@ class FeedLoop:
                 strike_usd=strike,
             ))
         return snaps
+
+    def _spot_range_60s(self) -> float | None:
+        """max(price) - min(price) across the last 60s of primary ticks.
+
+        Returns None while the window is empty (cold start); the implied-
+        basis-arb trap treats None as "unknown — fail-closed" (i.e. veto),
+        which matches the intent: without a range reading we can't prove
+        the spot is quiet enough to trust fair value.
+        """
+        if not self._spot_history:
+            return None
+        prices = [p for _, p in self._spot_history]
+        return max(prices) - min(prices)
 
     def _snapshot(self) -> MarketSnapshot | None:
         """Legacy single-book snapshot (primary only). Kept for tests and

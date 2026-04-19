@@ -20,6 +20,13 @@ from bot_btc_1hr_kalshi.execution.oms import OMS, ExitResult
 from bot_btc_1hr_kalshi.market_data.book import L2Book
 from bot_btc_1hr_kalshi.obs.schemas import ExitReason
 from bot_btc_1hr_kalshi.portfolio.positions import OpenPosition, Portfolio
+from bot_btc_1hr_kalshi.signal.edge_model import settlement_prob_yes
+
+# Arb basis is considered "closed" (alpha captured) when the market price
+# on the owned side is within this many cents of current fair value. 3c
+# matches the spec's fast-exit threshold: any further waiting risks
+# giving back alpha to theta + adverse reversal.
+_ARB_BASIS_CLOSE_CENTS: float = 3.0
 
 MonitorAction = Literal[
     "noop",
@@ -28,6 +35,7 @@ MonitorAction = Literal[
     "early_cashout_99",
     "theta_net_target",
     "soft_stop",
+    "arb_basis_closed",
 ]
 
 
@@ -62,6 +70,8 @@ class PositionMonitor:
         minutes_to_settlement: float,
         regime_vol: str,
         regime_trend: str,
+        spot_btc_usd: float | None = None,
+        strike_usd: float | None = None,
     ) -> tuple[MonitorTick, ...]:
         results: list[MonitorTick] = []
         for pos in self._portfolio.open_positions:
@@ -74,6 +84,8 @@ class PositionMonitor:
                     minutes_to_settlement=minutes_to_settlement,
                     regime_vol=regime_vol,
                     regime_trend=regime_trend,
+                    spot_btc_usd=spot_btc_usd,
+                    strike_usd=strike_usd,
                 )
             )
         return tuple(results)
@@ -86,6 +98,8 @@ class PositionMonitor:
         minutes_to_settlement: float,
         regime_vol: str,
         regime_trend: str,
+        spot_btc_usd: float | None,
+        strike_usd: float | None,
     ) -> MonitorTick:
         if pos.position_id in self._pending_exit:
             return MonitorTick(position_id=pos.position_id, action="skip_pending_exit")
@@ -101,6 +115,30 @@ class PositionMonitor:
         # Priority 1: early cashout
         if best_bid.price_cents >= self._settings.early_cashout_price_cents:
             return await self._submit_exit(pos, best_bid.price_cents, "early_cashout_99")
+
+        # Priority 1b: arb-basis-closed fast exit. The implied-basis-arb
+        # trap's alpha is the mispricing vs Normal-CDF fair value; once
+        # the market price on the owned side has converged to within
+        # ~3c of fair, the thesis has played out and continuing to hold
+        # just accrues theta + fade risk. Requires current spot + strike
+        # (FeedLoop passes them; test harnesses that omit them skip this
+        # branch — other priorities still apply).
+        if (
+            pos.trap == "implied_basis_arb"
+            and spot_btc_usd is not None
+            and strike_usd is not None
+        ):
+            q_yes = settlement_prob_yes(
+                spot_usd=spot_btc_usd,
+                strike_usd=strike_usd,
+                sigma_per_minute_usd=pos.features_at_entry.atr_cents,
+                minutes_to_settlement=minutes_to_settlement,
+            )
+            fair_cents = q_yes * 100.0 if pos.side == "YES" else (1.0 - q_yes) * 100.0
+            if abs(best_bid.price_cents - fair_cents) <= _ARB_BASIS_CLOSE_CENTS:
+                return await self._submit_exit(
+                    pos, best_bid.price_cents, "arb_basis_closed"
+                )
 
         # Priority 2: theta-net target
         depth = book.book_depth(levels=5)
@@ -148,6 +186,8 @@ class PositionMonitor:
             action = "early_cashout_99"
         elif reason == "theta_net_target":
             action = "theta_net_target"
+        elif reason == "arb_basis_closed":
+            action = "arb_basis_closed"
         else:
             action = "soft_stop"
         return MonitorTick(position_id=pos.position_id, action=action, exit=result)

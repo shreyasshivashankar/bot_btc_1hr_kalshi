@@ -10,6 +10,7 @@ from bot_btc_1hr_kalshi.signal.traps import (
     detect_ceiling_reversion,
     detect_cross_venue_lag,
     detect_floor_reversion,
+    detect_implied_arb,
 )
 from bot_btc_1hr_kalshi.signal.types import MarketSnapshot, TrapSignal
 
@@ -20,6 +21,7 @@ __all__ = [
     "detect_ceiling_reversion",
     "detect_cross_venue_lag",
     "detect_floor_reversion",
+    "detect_implied_arb",
     "run_traps",
     "run_traps_cross_strike",
 ]

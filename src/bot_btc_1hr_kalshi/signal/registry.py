@@ -22,6 +22,7 @@ from bot_btc_1hr_kalshi.signal.traps import (
     detect_ceiling_reversion,
     detect_cross_venue_lag,
     detect_floor_reversion,
+    detect_implied_arb,
 )
 from bot_btc_1hr_kalshi.signal.types import MarketSnapshot, TrapSignal
 
@@ -59,6 +60,14 @@ def run_traps(snap: MarketSnapshot, *, settings: SignalSettings) -> TrapSignal |
     lag = detect_cross_venue_lag(snap, min_confidence=min_confidence)
     if lag is not None:
         candidates.append(lag)
+
+    arb = detect_implied_arb(
+        snap,
+        basis_threshold_cents=settings.arb_basis_threshold_cents,
+        dead_spot_range_usd=settings.arb_dead_spot_range_usd,
+    )
+    if arb is not None:
+        candidates.append(arb)
 
     if not candidates:
         return None
