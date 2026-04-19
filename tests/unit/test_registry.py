@@ -134,3 +134,43 @@ def test_cross_strike_prefers_higher_edge_strike() -> None:
 
 def test_cross_strike_empty_input_returns_none() -> None:
     assert run_traps_cross_strike([], settings=_signal_settings()) is None
+
+
+def test_registry_fires_implied_basis_arb_when_others_silent() -> None:
+    """Quiet Bollinger (pct_b in-band) + a 20c Kalshi-vs-fair basis should
+    fire the arb trap from the registry. Confirms the new trap is wired
+    into run_traps and that its gates don't shadow the other traps."""
+    market_id = "BTC-1H"
+    book = L2Book(market_id)
+    book.apply(
+        BookUpdate(
+            seq=1,
+            ts_ns=1,
+            market_id=market_id,
+            bids=(BookLevel(28, 200),),
+            asks=(BookLevel(30, 200),),
+            is_snapshot=True,
+        )
+    )
+    snap = MarketSnapshot(
+        market_id=market_id,
+        book=book,
+        features=Features(
+            regime_trend="flat",
+            regime_vol="normal",
+            signal_confidence=0.5,
+            bollinger_pct_b=0.1,  # in-band → floor/ceiling/lag stay silent
+            atr_cents=10.0,
+            book_depth_at_entry=400.0,
+            spread_cents=2,
+            spot_btc_usd=60_000.0,
+            minutes_to_settlement=30.0,
+            spot_range_60s=5.0,
+        ),
+        spot_btc_usd=60_000.0,
+        minutes_to_settlement=30.0,
+        strike_usd=60_000.0,
+    )
+    sig = run_traps(snap, settings=_signal_settings())
+    assert sig is not None
+    assert sig.trap == "implied_basis_arb"

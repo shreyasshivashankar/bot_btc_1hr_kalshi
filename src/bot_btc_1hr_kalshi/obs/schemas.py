@@ -16,7 +16,12 @@ from pydantic import BaseModel, ConfigDict, Field
 Side = Literal["YES", "NO"]
 RegimeTrend = Literal["up", "down", "flat"]
 RegimeVol = Literal["high", "normal", "low"]
-TrapName = Literal["floor_reversion", "ceiling_reversion", "cross_venue_lag"]
+TrapName = Literal[
+    "floor_reversion",
+    "ceiling_reversion",
+    "cross_venue_lag",
+    "implied_basis_arb",
+]
 ExitReason = Literal[
     "settled",
     "early_cashout_99",
@@ -24,6 +29,7 @@ ExitReason = Literal[
     "theta_net_target",
     "abandoned_to_settlement",
     "tier1_flatten",
+    "arb_basis_closed",
 ]
 
 # ---- Records ----------------------------------------------------------------
@@ -55,6 +61,12 @@ class Features(BaseModel):
     # after a bar-bus start). NULLABLE in BigQuery for back-compat with
     # pre-Slice-9 rows.
     cvd_1m_usd: float | None = None
+    # Implied-basis-arb dead-spot gate (Slice 10). Rolling 60-second spot
+    # range in USD — if the underlying is actively sweeping, the Normal-CDF
+    # fair value is stale relative to the incoming print and any apparent
+    # basis is adverse-selection bait. `None` during warmup on cold start
+    # and NULLABLE in BigQuery for back-compat with pre-arb rows.
+    spot_range_60s: float | None = Field(default=None, ge=0.0)
 
 
 class Sizing(BaseModel):

@@ -29,6 +29,8 @@ signal:
   bollinger_period_bars: 20
   bollinger_std_mult: 2.0
   min_signal_confidence: 0.55
+  arb_basis_threshold_cents: 15
+  arb_dead_spot_range_usd: 20.0
 
 monitor:
   early_cashout_price_cents: 99
