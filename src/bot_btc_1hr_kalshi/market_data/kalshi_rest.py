@@ -117,26 +117,28 @@ class KalshiRestClient:
             await asyncio.sleep(0.1)
         return out
 
-    async def current_btc_hourly_market(
+    async def list_btc_hourly_markets(
         self,
         *,
         now_ns: int,
         series_ticker: str = "KXBTC",
         max_horizon_sec: int = 3600,
         btc_spot_usd: float | None = None,
-    ) -> HourlyMarket:
-        """Pick the hourly market closest to `btc_spot_usd`, settling next.
+        max_markets: int = 5,
+    ) -> list[HourlyMarket]:
+        """Return up to `max_markets` open hourly markets of the next
+        settlement, ranked by `|strike - btc_spot_usd|`.
 
-        Kalshi's BTC-hourly series lists ~40 strikes each hour spanning
-        roughly ±10% of spot (e.g. $66k-$86k around $78k). Without a spot
-        reference the selection used to tiebreak alphabetically, which
-        systematically picked deep-ITM markets where the YES price is
-        already ~99¢ and there is no tradeable edge for a mean-reversion
-        strategy.
+        Multi-strike era (Slice: correlation cap + multi-book routing).
+        All returned markets share the earliest future `settlement_ts_ns`
+        — mixing settlements breaks the correlation cap's key identity
+        (the cap counts per-hour same-side positions, and two strikes
+        settling different hours are NOT structurally correlated).
 
-        New ranking (Slice 6):
+        Ranking:
           1. Filter: future settlement within `max_horizon_sec`.
-          2. Primary sort: soonest settlement wins.
+          2. Keep only candidates sharing the soonest `settlement_ts_ns`
+             (drop later hours even if more strikes are listed).
           3. Secondary sort: smallest `|strike - btc_spot_usd|` when spot
              is provided (tiebreak alphabetical ticker for determinism).
           4. If `btc_spot_usd is None`, falls back to alphabetical tiebreak
@@ -144,9 +146,15 @@ class KalshiRestClient:
              output. Live callers MUST pass spot — the feedloop enforces
              this via the SpotOracle's fail-closed `get_primary`.
 
+        First item is always the "primary" market (closest-to-spot) and
+        is what trap evaluation drives off until the cross-sectional
+        evaluator ships.
+
         Raises `MarketDiscoveryError` if no market matches — caller should
         backoff and retry rather than trading blind.
         """
+        if max_markets < 1:
+            raise ValueError("max_markets must be >= 1")
         markets = await self.list_open_markets(series_ticker=series_ticker)
         horizon_ns = now_ns + max_horizon_sec * 1_000_000_000
         candidates: list[HourlyMarket] = []
@@ -176,31 +184,57 @@ class KalshiRestClient:
                 f"{max_horizon_sec}s (found {len(markets)} listings)"
             )
 
+        # Keep only the soonest settlement — the correlation cap counts
+        # same-hour same-side positions, so mixing hours would silently
+        # break its semantics.
+        soonest_ns = min(c.settlement_ts_ns for c in candidates)
+        candidates = [c for c in candidates if c.settlement_ts_ns == soonest_ns]
+
         if btc_spot_usd is not None:
             candidates.sort(
-                key=lambda c: (
-                    c.settlement_ts_ns,
-                    abs(c.strike_usd - btc_spot_usd),
-                    c.ticker,
-                )
+                key=lambda c: (abs(c.strike_usd - btc_spot_usd), c.ticker)
             )
         else:
-            candidates.sort(key=lambda c: (c.settlement_ts_ns, c.ticker))
-        chosen = candidates[0]
+            candidates.sort(key=lambda c: c.ticker)
+        chosen = candidates[:max_markets]
+        primary = chosen[0]
         _log.info(
             "market_discovery.selected",
-            ticker=chosen.ticker,
-            strike_usd=chosen.strike_usd,
-            settlement_ts_ns=chosen.settlement_ts_ns,
+            ticker=primary.ticker,
+            strike_usd=primary.strike_usd,
+            settlement_ts_ns=primary.settlement_ts_ns,
             candidate_count=len(candidates),
+            tracked_count=len(chosen),
+            tracked_tickers=[m.ticker for m in chosen],
             btc_spot_usd=btc_spot_usd,
             strike_gap_usd=(
-                abs(chosen.strike_usd - btc_spot_usd)
+                abs(primary.strike_usd - btc_spot_usd)
                 if btc_spot_usd is not None
                 else None
             ),
         )
         return chosen
+
+    async def current_btc_hourly_market(
+        self,
+        *,
+        now_ns: int,
+        series_ticker: str = "KXBTC",
+        max_horizon_sec: int = 3600,
+        btc_spot_usd: float | None = None,
+    ) -> HourlyMarket:
+        """Back-compat single-market discovery — returns the primary market
+        from `list_btc_hourly_markets(max_markets=1)`. New callers should
+        use `list_btc_hourly_markets` directly.
+        """
+        markets = await self.list_btc_hourly_markets(
+            now_ns=now_ns,
+            series_ticker=series_ticker,
+            max_horizon_sec=max_horizon_sec,
+            btc_spot_usd=btc_spot_usd,
+            max_markets=1,
+        )
+        return markets[0]
 
 
 _TRUNCATION_MIDPOINT_NS = 500_000_000  # 500ms — see docstring below

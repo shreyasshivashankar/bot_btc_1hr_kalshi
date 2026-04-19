@@ -137,11 +137,11 @@ class StubOracle:
             return None
 
 
-def _kalshi_snapshot(seq: int) -> bytes:
+def _kalshi_snapshot(seq: int, market_ticker: str = "KXBTC-TEST") -> bytes:
     return orjson.dumps({
         "type": "orderbook_snapshot",
         "msg": {
-            "market_ticker": "KXBTC-TEST",
+            "market_ticker": market_ticker,
             "seq": seq,
             "yes": [[40, 100]],
             "no": [[55, 100]],
@@ -205,7 +205,7 @@ async def test_feedloop_routes_events_and_exits_at_settlement() -> None:
     loop = FeedLoop(
         app=app,
         broker=broker,
-        book=book,
+        books={"KXBTC-TEST": book},
         kalshi_feed=kalshi_feed,
         spot_oracle=oracle,  # type: ignore[arg-type]
         feature_engine=features,
@@ -225,6 +225,98 @@ async def test_feedloop_routes_events_and_exits_at_settlement() -> None:
     snap = app.activity.snapshot(now_ns=clock.now_ns())  # type: ignore[union-attr]
     assert snap["last_tick_ns"] is not None
     assert kalshi_conn.sent, "Kalshi feed should have sent subscribe frame"
+
+
+@pytest.mark.asyncio
+async def test_feedloop_routes_book_updates_to_correct_book_by_market_id() -> None:
+    """Multi-strike routing: each BookUpdate's `market_id` selects which
+    L2Book gets the apply(). An update for a strike we don't track is a
+    warning, not a crash, and doesn't pollute the primary book."""
+    start_ns = 1_800_000_000_000_000_000
+    settlement_ns = start_ns + 2_000_000_000
+    clock = ManualClock(start_ns)
+    app, broker = _build_app(clock)
+
+    # Three frames: primary, adjacent-strike, unknown-ticker (expect a drop).
+    kalshi_conn = FakeConn([
+        _kalshi_snapshot(1, market_ticker="KXBTC-ATM"),
+        _kalshi_snapshot(1, market_ticker="KXBTC-LOW"),
+        _kalshi_snapshot(1, market_ticker="KXBTC-GHOST"),  # not in our books
+    ])
+
+    async def connect(url: str) -> WSConnection:
+        return kalshi_conn  # type: ignore[return-value]
+
+    kalshi_feed = KalshiFeed(
+        ws_url="ws://kalshi/test",
+        market_tickers=["KXBTC-ATM", "KXBTC-LOW"],
+        clock=clock,
+        ws_connect=connect,
+        staleness=StalenessTracker(name="kalshi", clock=clock, threshold_ms=2000),
+    )
+    oracle = StubOracle(clock)
+    oracle.push_primary(60_000.0)
+    features = FeatureEngine(
+        timeframes=["5m"], bollinger_period=20, bollinger_std_mult=2.0
+    )
+    atm = L2Book("KXBTC-ATM")
+    low = L2Book("KXBTC-LOW")
+    loop = FeedLoop(
+        app=app, broker=broker,
+        books={"KXBTC-ATM": atm, "KXBTC-LOW": low},
+        kalshi_feed=kalshi_feed,
+        spot_oracle=oracle,  # type: ignore[arg-type]
+        feature_engine=features,
+        market_id="KXBTC-ATM",
+        strike_usd=60_000.0,
+        settlement_ts_ns=settlement_ns,
+        clock=clock,
+        grace_sec=0.1,
+    )
+
+    run_task = asyncio.create_task(loop.run())
+    await asyncio.sleep(0.3)
+    clock.set_ns(settlement_ns + 1_000_000_000)
+    await asyncio.wait_for(run_task, timeout=5.0)
+
+    assert atm.valid, "primary book received its snapshot"
+    assert low.valid, "secondary book received its snapshot"
+    # Both books independently registered with the App.
+    assert "KXBTC-ATM" in app.books
+    assert "KXBTC-LOW" in app.books
+
+
+@pytest.mark.asyncio
+async def test_feedloop_rejects_missing_primary_market_id() -> None:
+    """If `market_id` isn't a key in `books`, construction raises — this
+    would otherwise silently route trap evaluation against a KeyError
+    on every tick."""
+    start_ns = 1_800_000_000_000_000_000
+    clock = ManualClock(start_ns)
+    app, broker = _build_app(clock)
+    kalshi_feed = KalshiFeed(
+        ws_url="ws://kalshi/test",
+        market_tickers=["KXBTC-ATM"],
+        clock=clock,
+        ws_connect=lambda url: _never(),
+        staleness=StalenessTracker(name="kalshi", clock=clock, threshold_ms=2000),
+    )
+    oracle = StubOracle(clock)
+    features = FeatureEngine(
+        timeframes=["5m"], bollinger_period=20, bollinger_std_mult=2.0
+    )
+    with pytest.raises(ValueError, match="missing from books"):
+        FeedLoop(
+            app=app, broker=broker,
+            books={"KXBTC-ATM": L2Book("KXBTC-ATM")},
+            kalshi_feed=kalshi_feed,
+            spot_oracle=oracle,  # type: ignore[arg-type]
+            feature_engine=features,
+            market_id="KXBTC-UNKNOWN",
+            strike_usd=60_000.0,
+            settlement_ts_ns=start_ns + 1_000_000_000,
+            clock=clock,
+        )
 
 
 def test_minutes_to_settlement_fn_counts_down() -> None:
@@ -271,7 +363,7 @@ async def test_feedloop_routes_primary_and_confirmation_to_integrity() -> None:
     )
     book = L2Book("KXBTC-TEST")
     loop = FeedLoop(
-        app=app, broker=broker, book=book, kalshi_feed=kalshi_feed,
+        app=app, broker=broker, books={"KXBTC-TEST": book}, kalshi_feed=kalshi_feed,
         spot_oracle=oracle,  # type: ignore[arg-type]
         feature_engine=features,
         market_id="KXBTC-TEST", strike_usd=60_000.0,
@@ -333,7 +425,7 @@ async def test_feedloop_snapshot_refuses_when_spot_stale() -> None:
         )
 
     loop = FeedLoop(
-        app=app, broker=broker, book=book, kalshi_feed=kalshi_feed,
+        app=app, broker=broker, books={"KXBTC-TEST": book}, kalshi_feed=kalshi_feed,
         spot_oracle=oracle,  # type: ignore[arg-type]
         feature_engine=features,
         market_id="KXBTC-TEST", strike_usd=60_000.0,
