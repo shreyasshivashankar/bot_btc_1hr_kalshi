@@ -117,6 +117,13 @@ Flags explained:
 - `--timeout=3600`: max HTTP request time; trading loop uses WS, not HTTP, so this only affects admin endpoints.
 - `--set-secrets`: mounts Secret Manager values as env vars at container start.
 
+**Tick archive — GCS FUSE mount.** `deploy/cloudrun.yaml` declares a `tick-archive` volume backed by the `gcsfuse.run.googleapis.com` CSI driver, mounting `bot-btc-1hr-kalshi-tick-archive-$PROJECT_ID` at `/app/data/archive`. `BOT_BTC_1HR_KALSHI_ARCHIVE_DIR` is set to that path, and `ArchiveWriter` writes hour-partitioned JSONL files (`events-YYYY-MM-DDTHH.jsonl`) directly into the bucket — no rsync cron, no local scratch dir. Each hour-roll closes the current file, finalizing the underlying GCS object; the writer does **not** flush per line because on a FUSE mount that either no-ops or triggers a full-object rewrite (see `archive/writer.py` module docstring). Two provisioning prerequisites:
+
+1. The runtime service account must have **`roles/storage.objectAdmin`** on the tick-archive bucket — FUSE needs read+write+overwrite (append-within-hour reopens the object). `objectCreator` alone will fail with EACCES after the first roll. `setup_gcp.sh` already provisions this.
+2. The FUSE mount options pin `uid=10001,gid=10001` to match the Dockerfile's non-root `bot-btc-1hr-kalshi` user (uid=10001). Without these the inode is root-owned and the app gets EACCES on first write. `implicit-dirs` is also set so `ArchiveWriter`'s `mkdir(parents=True, exist_ok=True)` succeeds — GCS has no real directory inodes.
+
+Because `gcloud run deploy` flags do not include FUSE volume declarations, the first deploy (or any change to volume configuration) must go through `gcloud run services replace deploy/cloudrun.yaml --region=$REGION` to materialize the CSI volume. Subsequent env-var-only revisions can continue to use `gcloud run deploy` / Console edits without re-applying the YAML.
+
 **SIGTERM grace — the 10-second contract.** Cloud Run's container-runtime contract states a fixed 10-second SIGTERM→SIGKILL window, and neither `terminationGracePeriodSeconds` nor the `run.googleapis.com/container-shutdown-timeout` annotation is documented as a way to extend it on managed Cloud Run ([YAML reference](https://cloud.google.com/run/docs/reference/yaml/v1), [container contract](https://cloud.google.com/run/docs/container-contract)). `deploy/cloudrun.yaml` sets `terminationGracePeriodSeconds: 600` as a best-effort Knative spec — if Cloud Run ever honors it we get the longer drain; if not, nothing breaks. **The system must be safe to die in 10 seconds.** The OMS `ABANDONED_TO_SETTLEMENT` ledger state covers this: any unfinished IOC exit is recovered on next boot from the broker's authoritative state, and capital stays locked safely in Kalshi's settlement engine.
 
 On successful deploy you'll get a service URL. Save it:
@@ -241,7 +248,7 @@ Alert channels: email or SMS. Pager duties are operator-defined.
 | `bot_btc_1hr_kalshi.bet_outcomes`             | BigQuery `bot_btc_1hr_kalshi_bet_outcomes.outcomes` | 7 days (partition expiry) | Automatic (BQ) |
 | `bot_btc_1hr_kalshi.admin_audit`              | `_Default` bucket                   | 7 days    | Automatic (bucket)  |
 | `bot_btc_1hr_kalshi.market_data`, `bot_btc_1hr_kalshi.risk`, `bot_btc_1hr_kalshi.execution`, others | `_Default` bucket | 7 days | Automatic |
-| Tick archive (Parquet)           | GCS `bot-btc-1hr-kalshi-tick-archive-$PROJECT`   | 365 days, COLDLINE at 30d | Lifecycle rule |
+| Tick archive (JSONL, hour-partitioned) | GCS `bot-btc-1hr-kalshi-tick-archive-$PROJECT` — mounted at `/app/data/archive` via FUSE CSI | 365 days, COLDLINE at 30d | Lifecycle rule |
 
 **Manual cleanup is never required** — GCP enforces retention at both the log bucket and BigQuery partition level. The `_Default` bucket is explicitly capped at 7 days by `setup_gcp.sh` (default would otherwise be 30 days).
 

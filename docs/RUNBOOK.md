@@ -243,13 +243,13 @@ Cloud Logging retains entries for 14 days by default (policy set by `deploy/setu
 
 ### Tick archive capture (for `make backtest`)
 
-Set `BOT_BTC_1HR_KALSHI_ARCHIVE_DIR=/var/lib/bot_btc_1hr_kalshi/archive` before starting the bot. Every `FeedEvent` consumed by the live loop is appended to hour-partitioned JSONL files (`events-YYYY-MM-DDTHH.jsonl`). Sync the directory to GCS periodically:
+On Cloud Run, the archive directory is backed by a GCS FUSE mount declared in `deploy/cloudrun.yaml` — the `tick-archive` volume mounts bucket `bot-btc-1hr-kalshi-tick-archive-$PROJECT_ID` at `/app/data/archive`, and `BOT_BTC_1HR_KALSHI_ARCHIVE_DIR` points at that path. `ArchiveWriter` appends hour-partitioned JSONL files (`events-YYYY-MM-DDTHH.jsonl`) directly into the bucket; no rsync cron, no local scratch directory, no hand-off step. Each hour-roll closes the prior file, which finalizes the GCS object — that is the only mid-run persistence checkpoint, so a hard crash (SIGKILL / instance rotation) loses up to the in-flight hour of ticks. Graceful SIGTERM runs through `serve()`'s finally block and finalizes the current file too.
 
-```bash
-# systemd timer or cron — every 5 min while bot is running
-gsutil -m rsync -r /var/lib/bot_btc_1hr_kalshi/archive \
-    gs://bot-btc-1hr-kalshi-tick-archive-$ENV/
-```
+Prerequisites (one-time, enforced in `deploy/setup_gcp.sh`):
+- Bucket `bot-btc-1hr-kalshi-tick-archive-$PROJECT_ID` exists.
+- Runtime service account has `roles/storage.objectAdmin` on that bucket (FUSE needs both read and write — `objectViewer` + `objectCreator` won't cover overwrite on append-within-hour).
+
+Locally, point `BOT_BTC_1HR_KALSHI_ARCHIVE_DIR` at any writable directory; the writer has no FUSE-specific code paths.
 
 Once you have ≥2 weeks of captured ticks, run backtests:
 

@@ -43,6 +43,26 @@ def _spot(ts_ns: int, price_micros: int = 60_000_000_000) -> SpotTick:
                     price_micros=Micros(price_micros), size=1.0)
 
 
+def test_writer_finalizes_prior_hour_on_roll(tmp_path: Path) -> None:
+    """Slice 11 durability contract: per-line flush is removed (incompatible
+    with GCS FUSE). The hour-roll is the only mid-run persistence
+    checkpoint — it must fully flush and close the prior-hour file so the
+    underlying GCS object is finalized while the writer keeps running."""
+    h0 = _hour_ns(2026, 4, 17, 15)
+    h1 = _hour_ns(2026, 4, 17, 16)
+    w = ArchiveWriter(tmp_path)
+    try:
+        w.write(_book(h0 + 1))
+        w.write(_spot(h0 + 2))
+        # Cross the hour boundary — prior file must be closed, not just flushed.
+        w.write(_book(h1 + 1, seq=2))
+        prior = tmp_path / "events-2026-04-17T15.jsonl"
+        assert prior.read_text().splitlines(), "prior-hour file empty after roll"
+        assert len(prior.read_text().splitlines()) == 2
+    finally:
+        w.close()
+
+
 def test_writer_rotates_on_hour_boundary(tmp_path: Path) -> None:
     h0 = _hour_ns(2026, 4, 17, 15)
     h1 = _hour_ns(2026, 4, 17, 16)

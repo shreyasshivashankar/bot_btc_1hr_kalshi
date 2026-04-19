@@ -6,16 +6,21 @@ directory; the hour bucket is derived from `event.ts_ns` so the on-disk
 partitioning is deterministic under replay regardless of wall-clock
 skew at record time.
 
-Durability note: we `flush()` after every line so a process crash
-loses at most the in-flight line; we do NOT `fsync()` because the
+Durability contract: we flush on hour-roll and on explicit `close()` —
+NOT per line. Rationale: the archive dir is backed by a GCS FUSE mount
+in production (see deploy/cloudrun.yaml), where `flush()` is either a
+no-op or triggers a full-object upload. At ~50 ticks/sec a per-line
+flush would issue 180k object rewrites per hour, saturating the hot
+path for no durability benefit. A crash (OOM / SIGKILL / Cloud Run
+instance rotation) loses up to the current in-flight hour of ticks;
+graceful SIGTERM runs through serve()'s finally block which calls
+`close()`, finalizing the file. This is acceptable because the
 recorder is not the system of record for fills (hard rule #7 — the
-broker is). The archive is research input, not audit input; the
+broker is) and the archive is research input, not audit input; the
 lifecycle log handles audit.
 
-GCS upload is out of scope for this module — run
-`gsutil rsync <archive_dir> gs://bot-btc-1hr-kalshi-tick-archive-<env>/`
-from a systemd timer or Cloud Run sidecar. Keeping it offline lets the
-bot survive a GCS outage without stalling the hot path.
+GCS delivery is handled transparently by the Cloud Run GCS FUSE CSI
+mount — close() on an hour-roll finalizes the object in the bucket.
 """
 
 from __future__ import annotations
@@ -65,7 +70,6 @@ class ArchiveWriter:
         if fh is None:  # pragma: no cover — _roll_to always sets _fh
             raise RuntimeError("archive writer file handle not open")
         fh.write(json.dumps(to_dict(event), separators=(",", ":")) + "\n")
-        fh.flush()
         self._lines_written += 1
 
     def close(self) -> None:
