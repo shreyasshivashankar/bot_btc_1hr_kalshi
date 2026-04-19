@@ -241,13 +241,12 @@ Prints: mode (paper/shadow/live), halt state, open positions, session PnL, circu
 Long-term closed-trade analysis lives in BigQuery (`scripts/query_bets.sh`); these modes are for the recent Cloud Logging window.
 
 ### Log retention / cleanup
-Cloud Logging retains entries for 14 days by default (policy set by `deploy/setup_gcp.sh`). To prune on demand (e.g. after a noisy debug run):
+Steady-state retention is enforced by the `_Default` log-bucket policy (set by `deploy/setup_gcp.sh` via `gcloud logging buckets update _Default --retention-days=N`). The prune script is for on-demand clean cuts — e.g. wiping noisy output before starting a fresh soak:
 ```bash
-./scripts/prune_logs.sh              # delete entries older than 14 days
-./scripts/prune_logs.sh --days 7     # tighter window
+./scripts/prune_logs.sh              # delete all Cloud Run log streams
 ./scripts/prune_logs.sh --dry-run    # preview what would be deleted
 ```
-`bet_outcomes` records are mirrored to BigQuery via the logging sink — pruning Cloud Logging does **not** delete the BQ rows, so tuning queries stay intact.
+Only `run.googleapis.com/*` streams are touched; audit, ops-agent, and cloudbuild logs are left alone. `bet_outcomes` records are mirrored to BigQuery via the logging sink — pruning Cloud Logging does **not** delete the BQ rows, so tuning queries stay intact.
 
 ### Tick archive capture (for `make backtest`)
 
