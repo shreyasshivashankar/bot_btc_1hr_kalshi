@@ -32,6 +32,13 @@ risk:
   single_trade_drawdown_freeze_pct: 0.15
   reconcile_interval_sec: 60
   clock_drift_halt_ms: 1000       # RFC7231 Date header is second-truncated; ±500ms noise floor — see kalshi_rest.kalshi_date_header_probe
+  # Multi-strike correlation cap: one YES (or NO) position per settlement
+  # hour regardless of how many strikes are tracked. Three YES bets on
+  # adjacent strikes of the same hour are structurally one directional bet
+  # on BTC over the session — aggregate_notional alone doesn't enforce the
+  # diversification intent because all N strikes settle from the same BTC
+  # terminal price. Raise only after risk-committee review.
+  max_correlated_positions: 1
 
 signal:
   bollinger_period_bars: 20

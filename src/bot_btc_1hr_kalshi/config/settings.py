@@ -41,6 +41,13 @@ class RiskSettings(BaseModel):
     # Matches clock_drift_halt_ms by design: both gate the trading graph
     # against silent-stale-data-induced decisions.
     spot_staleness_halt_ms: int = Field(gt=0, default=1000)
+    # Correlation cap (multi-strike era). Prevents stacking N positions on
+    # adjacent strikes of the SAME hourly settlement on the SAME side — they
+    # are structurally one directional bet on BTC over the session, and a
+    # cascade would take N x the per-position drawdown in one move. Counted
+    # per (settlement_ts_ns, side) pair; default 1 means one bet at a time
+    # per hour-direction regardless of how many strikes are tracked.
+    max_correlated_positions: int = Field(ge=1, default=1)
 
 
 class SignalSettings(BaseModel):

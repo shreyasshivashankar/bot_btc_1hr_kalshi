@@ -42,6 +42,11 @@ class OpenPosition:
     fees_paid_usd: float
     trap: str
     features_at_entry: Features
+    # Exchange-emitted settlement time. Used by the risk layer to count
+    # correlated open positions: two YES bets on different strikes of the
+    # same hourly session share `settlement_ts_ns` and are one directional
+    # bet on BTC.
+    settlement_ts_ns: int = 0
 
     @property
     def notional_usd(self) -> float:
@@ -91,6 +96,7 @@ class Portfolio:
         fill: Fill,
         trap: str,
         features_at_entry: Features,
+        settlement_ts_ns: int = 0,
     ) -> OpenPosition:
         if position_id in self._positions:
             raise ValueError(f"position already open: {position_id}")
@@ -107,10 +113,21 @@ class Portfolio:
             fees_paid_usd=fill.fees_usd,
             trap=trap,
             features_at_entry=features_at_entry,
+            settlement_ts_ns=settlement_ts_ns,
         )
         self._positions[position_id] = pos
         self._bankroll_micros -= _to_micros(pos.notional_usd + fill.fees_usd)
         return pos
+
+    def count_correlated_open(self, *, side: Side, settlement_ts_ns: int) -> int:
+        """Count open positions sharing (side, settlement_ts_ns) with the
+        pending signal. Risk layer uses this to gate stacking multiple
+        directional bets on different strikes of the same hourly session."""
+        return sum(
+            1
+            for p in self._positions.values()
+            if p.side == side and p.settlement_ts_ns == settlement_ts_ns
+        )
 
     def close(
         self,

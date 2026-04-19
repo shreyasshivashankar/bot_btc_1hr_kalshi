@@ -11,11 +11,13 @@ def _settings(
     max_notional: float = 100.0,
     max_daily_loss_pct: float = 0.05,
     kelly_fraction: float = 0.25,
+    max_correlated_positions: int = 1,
 ) -> RiskSettings:
     return RiskSettings(
         kelly_fraction=kelly_fraction,
         max_position_notional_usd=max_notional,
         max_daily_loss_pct=max_daily_loss_pct,
+        max_correlated_positions=max_correlated_positions,
     )
 
 
@@ -49,6 +51,7 @@ def _req(
     confidence: float = 0.7,
     min_conf: float = 0.5,
     breakers: BreakerState | None = None,
+    correlated_count: int = 0,
 ) -> RiskInput:
     return RiskInput(
         signal=_signal(confidence=confidence),
@@ -59,6 +62,7 @@ def _req(
         breakers=breakers or BreakerState(),
         now_ns=1_000_000_000,
         min_signal_confidence=min_conf,
+        correlated_open_positions_count=correlated_count,
     )
 
 
@@ -111,3 +115,39 @@ def test_reject_aggregate_exposure_cap() -> None:
     )
     assert isinstance(d, Reject)
     assert d.reason == "aggregate_exposure_cap"
+
+
+def test_reject_correlation_cap_at_default_one() -> None:
+    """One YES bet already open on this hour → second YES bet (same hour,
+    different strike) must be rejected. This is the whole point of the cap:
+    three YES bets on adjacent strikes of the same session settle as one
+    correlated directional bet on BTC, and aggregate_notional alone lets
+    them stack as long as the cash ceiling isn't hit."""
+    d = check(_req(correlated_count=1), _settings(max_correlated_positions=1))
+    assert isinstance(d, Reject)
+    assert d.reason == "correlation_cap"
+
+
+def test_correlation_cap_allows_when_count_below_cap() -> None:
+    """A risk committee that wants to tolerate two concurrent strikes can
+    raise the cap. The check is exclusive (count < cap approves)."""
+    d = check(_req(correlated_count=1), _settings(max_correlated_positions=2))
+    assert isinstance(d, Approve)
+
+
+def test_correlation_cap_does_not_fire_when_count_is_zero() -> None:
+    d = check(_req(correlated_count=0), _settings(max_correlated_positions=1))
+    assert isinstance(d, Approve)
+
+
+def test_correlation_cap_ordered_after_confidence_floor() -> None:
+    """Rule-ordering canary: confidence floor must reject BEFORE correlation.
+    A low-confidence signal should not surface a correlation reject — the
+    decision journal becomes noisy if every below-confidence tick that
+    happens to have an open position logs `correlation_cap`."""
+    d = check(
+        _req(confidence=0.3, min_conf=0.5, correlated_count=5),
+        _settings(max_correlated_positions=1),
+    )
+    assert isinstance(d, Reject)
+    assert d.reason == "below_confidence_floor"

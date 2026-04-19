@@ -278,6 +278,85 @@ def test_partial_then_full_close_sums_correctly() -> None:
     assert p.get("p1") is None
 
 
+# --- count_correlated_open -------------------------------------------------
+# Same-hour correlation counter used by risk.check. Same (side, settlement_ts_ns)
+# = one correlated directional bet; the cap prevents stacking multiple strikes
+# that would all win/lose together on the same BTC settlement print.
+
+HOUR_A_NS = 1_800_000_000_000_000_000
+HOUR_B_NS = 1_800_000_000_000_000_000 + 3_600 * 1_000_000_000
+
+
+def _buy_side(market: str, side: str, ts_ns: int = 1_000) -> Fill:
+    return Fill(
+        order_id="o", client_order_id="c", market_id=market,
+        side=side,  # type: ignore[arg-type]
+        action="BUY", price_cents=30, contracts=10, ts_ns=ts_ns, fees_usd=0.0,
+    )
+
+
+def test_count_correlated_open_zero_when_empty() -> None:
+    p = Portfolio(bankroll_usd=1000.0)
+    assert p.count_correlated_open(side="YES", settlement_ts_ns=HOUR_A_NS) == 0
+
+
+def test_count_correlated_open_matches_same_hour_same_side() -> None:
+    """Two YES positions on different strikes of the same hour count as 2.
+    Same hour = same settlement_ts_ns (all strikes of an hourly series
+    settle at the exact same instant)."""
+    p = Portfolio(bankroll_usd=1000.0)
+    p.open_from_fill(
+        position_id="p1", decision_id="d1",
+        fill=_buy_side("KXBTC-26APR1817-B75000", "YES"),
+        trap="floor_reversion", features_at_entry=_features(),
+        settlement_ts_ns=HOUR_A_NS,
+    )
+    p.open_from_fill(
+        position_id="p2", decision_id="d2",
+        fill=_buy_side("KXBTC-26APR1817-B75500", "YES"),
+        trap="floor_reversion", features_at_entry=_features(),
+        settlement_ts_ns=HOUR_A_NS,
+    )
+    assert p.count_correlated_open(side="YES", settlement_ts_ns=HOUR_A_NS) == 2
+
+
+def test_count_correlated_open_ignores_different_hour() -> None:
+    p = Portfolio(bankroll_usd=1000.0)
+    p.open_from_fill(
+        position_id="p1", decision_id="d1",
+        fill=_buy_side("KXBTC-26APR1817-B75000", "YES"),
+        trap="floor_reversion", features_at_entry=_features(),
+        settlement_ts_ns=HOUR_A_NS,
+    )
+    assert p.count_correlated_open(side="YES", settlement_ts_ns=HOUR_B_NS) == 0
+
+
+def test_count_correlated_open_ignores_opposite_side() -> None:
+    """YES and NO are uncorrelated (one wins when the other loses), so a
+    concurrent NO at the same hour doesn't consume the YES-hour quota."""
+    p = Portfolio(bankroll_usd=1000.0)
+    p.open_from_fill(
+        position_id="p1", decision_id="d1",
+        fill=_buy_side("KXBTC-26APR1817-B75000", "NO"),
+        trap="ceiling_reversion", features_at_entry=_features(),
+        settlement_ts_ns=HOUR_A_NS,
+    )
+    assert p.count_correlated_open(side="YES", settlement_ts_ns=HOUR_A_NS) == 0
+    assert p.count_correlated_open(side="NO", settlement_ts_ns=HOUR_A_NS) == 1
+
+
+def test_count_correlated_open_excludes_closed_positions() -> None:
+    p = Portfolio(bankroll_usd=1000.0)
+    p.open_from_fill(
+        position_id="p1", decision_id="d1",
+        fill=_buy_side("KXBTC-26APR1817-B75000", "YES"),
+        trap="floor_reversion", features_at_entry=_features(),
+        settlement_ts_ns=HOUR_A_NS,
+    )
+    p.close(position_id="p1", exit_fill=_sell(50, 10), exit_reason="soft_stop")
+    assert p.count_correlated_open(side="YES", settlement_ts_ns=HOUR_A_NS) == 0
+
+
 def test_bankroll_has_no_float_drift_over_many_small_fees() -> None:
     """Regression: 10_000 sequential $0.003 fee deductions must produce an
     exact $30.00 reduction. With plain float arithmetic this drifts in the
