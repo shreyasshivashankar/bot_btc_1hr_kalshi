@@ -1,5 +1,19 @@
 """Trap registry: runs every registered trap against a snapshot and returns the
-highest-confidence signal, or None if no trap fires."""
+highest-confidence signal, or None if no trap fires.
+
+`run_traps` evaluates a single MarketSnapshot — same-book, multi-trap
+ranking uses `confidence` as the sole tiebreak (all candidates price
+the same strike, so `edge_cents` is comparable 1:1).
+
+`run_traps_cross_strike` picks the best opportunity across a set of
+snapshots drawn from N strikes of the same hourly settlement. It ranks
+by `edge_cents * confidence` — classic expected-edge weighting. Two
+strikes on the same session are NOT priced the same, so raw edge_cents
+comparison would systematically over-weight low-delta deep-OTM strikes
+(where a 5c move from 8c→13c is a 60%+ return but the "edge" also rests
+on thin liquidity). Scaling by confidence pulls that back toward setups
+the trap actually trusts.
+"""
 
 from __future__ import annotations
 
@@ -49,3 +63,39 @@ def run_traps(snap: MarketSnapshot, *, settings: SignalSettings) -> TrapSignal |
     if not candidates:
         return None
     return max(candidates, key=lambda c: c.confidence)
+
+
+def run_traps_cross_strike(
+    snapshots: list[MarketSnapshot], *, settings: SignalSettings
+) -> tuple[MarketSnapshot, TrapSignal] | None:
+    """Evaluate every snapshot, return the best `(snapshot, signal)` pair.
+
+    Best := max over all fired candidates of `edge_cents * confidence`.
+    Ties break on (higher confidence, lower |strike - spot|, ticker) so
+    the result is deterministic against candidate ordering.
+
+    Returns None if no trap fires on any snapshot. All snapshots are
+    expected to share the same `settlement_ts_ns` — mixing settlements
+    would violate the correlation cap's identity; callers (the feed
+    loop) enforce that upstream in market discovery.
+    """
+    best: tuple[MarketSnapshot, TrapSignal] | None = None
+    best_key: tuple[float, float, float] | None = None
+    # Iterate in stable ticker order so that when scores/confidence/gap
+    # all tie, the alphabetically-earliest ticker wins via strict `>`.
+    # Input-order independence makes journal diffs deterministic across
+    # replays regardless of how discovery ordered its candidates.
+    for snap in sorted(snapshots, key=lambda s: s.market_id):
+        sig = run_traps(snap, settings=settings)
+        if sig is None:
+            continue
+        score = sig.edge_cents * sig.confidence
+        key = (
+            score,
+            sig.confidence,
+            -abs(snap.strike_usd - snap.spot_btc_usd),
+        )
+        if best_key is None or key > best_key:
+            best_key = key
+            best = (snap, sig)
+    return best

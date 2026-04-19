@@ -71,7 +71,7 @@ from bot_btc_1hr_kalshi.obs.schemas import Features
 from bot_btc_1hr_kalshi.risk.breakers import BreakerState
 from bot_btc_1hr_kalshi.signal.features import CVD_ROLLING_PERIODS, FeatureEngine
 from bot_btc_1hr_kalshi.signal.integrity import IntegrityTracker
-from bot_btc_1hr_kalshi.signal.registry import run_traps
+from bot_btc_1hr_kalshi.signal.registry import run_traps_cross_strike
 from bot_btc_1hr_kalshi.signal.types import MarketSnapshot
 
 _log = structlog.get_logger("bot_btc_1hr_kalshi.feedloop")
@@ -166,21 +166,33 @@ class FeedLoop:
         grace_sec: float = 5.0,
         integrity: IntegrityTracker | None = None,
         spot_staleness_max_age_ms: int = 1000,
+        strikes: dict[str, float] | None = None,
     ) -> None:
         if market_id not in books:
             raise ValueError(
                 f"primary market_id {market_id!r} missing from books "
                 f"{sorted(books)!r}"
             )
+        # `strikes` carries the per-ticker strike for snapshot building
+        # across the universe. Single-book callers may omit it; we
+        # auto-fill from (market_id, strike_usd).
+        resolved_strikes: dict[str, float] = dict(strikes) if strikes is not None else {}
+        resolved_strikes.setdefault(market_id, strike_usd)
+        missing = set(books) - set(resolved_strikes)
+        if missing:
+            raise ValueError(
+                f"strikes missing entries for books: {sorted(missing)!r}"
+            )
         self._app = app
         self._broker = broker
         self._books = books
-        self._book = books[market_id]  # primary — trap evaluator reads this
+        self._book = books[market_id]  # primary — kept for monitor evaluation
         self._kalshi_feed = kalshi_feed
         self._spot_oracle = spot_oracle
         self._features = feature_engine
         self._market_id = market_id
         self._strike_usd = strike_usd
+        self._strikes = resolved_strikes
         self._settlement_ns = settlement_ts_ns
         self._clock = clock
         self._grace_ns = int(grace_sec * 1_000_000_000)
@@ -280,16 +292,22 @@ class FeedLoop:
     async def _maybe_enter(self) -> None:
         if self._app.trading_halted:
             return
-        # Single-market, one-entry-in-flight: bail if already building up
-        # a pending entry, or if we already have an open position.
+        # One-entry-in-flight across the whole session. Open positions on
+        # any tracked strike short-circuit new cross-strike evaluation —
+        # the correlation cap in risk.check also guards same-side same-
+        # hour stacking, but bailing here avoids building N snapshots per
+        # tick and keeps the decision journal clean.
         if self._pending or self._app.portfolio.open_positions:
             return
-        snap = self._snapshot()
-        if snap is None:
+        snaps = self._build_snapshots()
+        if not snaps:
             return
-        signal = run_traps(snap, settings=self._app.settings.signal)
-        if signal is None:
+        result_pair = run_traps_cross_strike(
+            snaps, settings=self._app.settings.signal
+        )
+        if result_pair is None:
             return
+        chosen_snap, signal = result_pair
 
         # Primary/Confirmation integrity gate (signal/integrity.py). Only
         # vetoes on active directional disagreement between Coinbase and
@@ -305,13 +323,24 @@ class FeedLoop:
                 )
                 return
 
+        _log.info(
+            "feedloop.cross_strike_selected",
+            chosen_market_id=chosen_snap.market_id,
+            chosen_strike_usd=chosen_snap.strike_usd,
+            trap=signal.trap,
+            side=signal.side,
+            edge_cents=signal.edge_cents,
+            confidence=signal.confidence,
+            candidates_evaluated=len(snaps),
+        )
+
         # Serialize consider_entry so two feeds can't both trigger at once.
         async with self._entry_guard:
             if self._pending or self._app.portfolio.open_positions:
                 return
             result: EntryResult = await self._app.oms.consider_entry(
                 signal=signal,
-                market_id=self._market_id,
+                market_id=chosen_snap.market_id,
                 settlement_ts_ns=self._settlement_ns,
             )
             if not result.decision.approved:
@@ -333,50 +362,84 @@ class FeedLoop:
             regime_trend=self._features.regime_trend(_PRIMARY_TF),
         )
 
-    def _snapshot(self) -> MarketSnapshot | None:
+    def _build_snapshots(self) -> list[MarketSnapshot]:
+        """Build a MarketSnapshot for every book that's currently valid
+        enough to trade.
+
+        Feature values (pct_b, ATR, RSI, CVD, regime, 24h move) are
+        spot-driven and shared across all strikes — they come from the
+        App-scope FeatureEngine and do not vary per-book. Per-book state
+        (validity, depth, spread) is pulled from each L2Book individually.
+        A stale primary spot or cold FeatureEngine short-circuits the
+        whole list (nothing can be snapshotted).
+        """
         if not self._book.valid:
-            return None
+            return []
         pct_b = self._features.bollinger_pct_b(_PRIMARY_TF)
         atr = self._features.atr(_PRIMARY_TF)
         if pct_b is None or atr is None:
-            return None
+            return []
         # Hard LastSpot contract: if the primary spot is stale, sit this
         # tick out. `get_primary_or_none` returns None on both cold-start
-        # and staleness, so the upstream "no signal yet" branch handles
-        # both — identical to refusing to trade, which is what the
-        # contract demands.
+        # and staleness, identical to refusing to trade — which is what
+        # the contract demands.
         spot = self._spot_oracle.get_primary_or_none(
             max_age_ms=self._spot_staleness_max_age_ms
         )
         if spot is None:
-            return None
-        spread = self._book.spread_cents
-        if spread is None:
-            return None
+            return []
         mts = self._mts_fn(self._clock.now_ns())
-        features = Features(
-            regime_trend=self._features.regime_trend(_PRIMARY_TF),
-            regime_vol=self._features.regime_vol(_PRIMARY_TF),
-            signal_confidence=min(1.0, abs(pct_b)),
-            bollinger_pct_b=pct_b,
-            atr_cents=float(atr),
-            book_depth_at_entry=self._book.book_depth(levels=5),
-            spread_cents=spread,
-            spot_btc_usd=spot,
-            minutes_to_settlement=mts,
-            rsi_5m=self._features.rsi("5m"),
-            rsi_1h=self._features.rsi("1h"),
-            move_24h_pct=self._features.move_24h_pct(),
-            cvd_1m_usd=self._features.cvd("1m", periods=CVD_ROLLING_PERIODS),
-        )
-        return MarketSnapshot(
-            market_id=self._market_id,
-            book=self._book,
-            features=features,
-            spot_btc_usd=spot,
-            minutes_to_settlement=mts,
-            strike_usd=self._strike_usd,
-        )
+        regime_trend = self._features.regime_trend(_PRIMARY_TF)
+        regime_vol = self._features.regime_vol(_PRIMARY_TF)
+        rsi_5m = self._features.rsi("5m")
+        rsi_1h = self._features.rsi("1h")
+        move_24h = self._features.move_24h_pct()
+        cvd_1m = self._features.cvd("1m", periods=CVD_ROLLING_PERIODS)
+
+        snaps: list[MarketSnapshot] = []
+        for market_id, book in self._books.items():
+            if not book.valid:
+                continue
+            spread = book.spread_cents
+            if spread is None:
+                continue
+            strike = self._strikes.get(market_id)
+            if strike is None:
+                continue
+            features = Features(
+                regime_trend=regime_trend,
+                regime_vol=regime_vol,
+                signal_confidence=min(1.0, abs(pct_b)),
+                bollinger_pct_b=pct_b,
+                atr_cents=float(atr),
+                book_depth_at_entry=book.book_depth(levels=5),
+                spread_cents=spread,
+                spot_btc_usd=spot,
+                minutes_to_settlement=mts,
+                rsi_5m=rsi_5m,
+                rsi_1h=rsi_1h,
+                move_24h_pct=move_24h,
+                cvd_1m_usd=cvd_1m,
+            )
+            snaps.append(MarketSnapshot(
+                market_id=market_id,
+                book=book,
+                features=features,
+                spot_btc_usd=spot,
+                minutes_to_settlement=mts,
+                strike_usd=strike,
+            ))
+        return snaps
+
+    def _snapshot(self) -> MarketSnapshot | None:
+        """Legacy single-book snapshot (primary only). Kept for tests and
+        back-compat callers that don't want the cross-strike loop.
+        """
+        snaps = self._build_snapshots()
+        for s in snaps:
+            if s.market_id == self._market_id:
+                return s
+        return None
 
 
 async def ws_connect_websockets(url: str) -> Any:
@@ -572,6 +635,7 @@ async def _run_one_session(
         feature_engine=feature_engine,
         market_id=primary.ticker,
         strike_usd=primary.strike_usd,
+        strikes={m.ticker: m.strike_usd for m in markets},
         settlement_ts_ns=primary.settlement_ts_ns,
         clock=clock,
         integrity=integrity,
