@@ -3,7 +3,9 @@
 # bot_btc_1hr_kalshi — Cloud Run container.
 # Minimal Python 3.12 slim base with the numerics stack. Non-root at runtime.
 #
-# Build: gcloud builds submit --tag <region>-docker.pkg.dev/<project>/bot-btc-1hr-kalshi/bot-btc-1hr-kalshi:latest .
+# Build (from repo root, Dockerfile is deploy/Dockerfile not root):
+#   gcloud builds submit --config cloudbuild.yaml \
+#     --substitutions _REGION=$BOT_BTC_1HR_KALSHI_GCP_REGION .
 
 FROM python:3.12-slim AS base
 

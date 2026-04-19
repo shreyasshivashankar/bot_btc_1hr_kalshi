@@ -62,12 +62,13 @@ The script prints next steps on success. Rerun is safe.
 
 ```bash
 gcloud builds submit \
-  --tag "$BOT_BTC_1HR_KALSHI_GCP_REGION-docker.pkg.dev/$BOT_BTC_1HR_KALSHI_GCP_PROJECT/bot-btc-1hr-kalshi/bot-btc-1hr-kalshi:latest" \
+  --config cloudbuild.yaml \
+  --substitutions _REGION=$BOT_BTC_1HR_KALSHI_GCP_REGION \
   --timeout=20m \
   .
 ```
 
-This uses `deploy/Dockerfile`. First build ~5 min; subsequent builds are cached.
+The `--tag` shortcut does not work here because `deploy/Dockerfile` is not at the build-context root; `cloudbuild.yaml` passes `-f deploy/Dockerfile` explicitly. First build ~5 min; subsequent builds are cached.
 
 ### 2.2 Review env vars
 
