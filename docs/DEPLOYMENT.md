@@ -96,7 +96,7 @@ gcloud run deploy $BOT_BTC_1HR_KALSHI_SERVICE_NAME \
   --cpu-boost \
   --execution-environment=gen2 \
   --no-cpu-throttling \
-  --ingress=internal-and-cloud-load-balancing \
+  --ingress=all \
   --no-allow-unauthenticated \
   --env-vars-file=deploy/env.yaml \
   --set-env-vars="BOT_BTC_1HR_KALSHI_PRIVATE_KEY_PATH=/secrets/kalshi/kalshi-private-key" \
@@ -114,7 +114,7 @@ Short values (UUIDs, tokens) stay env vars. The RSA private key is multi-line PE
 Flags explained:
 - `min=max=1`: exactly one instance, always running. Trading state is not horizontally scalable.
 - `--no-cpu-throttling`: CPU is always allocated, not just during HTTP requests. This is what keeps the event loop alive for WS consumption.
-- `--ingress=internal-and-cloud-load-balancing` + `--no-allow-unauthenticated`: no public internet access to admin endpoints.
+- `--ingress=all` + `--no-allow-unauthenticated`: zero-trust model — the URL is publicly resolvable but the Google Front End rejects any request without a Google-signed OIDC token from a principal holding `roles/run.invoker` (403 before the request reaches the container). The app then requires `X-Admin-Token` on top for defense-in-depth. Tightening to `internal-*` would only add value behind a VPC/GCLB front-end; without one, it just breaks ops tooling without a real security gain.
 - `--timeout=3600`: max HTTP request time; trading loop uses WS, not HTTP, so this only affects admin endpoints.
 - `--set-secrets`: mounts Secret Manager values as env vars at container start.
 
@@ -295,7 +295,7 @@ Cut by another ~40% if you set `cpu=1, memory=1Gi` — the bot's hot path fits c
 - Admin endpoints gated by **two layers**: IAM `roles/run.invoker` + bearer token. Either alone is insufficient.
 - `BOT_BTC_1HR_KALSHI_ADMIN_TOKEN` is a random 32-byte hex string; rotate quarterly or after any suspected exposure.
 - Secrets never appear in logs, env YAML, or container images.
-- Cloud Run service has `--ingress=internal-and-cloud-load-balancing` — the public internet cannot reach `bot-btc-1hr-kalshi`. Admin calls originate from authenticated gcloud or a future internal load balancer.
+- Cloud Run service has `--ingress=all --no-allow-unauthenticated`. The URL is publicly resolvable but un-authenticated requests are dropped at the Google Front End with 403 — they never reach the container, never consume CPU. An attacker would need (a) a forged Google-signed OIDC token from an authorized principal AND (b) the `X-Admin-Token` secret. The GFE+IAM layer is cryptographically sufficient against an unauthenticated attacker; the in-app token is defense-in-depth.
 - Service account follows least privilege — it cannot read other GCP resources in the project, cannot impersonate users, cannot modify IAM.
 
 ---
@@ -311,6 +311,6 @@ Cut by another ~40% if you set `cpu=1, memory=1Gi` — the bot's hot path fits c
 ## 11. What this does NOT set up (intentionally)
 
 - **No Cloud SQL / Firestore.** State lives in memory + Cloud Logging + BigQuery. Persistence beyond a container restart is recovered from Kalshi broker state, not a database.
-- **No load balancer.** Single-instance, internal-ingress only.
+- **No load balancer.** Single-instance; `ingress=all` with IAM-only auth (see §9). A GCLB+IAP front-end would be required to restrict ingress further; we don't need that for a solo-operator deployment.
 - **No CI/CD pipeline.** Deploy is a manual `gcloud run deploy` — this is intentional gating for a trading system. Automate only after promotion gates are scripted and tested.
 - **No PubSub/Kafka.** `asyncio.Queue` is sufficient for single-process event flow.

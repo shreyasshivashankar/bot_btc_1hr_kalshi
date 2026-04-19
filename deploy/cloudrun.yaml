@@ -25,8 +25,13 @@ kind: Service
 metadata:
   name: bot-btc-1hr-kalshi
   annotations:
-    # Only internal and LB traffic (no public internet).
-    run.googleapis.com/ingress: internal-and-cloud-load-balancing
+    # Zero-trust: ingress=all relies on IAM (run.invoker) + the app-layer
+    # X-Admin-Token bearer for defense-in-depth. GFE drops un-authenticated
+    # requests with 403 before they reach the container. Setting ingress to
+    # `internal-*` without also fronting the service with a VPC/GCLB only
+    # breaks ops tooling — it doesn't add a real security layer for a
+    # single-operator Cloud Run service.
+    run.googleapis.com/ingress: all
   labels:
     app: bot-btc-1hr-kalshi
     tier: trading
