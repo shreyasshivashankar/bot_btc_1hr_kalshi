@@ -26,20 +26,25 @@ gcloud run services update bot-btc-1hr-kalshi \
   --env-vars-file=deploy/env.yaml
 ```
 
-Deploy + start:
+Deploy + start. First-ever deploy must go through `gcloud run services replace` so the GCS FUSE tick-archive volume is materialized. `deploy/cloudrun.yaml` carries the full manifest (secrets, FUSE mount, env vars); resolve its `${PROJECT_ID}`/`${REGION}` placeholders at apply time:
+
 ```bash
-gcloud run deploy bot-btc-1hr-kalshi \
-  --source=. \
-  --region="${BOT_BTC_1HR_KALSHI_GCP_REGION:-us-central1}" \
-  --set-env-vars=BOT_BTC_1HR_KALSHI_PRIVATE_KEY_PATH=/secrets/kalshi/kalshi-private-key \
-  --set-secrets=BOT_BTC_1HR_KALSHI_ADMIN_TOKEN=BOT_BTC_1HR_KALSHI_ADMIN_TOKEN:latest \
-  --set-secrets=BOT_BTC_1HR_KALSHI_API_KEY=BOT_BTC_1HR_KALSHI_API_KEY:latest \
-  --set-secrets=/secrets/kalshi/kalshi-private-key=BOT_BTC_1HR_KALSHI_PRIVATE_KEY:latest \
-  --args="--mode,paper,--bankroll,50"
-# Note: each container start resets session bankroll to the --bankroll value.
-# Stop + start (or redeploy) to begin a new $50 session.
+# 1. Build the image into Artifact Registry
+gcloud builds submit \
+  --tag "$BOT_BTC_1HR_KALSHI_GCP_REGION-docker.pkg.dev/$BOT_BTC_1HR_KALSHI_GCP_PROJECT/bot-btc-1hr-kalshi/bot-btc-1hr-kalshi:latest" \
+  .
+
+# 2. Apply the manifest (sed — or swap in envsubst if you have gettext)
+sed -e "s|\${PROJECT_ID}|$BOT_BTC_1HR_KALSHI_GCP_PROJECT|g" \
+    -e "s|\${REGION}|$BOT_BTC_1HR_KALSHI_GCP_REGION|g" \
+    deploy/cloudrun.yaml | \
+  gcloud run services replace - --region=$BOT_BTC_1HR_KALSHI_GCP_REGION
+
+# 3. Scale + verify
 ./scripts/start.sh               # scales min=max=1 (idempotent if already running)
 ```
+
+Each container start resets session bankroll to the `--bankroll` arg (default $50 from `__main__.py`). Stop + start (or redeploy) to begin a new session. Subsequent env-var-only changes can use `gcloud run deploy` / Console edits without re-applying the full YAML — see `docs/DEPLOYMENT.md §2.3`.
 
 Verify it's trading:
 ```bash
