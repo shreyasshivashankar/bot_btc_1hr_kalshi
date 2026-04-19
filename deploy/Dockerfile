@@ -14,12 +14,15 @@ ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 
-# System deps for numba (llvmlite), cryptography wheels, and ntpdate for boot clock-drift validation.
+# System deps for numba (llvmlite) and cryptography wheels.
+# Clock-drift validation is handled in-process via the RFC7231 Date header
+# probe against Kalshi's REST API (see kalshi_rest.kalshi_date_header_probe),
+# so no NTP client is needed. Cloud Run also does not allow a container to
+# set the system clock.
 RUN apt-get update && apt-get install -y --no-install-recommends \
       build-essential \
       ca-certificates \
       curl \
-      ntpdate \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
