@@ -122,7 +122,22 @@ Flags explained:
 1. The runtime service account must have **`roles/storage.objectAdmin`** on the tick-archive bucket — FUSE needs read+write+overwrite (append-within-hour reopens the object). `objectCreator` alone will fail with EACCES after the first roll. `setup_gcp.sh` already provisions this.
 2. The FUSE mount options pin `uid=10001,gid=10001` to match the Dockerfile's non-root `bot-btc-1hr-kalshi` user (uid=10001). Without these the inode is root-owned and the app gets EACCES on first write. `implicit-dirs` is also set so `ArchiveWriter`'s `mkdir(parents=True, exist_ok=True)` succeeds — GCS has no real directory inodes.
 
-Because `gcloud run deploy` flags do not include FUSE volume declarations, the first deploy (or any change to volume configuration) must go through `gcloud run services replace deploy/cloudrun.yaml --region=$REGION` to materialize the CSI volume. Subsequent env-var-only revisions can continue to use `gcloud run deploy` / Console edits without re-applying the YAML.
+Because `gcloud run deploy` flags do not include FUSE volume declarations, the first deploy (or any change to volume configuration) must go through `gcloud run services replace` to materialize the CSI volume. `deploy/cloudrun.yaml` uses `${PROJECT_ID}` / `${REGION}` placeholders for portability — resolve them at deploy time:
+
+```bash
+# Option A: envsubst (brew install gettext)
+PROJECT_ID=$BOT_BTC_1HR_KALSHI_GCP_PROJECT REGION=$BOT_BTC_1HR_KALSHI_GCP_REGION \
+  envsubst < deploy/cloudrun.yaml | \
+  gcloud run services replace - --region=$BOT_BTC_1HR_KALSHI_GCP_REGION
+
+# Option B: sed (always available)
+sed -e "s|\${PROJECT_ID}|$BOT_BTC_1HR_KALSHI_GCP_PROJECT|g" \
+    -e "s|\${REGION}|$BOT_BTC_1HR_KALSHI_GCP_REGION|g" \
+    deploy/cloudrun.yaml | \
+  gcloud run services replace - --region=$BOT_BTC_1HR_KALSHI_GCP_REGION
+```
+
+Subsequent env-var-only revisions can use `gcloud run deploy` / Console edits without re-applying the YAML.
 
 **SIGTERM grace — the 10-second contract.** Cloud Run's container-runtime contract states a fixed 10-second SIGTERM→SIGKILL window, and neither `terminationGracePeriodSeconds` nor the `run.googleapis.com/container-shutdown-timeout` annotation is documented as a way to extend it on managed Cloud Run ([YAML reference](https://cloud.google.com/run/docs/reference/yaml/v1), [container contract](https://cloud.google.com/run/docs/container-contract)). `deploy/cloudrun.yaml` sets `terminationGracePeriodSeconds: 600` as a best-effort Knative spec — if Cloud Run ever honors it we get the longer drain; if not, nothing breaks. **The system must be safe to die in 10 seconds.** The OMS `ABANDONED_TO_SETTLEMENT` ledger state covers this: any unfinished IOC exit is recovered on next boot from the broker's authoritative state, and capital stays locked safely in Kalshi's settlement engine.
 

@@ -5,7 +5,19 @@
 # `gcloud run deploy` with the flags in docs/DEPLOYMENT.md §2.3 — this YAML is
 # for reference and for GitOps-style replay if we adopt one later.
 #
-# Apply: gcloud run services replace deploy/cloudrun.yaml --region=<REGION>
+# `${PROJECT_ID}` and `${REGION}` below are placeholders — resolve them at
+# deploy time against the same env vars setup_gcp.sh uses. Two options:
+#
+# With envsubst (brew install gettext):
+#   PROJECT_ID=$BOT_BTC_1HR_KALSHI_GCP_PROJECT REGION=$BOT_BTC_1HR_KALSHI_GCP_REGION \
+#     envsubst < deploy/cloudrun.yaml | \
+#     gcloud run services replace - --region=$BOT_BTC_1HR_KALSHI_GCP_REGION
+#
+# With sed (always available):
+#   sed -e "s|\${PROJECT_ID}|$BOT_BTC_1HR_KALSHI_GCP_PROJECT|g" \
+#       -e "s|\${REGION}|$BOT_BTC_1HR_KALSHI_GCP_REGION|g" \
+#       deploy/cloudrun.yaml | \
+#     gcloud run services replace - --region=$BOT_BTC_1HR_KALSHI_GCP_REGION
 # ============================================================================
 
 apiVersion: serving.knative.dev/v1
@@ -35,7 +47,7 @@ spec:
         # Faster cold start on deploy.
         run.googleapis.com/startup-cpu-boost: "true"
     spec:
-      serviceAccountName: bot-btc-1hr-kalshi-runtime@PROJECT_ID.iam.gserviceaccount.com
+      serviceAccountName: bot-btc-1hr-kalshi-runtime@${PROJECT_ID}.iam.gserviceaccount.com
       timeoutSeconds: 3600
       containerConcurrency: 10
 
@@ -63,13 +75,13 @@ spec:
         # exist_ok=True) which would otherwise fail.
         #
         # Runtime service account needs roles/storage.objectAdmin on
-        # bot-btc-1hr-kalshi-tick-archive-PROJECT_ID. See DEPLOYMENT.md.
+        # bot-btc-1hr-kalshi-tick-archive-${PROJECT_ID}. See DEPLOYMENT.md.
         - name: tick-archive
           csi:
             driver: gcsfuse.run.googleapis.com
             readOnly: false
             volumeAttributes:
-              bucketName: bot-btc-1hr-kalshi-tick-archive-PROJECT_ID
+              bucketName: bot-btc-1hr-kalshi-tick-archive-${PROJECT_ID}
               mountOptions: "uid=10001,gid=10001,implicit-dirs"
 
       # SIGTERM → SIGKILL grace, best-effort. Knative/Kubernetes honors this
@@ -87,7 +99,7 @@ spec:
       terminationGracePeriodSeconds: 600
       containers:
         - name: bot-btc-1hr-kalshi
-          image: REGION-docker.pkg.dev/PROJECT_ID/bot-btc-1hr-kalshi/bot-btc-1hr-kalshi:latest
+          image: ${REGION}-docker.pkg.dev/${PROJECT_ID}/bot-btc-1hr-kalshi/bot-btc-1hr-kalshi:latest
           ports:
             - name: http1
               containerPort: 8080
@@ -110,10 +122,17 @@ spec:
             - name: BOT_BTC_1HR_KALSHI_ENV
               value: prod
             - name: BOT_BTC_1HR_KALSHI_GCP_PROJECT
-              value: PROJECT_ID
+              value: ${PROJECT_ID}
             - name: BOT_BTC_1HR_KALSHI_GCP_REGION
-              value: REGION
-            # ... (rest populated from deploy/env.yaml at deploy time)
+              value: ${REGION}
+
+            # Kalshi feed endpoints. paper.yaml / live.yaml reference these
+            # via `ws_url_env` / `rest_url_env` — without them the feed loop
+            # halts at boot with feedloop.missing_config.
+            - name: BOT_BTC_1HR_KALSHI_WS_URL
+              value: wss://api.elections.kalshi.com/trade-api/ws/v2
+            - name: BOT_BTC_1HR_KALSHI_REST_URL
+              value: https://api.elections.kalshi.com/trade-api/v2
 
             # Path to the PEM file mounted from Secret Manager above.
             - name: BOT_BTC_1HR_KALSHI_PRIVATE_KEY_PATH
