@@ -10,6 +10,7 @@ from bot_btc_1hr_kalshi.market_data.feeds.kalshi_parser import (
     KalshiParseError,
     build_subscribe,
     parse_frame,
+    peek_frame_type,
 )
 from bot_btc_1hr_kalshi.market_data.types import BookUpdate, TradeEvent
 
@@ -385,6 +386,36 @@ def test_parses_trade_yes_taker_real_shape() -> None:
     assert ev.size == 199
     assert ev.taker_side == "YES"
     assert ev.aggressor == "buy"
+
+
+# --- peek_frame_type --------------------------------------------------------
+# Diagnostic-only pre-parse that buckets frames by `type` without routing
+# them through the full parser. Used by `_FeedDiagnostic` to count control
+# frames (ping/pong/subscribed) which `parse_frame` correctly drops before
+# the caller can see them.
+
+
+def test_peek_frame_type_returns_type_for_known_frames() -> None:
+    for ftype in ("orderbook_snapshot", "orderbook_delta", "trade", "ping", "pong",
+                  "subscribed", "ok", "error"):
+        assert peek_frame_type(_enc({"type": ftype, "msg": {}})) == ftype
+
+
+def test_peek_frame_type_sentinel_for_invalid_json() -> None:
+    assert peek_frame_type(b"{not json") == "<invalid-json>"
+
+
+def test_peek_frame_type_sentinel_for_non_object() -> None:
+    assert peek_frame_type(b'"a string"') == "<non-object>"
+    assert peek_frame_type(b"[1,2,3]") == "<non-object>"
+
+
+def test_peek_frame_type_sentinel_for_missing_type() -> None:
+    assert peek_frame_type(_enc({"msg": {}})) == "<no-type>"
+
+
+def test_peek_frame_type_sentinel_for_non_string_type() -> None:
+    assert peek_frame_type(_enc({"type": 42})) == "<no-type>"
 
 
 def test_unparseable_ts_string_raises_not_silent() -> None:

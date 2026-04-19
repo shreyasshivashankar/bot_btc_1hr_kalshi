@@ -3,7 +3,11 @@ SpotFeed for Coinbase (primary) / Kraken (confirmation) tickers."""
 
 from bot_btc_1hr_kalshi.market_data.feeds.base import Feed
 from bot_btc_1hr_kalshi.market_data.feeds.kalshi import KalshiFeed
-from bot_btc_1hr_kalshi.market_data.feeds.kalshi_parser import KalshiParseError, parse_frame
+from bot_btc_1hr_kalshi.market_data.feeds.kalshi_parser import (
+    KalshiParseError,
+    parse_frame,
+    peek_frame_type,
+)
 from bot_btc_1hr_kalshi.market_data.feeds.mock import MockFeed
 from bot_btc_1hr_kalshi.market_data.feeds.spot import (
     SpotFeed,
@@ -32,4 +36,5 @@ __all__ = [
     "parse_coinbase",
     "parse_frame",
     "parse_kraken",
+    "peek_frame_type",
 ]

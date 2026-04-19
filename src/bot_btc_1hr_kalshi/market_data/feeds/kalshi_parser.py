@@ -120,6 +120,27 @@ def _levels_yes(
     return yes_bids, yes_asks
 
 
+def peek_frame_type(raw: bytes | str) -> str:
+    """Return the frame's `type` field without full parse, for diagnostics.
+
+    Returns the literal string (``"orderbook_delta"``, ``"trade"``, ``"ping"``,
+    etc.) or one of the sentinels ``"<no-type>"`` / ``"<invalid-json>"`` /
+    ``"<non-object>"`` so callers can bucket anomalies without re-raising.
+    This is intentionally a separate pass so parse_frame's hot path is
+    unchanged; the extra orjson.loads on a small WS frame is <5µs.
+    """
+    try:
+        data = orjson.loads(raw)
+    except orjson.JSONDecodeError:
+        return "<invalid-json>"
+    if not isinstance(data, dict):
+        return "<non-object>"
+    ftype = data.get("type")
+    if not isinstance(ftype, str):
+        return "<no-type>"
+    return ftype
+
+
 def parse_frame(raw: bytes | str, *, recv_ts_ns: int) -> BookUpdate | TradeEvent | None:
     """Decode a single WS frame. Returns None for control frames (ack, heartbeat).
 

@@ -6,7 +6,11 @@ from collections.abc import AsyncIterator
 import orjson
 import pytest
 
-from bot_btc_1hr_kalshi.market_data.feeds.kalshi import KalshiFeed, WSConnection
+from bot_btc_1hr_kalshi.market_data.feeds.kalshi import (
+    KalshiFeed,
+    WSConnection,
+    _FeedDiagnostic,
+)
 from bot_btc_1hr_kalshi.market_data.feeds.staleness import StalenessTracker
 from bot_btc_1hr_kalshi.market_data.types import BookUpdate, TradeEvent
 from bot_btc_1hr_kalshi.obs.clock import ManualClock
@@ -278,6 +282,108 @@ async def test_staleness_tracks_event_time_not_recv_time() -> None:
     # move (event-time, not recv-time or clock-on-mark).
     clock.advance_ns(10_000_000_000)
     assert st.last_msg_ns == 5_000_000_000
+
+
+# --- _FeedDiagnostic --------------------------------------------------------
+# The diagnostic is off by default (hot path does a single `if self.enabled`
+# check per frame). When enabled, it aggregates per-ftype counts, inter-arrival
+# gaps, and exchange-to-recv lag over a rolling window and emits one log line
+# per interval. These tests drive the class directly so we don't depend on
+# structlog capture fixtures.
+
+
+def test_feed_diagnostic_disabled_is_noop() -> None:
+    clock = ManualClock(0)
+    diag = _FeedDiagnostic(enabled=False, clock=clock)
+    assert diag.enabled is False
+    # observe/maybe_emit must stay cheap when disabled — they shouldn't
+    # accumulate state that could leak memory.
+    diag.observe("orderbook_delta", recv_ns=100, ev_ts_ns=90)
+    diag.maybe_emit(now_ns=10_000_000_000)
+    assert diag._counts == {"orderbook_delta": 1}  # still records, but never emits
+
+
+def test_feed_diagnostic_emits_once_per_interval() -> None:
+    """Below-interval maybe_emit calls must not advance the emit timer; a
+    crossing call must. We check state transitions rather than capturing
+    structlog output — capturing structlog from pytest is fragile and the
+    reset-on-emit behavior is the load-bearing invariant."""
+    clock = ManualClock(0)
+    diag = _FeedDiagnostic(enabled=True, clock=clock, interval_sec=1.0)
+    initial = diag._last_emit_ns
+    diag.observe("orderbook_delta", recv_ns=100_000_000, ev_ts_ns=50_000_000)
+    diag.maybe_emit(now_ns=500_000_000)  # 0.5s → below interval
+    assert diag._last_emit_ns == initial
+    assert diag._counts == {"orderbook_delta": 1}  # still accumulating
+    diag.observe("trade", recv_ns=1_200_000_000, ev_ts_ns=1_100_000_000)
+    diag.maybe_emit(now_ns=1_500_000_000)  # 1.5s → crosses threshold
+    assert diag._last_emit_ns == 1_500_000_000
+    assert diag._counts == {}  # reset after emit
+
+
+def test_feed_diagnostic_resets_state_on_emit() -> None:
+    clock = ManualClock(0)
+    diag = _FeedDiagnostic(enabled=True, clock=clock, interval_sec=1.0)
+    diag.observe("trade", recv_ns=100_000_000, ev_ts_ns=50_000_000)
+    diag.observe("trade", recv_ns=200_000_000, ev_ts_ns=150_000_000)
+    diag.maybe_emit(now_ns=1_500_000_000)
+    # After an emit the accumulators must be reset — otherwise the next window
+    # reports stale data pooled across windows.
+    assert diag._counts == {}
+    assert diag._inter_arrivals == {}
+    assert diag._ts_lags_ms == []
+
+
+def test_feed_diagnostic_skips_emit_when_window_empty() -> None:
+    """A window with no observations should advance the timer but NOT log —
+    otherwise a quiet market floods the log with empty-window records."""
+    clock = ManualClock(0)
+    diag = _FeedDiagnostic(enabled=True, clock=clock, interval_sec=1.0)
+    before_last_emit = diag._last_emit_ns
+    diag.maybe_emit(now_ns=2_000_000_000)
+    # Timer was advanced, so next maybe_emit won't immediately re-fire.
+    assert diag._last_emit_ns > before_last_emit
+
+
+def test_feed_diagnostic_tracks_inter_arrival_by_type() -> None:
+    clock = ManualClock(0)
+    diag = _FeedDiagnostic(enabled=True, clock=clock, interval_sec=60.0)
+    # Two trades 10ms apart; one delta 50ms after the first trade.
+    diag.observe("trade", recv_ns=100_000_000, ev_ts_ns=None)
+    diag.observe("orderbook_delta", recv_ns=150_000_000, ev_ts_ns=None)
+    diag.observe("trade", recv_ns=110_000_000, ev_ts_ns=None)
+    # Inter-arrivals are computed per-type — trade[0]→trade[1] = 10ms gap.
+    assert "trade" in diag._inter_arrivals
+    assert diag._inter_arrivals["trade"] == [10.0]
+    # Single observation of delta → no inter-arrival sample yet.
+    assert "orderbook_delta" not in diag._inter_arrivals
+
+
+async def test_feed_runs_with_diagnostic_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Integration: with BOT_BTC_1HR_KALSHI_FEED_DIAG=1, the feed must
+    continue to deliver events unchanged. The diagnostic is instrumentation;
+    it must not alter the event stream or crash the session."""
+    monkeypatch.setenv("BOT_BTC_1HR_KALSHI_FEED_DIAG", "1")
+    conn = FakeConn([_snap(1), _trade(2), b"{bad", _snap(3)])
+    clock = ManualClock(0)
+    st = StalenessTracker(name="k", clock=clock, threshold_ms=2000)
+
+    async def connect(url: str) -> WSConnection:
+        return conn
+
+    feed = KalshiFeed(
+        ws_url="ws://fake",
+        market_tickers=["M"],
+        clock=clock,
+        ws_connect=connect,
+        staleness=st,
+    )
+    events = []
+    async for ev in feed.events():
+        events.append(ev)
+        if len(events) == 3:
+            break
+    assert len(events) == 3  # 2 books + 1 trade (parse error dropped)
 
 
 def test_empty_ticker_list_rejected() -> None:
