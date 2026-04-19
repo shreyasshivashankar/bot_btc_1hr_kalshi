@@ -174,6 +174,101 @@ async def test_current_btc_hourly_market_falls_back_to_ticker_strike() -> None:
     assert picked.strike_usd == 63500.0
 
 
+async def test_list_btc_hourly_markets_returns_n_closest_by_spot() -> None:
+    """Multi-strike discovery: return up to `max_markets` candidates of
+    the soonest settlement, ranked by `|strike - btc_spot_usd|`. The
+    primary (index 0) matches single-market behavior; the tail fans out
+    to adjacent strikes for cross-sectional evaluation."""
+    now = dt.datetime(2026, 4, 17, 14, 12, 0, tzinfo=dt.UTC)
+    now_ns = int(now.timestamp() * 1_000_000_000)
+    settlement = now.replace(minute=0, second=0) + dt.timedelta(hours=1)
+
+    markets = [
+        {"ticker": "KXBTC-H-B66000", "expected_expiration_time": _iso(settlement), "floor_strike": 66000},
+        {"ticker": "KXBTC-H-B76000", "expected_expiration_time": _iso(settlement), "floor_strike": 76000},
+        {"ticker": "KXBTC-H-B77500", "expected_expiration_time": _iso(settlement), "floor_strike": 77500},
+        {"ticker": "KXBTC-H-B78500", "expected_expiration_time": _iso(settlement), "floor_strike": 78500},
+        {"ticker": "KXBTC-H-B80000", "expected_expiration_time": _iso(settlement), "floor_strike": 80000},
+        {"ticker": "KXBTC-H-B86000", "expected_expiration_time": _iso(settlement), "floor_strike": 86000},
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=orjson.dumps({"markets": markets}))
+
+    client = KalshiRestClient(client=_client(httpx.MockTransport(handler)))
+    picked = await client.list_btc_hourly_markets(
+        now_ns=now_ns, btc_spot_usd=78_000.0, max_markets=5
+    )
+    # Distances from 78k: 77500→500, 78500→500, 76000→2000, 80000→2000,
+    # 66000→12000, 86000→8000. Top 5 by |strike - spot| then alpha tiebreak.
+    assert [m.ticker for m in picked] == [
+        "KXBTC-H-B77500",  # 500 gap, alpha first
+        "KXBTC-H-B78500",  # 500 gap
+        "KXBTC-H-B76000",  # 2000 gap, alpha first
+        "KXBTC-H-B80000",  # 2000 gap
+        "KXBTC-H-B86000",  # 8000 gap (next closest)
+    ]
+
+
+async def test_list_btc_hourly_markets_drops_later_hours() -> None:
+    """Only markets sharing the soonest settlement are returned. Mixing
+    hours would break the correlation cap's (settlement_ts_ns, side)
+    identity — a bet at 15:00 and a bet at 16:00 are NOT correlated."""
+    now = dt.datetime(2026, 4, 17, 14, 12, 0, tzinfo=dt.UTC)
+    now_ns = int(now.timestamp() * 1_000_000_000)
+    this_hour = now.replace(minute=0, second=0) + dt.timedelta(hours=1)
+    next_hour = this_hour + dt.timedelta(hours=1)
+
+    markets = [
+        {"ticker": "KXBTC-HR1-B77500", "expected_expiration_time": _iso(this_hour), "floor_strike": 77500},
+        {"ticker": "KXBTC-HR1-B78500", "expected_expiration_time": _iso(this_hour), "floor_strike": 78500},
+        {"ticker": "KXBTC-HR2-B77800", "expected_expiration_time": _iso(next_hour), "floor_strike": 77800},
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=orjson.dumps({"markets": markets}))
+
+    client = KalshiRestClient(client=_client(httpx.MockTransport(handler)))
+    picked = await client.list_btc_hourly_markets(
+        now_ns=now_ns, btc_spot_usd=78_000.0, max_markets=5
+    )
+    # HR2 is closer to spot but settles LATER — must be excluded.
+    assert [m.ticker for m in picked] == ["KXBTC-HR1-B77500", "KXBTC-HR1-B78500"]
+    assert all(m.settlement_ts_ns == picked[0].settlement_ts_ns for m in picked)
+
+
+async def test_list_btc_hourly_markets_respects_max_markets_cap() -> None:
+    now = dt.datetime(2026, 4, 17, 14, 12, 0, tzinfo=dt.UTC)
+    now_ns = int(now.timestamp() * 1_000_000_000)
+    settlement = now.replace(minute=0, second=0) + dt.timedelta(hours=1)
+    markets = [
+        {"ticker": f"KXBTC-H-B{strike}", "expected_expiration_time": _iso(settlement), "floor_strike": strike}
+        for strike in (76000, 77000, 78000, 79000, 80000, 81000, 82000)
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=orjson.dumps({"markets": markets}))
+
+    client = KalshiRestClient(client=_client(httpx.MockTransport(handler)))
+    picked = await client.list_btc_hourly_markets(
+        now_ns=now_ns, btc_spot_usd=78_000.0, max_markets=3
+    )
+    assert len(picked) == 3
+    assert picked[0].ticker == "KXBTC-H-B78000"
+
+
+async def test_list_btc_hourly_markets_no_match_raises() -> None:
+    now = dt.datetime(2026, 4, 17, 14, 12, 0, tzinfo=dt.UTC)
+    now_ns = int(now.timestamp() * 1_000_000_000)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=orjson.dumps({"markets": []}))
+
+    client = KalshiRestClient(client=_client(httpx.MockTransport(handler)))
+    with pytest.raises(MarketDiscoveryError):
+        await client.list_btc_hourly_markets(now_ns=now_ns)
+
+
 async def test_list_open_markets_paginates() -> None:
     page1 = {
         "markets": [{"ticker": "A"}],

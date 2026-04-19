@@ -82,6 +82,16 @@ _log = structlog.get_logger("bot_btc_1hr_kalshi.feedloop")
 # consume all of them via `snap.features` — no parameterless reads remain.
 _PRIMARY_TF: str = "5m"
 
+# How many strikes of the current hourly series to maintain L2 books for.
+# The WS is multiplexed — one connection, N subscriptions. 5 covers the
+# ±$500 / ±$1000 / ATM neighborhood that dominates tradeable short-dated
+# mean-reversion edges without bloating memory (each L2Book is ~a few kB
+# of resting levels). All strikes share one settlement_ts_ns, so the
+# correlation cap's identity remains well-defined. Bump cautiously: a
+# larger universe inflates the cross-sectional evaluator's eval cost
+# linearly per tick.
+_MAX_STRIKES_TRACKED: int = 5
+
 
 @dataclass(slots=True)
 class _PendingEntry:
@@ -145,7 +155,7 @@ class FeedLoop:
         *,
         app: App,
         broker: Broker,
-        book: L2Book,
+        books: dict[str, L2Book],
         kalshi_feed: KalshiFeed,
         spot_oracle: SpotOracle,
         feature_engine: FeatureEngine,
@@ -157,9 +167,15 @@ class FeedLoop:
         integrity: IntegrityTracker | None = None,
         spot_staleness_max_age_ms: int = 1000,
     ) -> None:
+        if market_id not in books:
+            raise ValueError(
+                f"primary market_id {market_id!r} missing from books "
+                f"{sorted(books)!r}"
+            )
         self._app = app
         self._broker = broker
-        self._book = book
+        self._books = books
+        self._book = books[market_id]  # primary — trap evaluator reads this
         self._kalshi_feed = kalshi_feed
         self._spot_oracle = spot_oracle
         self._features = feature_engine
@@ -175,9 +191,10 @@ class FeedLoop:
         self._spot_staleness_max_age_ms = spot_staleness_max_age_ms
 
     async def run(self) -> None:
-        self._app.register_book(self._book)
-        if isinstance(self._broker, PaperBroker):
-            self._broker.register_book(self._book)
+        for book in self._books.values():
+            self._app.register_book(book)
+            if isinstance(self._broker, PaperBroker):
+                self._broker.register_book(book)
 
         # Subscribe to the persistent oracle. On cold start the callback
         # fires immediately with the current cached tick (see SpotOracle
@@ -238,7 +255,15 @@ class FeedLoop:
         self._archive_and_mark(event)
 
         if isinstance(event, BookUpdate):
-            self._book.apply(event)
+            book = self._books.get(event.market_id)
+            if book is None:
+                _log.warning(
+                    "feedloop.unknown_market_book_update",
+                    market_id=event.market_id,
+                    known=sorted(self._books),
+                )
+                return
+            book.apply(event)
         elif isinstance(event, TradeEvent):
             # Paper-broker maker-match happens via book.apply crossings;
             # trade events do not directly produce fills in our model.
@@ -436,10 +461,11 @@ async def run_forever(
             continue
 
         try:
-            market = await discovery.current_btc_hourly_market(
+            markets = await discovery.list_btc_hourly_markets(
                 now_ns=clock.now_ns(),
                 series_ticker=series_ticker,
                 btc_spot_usd=btc_spot,
+                max_markets=_MAX_STRIKES_TRACKED,
             )
             backoff = 2.0  # reset on success
         except (MarketDiscoveryError, httpx.HTTPError) as exc:
@@ -452,20 +478,23 @@ async def run_forever(
             backoff = min(max_discovery_backoff_sec, backoff * 2.0)
             continue
 
+        primary = markets[0]
         _log.info(
             "feedloop.session_start",
-            market_id=market.ticker,
-            strike_usd=market.strike_usd,
-            settlement_ts_ns=market.settlement_ts_ns,
+            market_id=primary.ticker,
+            strike_usd=primary.strike_usd,
+            settlement_ts_ns=primary.settlement_ts_ns,
+            tracked_tickers=[m.ticker for m in markets],
+            tracked_count=len(markets),
             btc_spot_usd=btc_spot,
-            strike_gap_usd=abs(market.strike_usd - btc_spot),
+            strike_gap_usd=abs(primary.strike_usd - btc_spot),
         )
         try:
             await _run_one_session(
                 app=app,
                 broker=broker,
                 clock=clock,
-                market=market,
+                markets=markets,
                 kalshi_ws_url=kalshi_ws_url,
                 spot_oracle=spot_oracle,
                 ws_connect=ws_connect,
@@ -474,7 +503,7 @@ async def run_forever(
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # pragma: no cover — defensive
-            _log.error("feedloop.session_error", error=str(exc), market=market.ticker)
+            _log.error("feedloop.session_error", error=str(exc), market=primary.ticker)
             await asyncio.sleep(2.0)
 
 
@@ -483,19 +512,31 @@ async def _run_one_session(
     app: App,
     broker: Broker,
     clock: Clock,
-    market: HourlyMarket,
+    markets: list[HourlyMarket],
     kalshi_ws_url: str,
     spot_oracle: SpotOracle,
     ws_connect: WSConnect,
     on_book_invalidate: Callable[[str], None] | None,
 ) -> None:
-    book = L2Book(market.ticker)
+    if not markets:
+        raise ValueError("_run_one_session: markets must be non-empty")
+    primary = markets[0]
+    books: dict[str, L2Book] = {m.ticker: L2Book(m.ticker) for m in markets}
 
     def _invalidate(reason: str) -> None:
-        book.invalidate(reason)
+        # On WS reconnect every book in the session lost its delta stream
+        # together (single multiplexed socket). Mark them all INVALID so
+        # downstream features refuse to fire until a fresh snapshot arrives
+        # per ticker (hard rule #9).
+        for b in books.values():
+            b.invalidate(reason)
         if on_book_invalidate is not None:
             on_book_invalidate(reason)
 
+    # One StalenessTracker for the whole session — all N strikes share one
+    # WS, so a broken socket stales them together. Per-ticker trackers
+    # would false-positive quiet strikes and fail-open on genuine socket
+    # death (a ticker that never prints could never report stale).
     kalshi_staleness = StalenessTracker(
         name="kalshi",
         clock=clock,
@@ -504,7 +545,7 @@ async def _run_one_session(
 
     kalshi_feed = KalshiFeed(
         ws_url=kalshi_ws_url,
-        market_tickers=[market.ticker],
+        market_tickers=[m.ticker for m in markets],
         clock=clock,
         ws_connect=ws_connect,
         staleness=kalshi_staleness,
@@ -525,13 +566,13 @@ async def _run_one_session(
     loop = FeedLoop(
         app=app,
         broker=broker,
-        book=book,
+        books=books,
         kalshi_feed=kalshi_feed,
         spot_oracle=spot_oracle,
         feature_engine=feature_engine,
-        market_id=market.ticker,
-        strike_usd=market.strike_usd,
-        settlement_ts_ns=market.settlement_ts_ns,
+        market_id=primary.ticker,
+        strike_usd=primary.strike_usd,
+        settlement_ts_ns=primary.settlement_ts_ns,
         clock=clock,
         integrity=integrity,
         spot_staleness_max_age_ms=app.settings.risk.spot_staleness_halt_ms,
@@ -554,10 +595,13 @@ async def _run_one_session(
         # feed produces), so leaving the breaker latched would spuriously
         # halt the new session.
         app.breakers.set_feed_halt(halted=False)
-        # Drop the book reference so the next session can register a new one
-        # under the new ticker. If an open position still exists we keep it
-        # (hard rule #10 — operator must flatten).
-        app.books.pop(market.ticker, None)
+        # Drop book references so the next session can register fresh ones
+        # under next-hour tickers. If an open position still exists we keep
+        # its book (hard rule #10 — operator must flatten).
+        open_market_ids = {p.market_id for p in app.portfolio.open_positions}
+        for ticker in list(books):
+            if ticker not in open_market_ids:
+                app.books.pop(ticker, None)
 
 
 __all__ = [
