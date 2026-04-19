@@ -51,6 +51,27 @@ spec:
               - key: latest
                 path: kalshi-private-key
 
+        # Tick archive — GCS FUSE mount. ArchiveWriter writes
+        # events-YYYY-MM-DDTHH.jsonl files; hour-roll close() finalizes
+        # each object in the bucket (no per-line flushes, see
+        # archive/writer.py docstring).
+        #
+        # uid/gid match the Dockerfile's non-root user (uid=10001).
+        # Without these the inode is root-owned and the app gets EACCES.
+        # implicit-dirs is required because GCS has no real directory
+        # inodes — ArchiveWriter.__init__ calls mkdir(parents=True,
+        # exist_ok=True) which would otherwise fail.
+        #
+        # Runtime service account needs roles/storage.objectAdmin on
+        # bot-btc-1hr-kalshi-tick-archive-PROJECT_ID. See DEPLOYMENT.md.
+        - name: tick-archive
+          csi:
+            driver: gcsfuse.run.googleapis.com
+            readOnly: false
+            volumeAttributes:
+              bucketName: bot-btc-1hr-kalshi-tick-archive-PROJECT_ID
+              mountOptions: "uid=10001,gid=10001,implicit-dirs"
+
       # SIGTERM → SIGKILL grace, best-effort. Knative/Kubernetes honors this
       # field; Cloud Run managed does NOT document it (the YAML reference
       # at cloud.google.com/run/docs/reference/yaml/v1 lists neither this
@@ -79,6 +100,8 @@ spec:
             - name: kalshi-private-key
               mountPath: /secrets/kalshi
               readOnly: true
+            - name: tick-archive
+              mountPath: /app/data/archive
 
           # Non-secret config — sync with deploy/env.example.yaml
           env:
@@ -95,6 +118,10 @@ spec:
             # Path to the PEM file mounted from Secret Manager above.
             - name: BOT_BTC_1HR_KALSHI_PRIVATE_KEY_PATH
               value: /secrets/kalshi/kalshi-private-key
+
+            # Tick archive directory — backed by the GCS FUSE mount above.
+            - name: BOT_BTC_1HR_KALSHI_ARCHIVE_DIR
+              value: /app/data/archive
 
             # Secrets exposed as env vars (non-PEM values — short strings).
             - name: BOT_BTC_1HR_KALSHI_API_KEY
