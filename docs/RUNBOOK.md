@@ -29,9 +29,12 @@ gcloud run services update bot-btc-1hr-kalshi \
 Deploy + start. First-ever deploy must go through `gcloud run services replace` so the GCS FUSE tick-archive volume is materialized. `deploy/cloudrun.yaml` carries the full manifest (secrets, FUSE mount, env vars); resolve its `${PROJECT_ID}`/`${REGION}` placeholders at apply time:
 
 ```bash
-# 1. Build the image into Artifact Registry
+# 1. Build the image into Artifact Registry. Dockerfile lives at
+#    deploy/Dockerfile (not the repo root), so we use cloudbuild.yaml
+#    instead of the --tag shortcut.
 gcloud builds submit \
-  --tag "$BOT_BTC_1HR_KALSHI_GCP_REGION-docker.pkg.dev/$BOT_BTC_1HR_KALSHI_GCP_PROJECT/bot-btc-1hr-kalshi/bot-btc-1hr-kalshi:latest" \
+  --config cloudbuild.yaml \
+  --substitutions _REGION=$BOT_BTC_1HR_KALSHI_GCP_REGION \
   .
 
 # 2. Apply the manifest (sed — or swap in envsubst if you have gettext)
