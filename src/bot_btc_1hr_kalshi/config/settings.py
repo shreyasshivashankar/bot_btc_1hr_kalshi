@@ -48,6 +48,26 @@ class RiskSettings(BaseModel):
     # per (settlement_ts_ns, side) pair; default 1 means one bet at a time
     # per hour-direction regardless of how many strikes are tracked.
     max_correlated_positions: int = Field(ge=1, default=1)
+    # Premium cap (Slice 11 Phase 3.1). Hard reject on entries above this
+    # price in cents. Kelly's math tolerates 75¢ entries (the (1-p) term
+    # compensates mechanically) but the risk/reward is inverted: paying
+    # 75¢ to make 25¢ means any single loss wipes three wins. This is a
+    # monotonic tightening — raising the floor of acceptable bets, not
+    # repricing the edge. Applies only to BUY-side (YES or NO) entries;
+    # the trap emits a single-side signal, so the price is always the
+    # cost of the leg being bought.
+    max_entry_price_cents: int = Field(gt=0, lt=100, default=75)
+    # Inverted-risk sizing clip (Slice 11 Phase 3.2). When entry price is
+    # at/above `inverted_risk_threshold_cents`, multiply the fractional
+    # Kelly allocation by `inverted_risk_kelly_multiplier`. At 50¢+ the
+    # dollar-loss-per-contract exceeds the dollar-win, and Kelly's raw
+    # sizing grows with price (the (1-p) term shrinks the denominator).
+    # This clip halves exposure in that regime — a monotonic tightening,
+    # not a retuning of the edge. Set multiplier=1.0 to disable without
+    # removing the field. Paired with the premium cap (3.1): 3.1 draws
+    # the upper bound, 3.2 scales exposure in the band below it.
+    inverted_risk_threshold_cents: int = Field(gt=0, lt=100, default=50)
+    inverted_risk_kelly_multiplier: float = Field(gt=0.0, le=1.0, default=0.5)
 
 
 class SignalSettings(BaseModel):

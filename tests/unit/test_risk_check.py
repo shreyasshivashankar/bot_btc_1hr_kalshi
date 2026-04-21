@@ -12,12 +12,14 @@ def _settings(
     max_daily_loss_pct: float = 0.05,
     kelly_fraction: float = 0.25,
     max_correlated_positions: int = 1,
+    max_entry_price_cents: int = 75,
 ) -> RiskSettings:
     return RiskSettings(
         kelly_fraction=kelly_fraction,
         max_position_notional_usd=max_notional,
         max_daily_loss_pct=max_daily_loss_pct,
         max_correlated_positions=max_correlated_positions,
+        max_entry_price_cents=max_entry_price_cents,
     )
 
 
@@ -52,9 +54,10 @@ def _req(
     min_conf: float = 0.5,
     breakers: BreakerState | None = None,
     correlated_count: int = 0,
+    entry_price_cents: int = 30,
 ) -> RiskInput:
     return RiskInput(
-        signal=_signal(confidence=confidence),
+        signal=_signal(confidence=confidence, entry_price_cents=entry_price_cents),
         contracts=contracts,
         bankroll_usd=bankroll,
         open_positions_notional_usd=open_notional,
@@ -151,3 +154,58 @@ def test_correlation_cap_ordered_after_confidence_floor() -> None:
     )
     assert isinstance(d, Reject)
     assert d.reason == "below_confidence_floor"
+
+
+def test_reject_premium_cap_above_default() -> None:
+    """Slice 11 Phase 3.1: 76¢ entry with default 75¢ cap → reject. The
+    inverted-risk trade (pay 76 to make 24) is structurally off-edge even
+    when Kelly's (1-p) term makes the math look fine."""
+    d = check(_req(entry_price_cents=76), _settings())
+    assert isinstance(d, Reject)
+    assert d.reason == "premium_cap"
+
+
+def test_premium_cap_boundary_approves_at_exactly_75() -> None:
+    """The cap is exclusive upper bound — 75¢ exactly is still acceptable."""
+    d = check(
+        _req(contracts=1, entry_price_cents=75),
+        _settings(max_notional=100.0),
+    )
+    assert isinstance(d, Approve)
+
+
+def test_premium_cap_respects_configured_override() -> None:
+    """Risk committee can loosen the cap (e.g. for a higher-price strategy
+    slice). 80¢ entry with cap raised to 85 → approve; same entry at
+    default 75 would reject."""
+    d = check(
+        _req(contracts=1, entry_price_cents=80),
+        _settings(max_entry_price_cents=85),
+    )
+    assert isinstance(d, Approve)
+
+
+def test_premium_cap_ordered_after_confidence_floor() -> None:
+    """Journal-noise canary (mirrors correlation-cap ordering test). A
+    low-confidence 85¢ signal must reject as below_confidence_floor, not
+    premium_cap — else every too-weak tick on an expensive strike floods
+    the decision stream with premium_cap rejects."""
+    d = check(
+        _req(confidence=0.3, min_conf=0.5, entry_price_cents=85),
+        _settings(),
+    )
+    assert isinstance(d, Reject)
+    assert d.reason == "below_confidence_floor"
+
+
+def test_premium_cap_ordered_before_correlation_cap() -> None:
+    """Correlation cap is a journaling-sensitive reject too, but premium
+    cap fires first: an inverted-risk entry never qualifies regardless of
+    how many correlated positions are open. This keeps premium_cap the
+    clearer diagnostic when both conditions are true."""
+    d = check(
+        _req(entry_price_cents=85, correlated_count=5),
+        _settings(max_correlated_positions=1),
+    )
+    assert isinstance(d, Reject)
+    assert d.reason == "premium_cap"
