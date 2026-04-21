@@ -60,6 +60,16 @@ class CalendarGuard:
     def already_fired(self) -> frozenset[str]:
         return frozenset(self._fired)
 
+    def replace_events(self, new: Iterable[ScheduledEvent]) -> None:
+        """Swap the scheduled-event list in place. Preserves `_fired` so
+        a refresh that re-returns an already-fired event does not cause
+        a double-flatten. Used by the Forex Factory refresher (Slice 11
+        P1) — the FF endpoint publishes a rolling current-week window,
+        so most refreshes repeat events we've already seen and most
+        newly added events are further out on the calendar.
+        """
+        self._events = tuple(sorted(new, key=lambda e: e.ts_ns))
+
     async def tick(self) -> GuardTick:
         now_ns = self._clock.now_ns()
         fired_now: list[str] = []

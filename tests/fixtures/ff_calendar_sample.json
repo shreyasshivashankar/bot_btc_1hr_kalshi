@@ -1,0 +1,42 @@
+[
+  {
+    "title": "FOMC Press Conference",
+    "country": "USD",
+    "date": "2026-04-29T14:30:00-04:00",
+    "impact": "High",
+    "forecast": "",
+    "previous": ""
+  },
+  {
+    "title": "CPI m/m",
+    "country": "USD",
+    "date": "2026-04-10T08:30:00-04:00",
+    "impact": "High",
+    "forecast": "0.3%",
+    "previous": "0.2%"
+  },
+  {
+    "title": "Core Retail Sales m/m",
+    "country": "USD",
+    "date": "2026-04-15T08:30:00-04:00",
+    "impact": "Medium",
+    "forecast": "0.4%",
+    "previous": "0.3%"
+  },
+  {
+    "title": "German Ifo Business Climate",
+    "country": "EUR",
+    "date": "2026-04-24T04:00:00-04:00",
+    "impact": "High",
+    "forecast": "88.5",
+    "previous": "87.9"
+  },
+  {
+    "title": "GDP q/q",
+    "country": "USD",
+    "date": "2026-04-30T08:30:00-04:00",
+    "impact": "High",
+    "forecast": "2.1%",
+    "previous": "1.9%"
+  }
+]

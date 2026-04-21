@@ -24,6 +24,16 @@ feeds:
   kraken:
     ws_url: wss://ws.kraken.com/v2
     staleness_halt_ms: 5000
+  # Coinglass OI poller (Slice 11 P2 — SHADOW). Identical wiring to paper
+  # — this stays observational in live until risk-committee sign-off.
+  coinglass:
+    enabled: true
+    base_url: https://open-api-v4.coinglass.com
+    oi_path: /api/futures/open-interest/aggregated-history
+    symbol: BTC
+    interval: 5m
+    poll_interval_sec: 30.0
+    api_key_env: BOT_BTC_1HR_KALSHI_COINGLASS_API_KEY
 
 risk:
   kelly_fraction: 0.25            # ½-Kelly cap — hard ceiling
@@ -82,3 +92,15 @@ integrity:
   velocity_window_sec: 1.0
   active_disagreement_floor_usd: 25.0
   stale_halt_sec: 60.0
+
+calendar:
+  # Slice 11 P1 — Macro Blockers. See comments in paper.yaml. Live stays
+  # strictly on US/High-impact prints; loosening requires risk-committee
+  # sign-off (docs/RISK.md). A failed FF fetch keeps the prior event
+  # list live — the refresher is fail-soft, never fail-open.
+  lead_seconds: 60.0
+  tick_interval_sec: 5.0
+  fetch_enabled: true
+  fetch_interval_sec: 1800.0
+  tier_1_countries: ["USD"]
+  tier_1_impacts: ["High"]

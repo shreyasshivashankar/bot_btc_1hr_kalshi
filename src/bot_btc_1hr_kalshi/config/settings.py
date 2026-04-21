@@ -19,12 +19,36 @@ class FeedSettings(BaseModel):
     staleness_halt_ms: int = Field(gt=0, default=2000)
 
 
+class CoinglassSettings(BaseModel):
+    """Coinglass open-interest poller (Slice 11 P2 — shadow mode only).
+
+    Observational: sampled OI is logged for paper-soak telemetry and
+    optionally attached to `MarketSnapshot`, but traps do not gate on it
+    yet. `enabled: false` disables the polling task entirely — the API
+    key env var is read lazily only when `enabled: true`.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    base_url: str = "https://open-api-v4.coinglass.com"
+    oi_path: str = "/api/futures/open-interest/aggregated-history"
+    symbol: str = "BTC"
+    interval: str = "5m"
+    poll_interval_sec: float = Field(gt=0.0, default=30.0)
+    # Env var name (not the key itself). The actual API key loads via
+    # Secret Manager in Cloud Run / env in dev. Empty key triggers the
+    # free-tier unkeyed path (stricter rate limits).
+    api_key_env: str = "BOT_BTC_1HR_KALSHI_COINGLASS_API_KEY"
+
+
 class FeedsSettings(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     kalshi: FeedSettings
     coinbase: FeedSettings
     kraken: FeedSettings
+    coinglass: CoinglassSettings = CoinglassSettings()
 
 
 class RiskSettings(BaseModel):
@@ -163,8 +187,9 @@ class CalendarSettings(BaseModel):
     """Structured economic-calendar configuration (hard rule #8).
 
     `path` is relative to the config directory. Absent / empty means the
-    guard runs with zero scheduled events — the human kill-switch remains
-    the only override path.
+    guard runs with zero static (YAML) events; the Forex Factory fetcher
+    (Slice 11 P1) can still populate the guard if `fetch_enabled`. The
+    human kill-switch remains the backstop in either case.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -172,6 +197,19 @@ class CalendarSettings(BaseModel):
     path: str | None = None
     lead_seconds: float = Field(gt=0.0, default=60.0)
     tick_interval_sec: float = Field(gt=0.0, default=5.0)
+    # Forex Factory auto-refresh (Slice 11 P1 — Macro Blockers). When
+    # enabled, a background task polls `fetch_url` every `fetch_interval_sec`
+    # and hot-swaps the guard's event list. Static YAML (`path`) still
+    # takes precedence — names colliding between sources resolve to the
+    # YAML entry (operators may override an FF-scheduled event that is
+    # wrong or stale). Allow-lists default to US/High-impact because
+    # that's the set of prints historically associated with the BTC
+    # vol spikes we flatten for; widen only with risk-committee sign-off.
+    fetch_enabled: bool = False
+    fetch_url: str = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
+    fetch_interval_sec: float = Field(gt=0.0, default=1800.0)
+    tier_1_countries: tuple[str, ...] = ("USD",)
+    tier_1_impacts: tuple[str, ...] = ("High",)
 
 
 class Settings(BaseModel):

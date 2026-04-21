@@ -19,6 +19,7 @@ from bot_btc_1hr_kalshi.execution.oms import OMS
 from bot_btc_1hr_kalshi.market_data.bars import MultiTimeframeBus
 from bot_btc_1hr_kalshi.market_data.book import L2Book
 from bot_btc_1hr_kalshi.market_data.spot_oracle import SpotOracle
+from bot_btc_1hr_kalshi.market_data.types import OpenInterestSample
 from bot_btc_1hr_kalshi.monitor.position_monitor import PositionMonitor
 from bot_btc_1hr_kalshi.obs.activity import ActivityTracker
 from bot_btc_1hr_kalshi.obs.clock import Clock
@@ -65,6 +66,12 @@ class App:
     # shutdown path in `__main__.serve()` can `aclose()` it alongside
     # other async resources. None in dev / paper / shadow modes.
     kalshi_rest_client: httpx.AsyncClient | None = None
+    # Latest Coinglass open-interest sample (Slice 11 P2 — shadow). Polled
+    # on cadence; attached to outbound `MarketSnapshot` for optional trap
+    # consumption. None during warmup or when the poller is disabled.
+    # Not currently gating any signal — observation only pending a
+    # risk-committee promotion decision.
+    latest_open_interest: OpenInterestSample | None = None
     books: dict[str, L2Book] = field(default_factory=dict)
     trading_halted: bool = False
     tier1_override_active: bool = False

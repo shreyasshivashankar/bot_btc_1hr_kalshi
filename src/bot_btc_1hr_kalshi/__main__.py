@@ -27,6 +27,12 @@ import uvicorn
 from bot_btc_1hr_kalshi.admin.server import create_app as create_admin_app
 from bot_btc_1hr_kalshi.app import App
 from bot_btc_1hr_kalshi.archive.writer import ArchiveWriter
+from bot_btc_1hr_kalshi.calendar import (
+    CalendarGuard,
+    ForexFactoryRefresher,
+    ScheduledEvent,
+    load_calendar,
+)
 from bot_btc_1hr_kalshi.config.loader import load_settings
 from bot_btc_1hr_kalshi.config.settings import FeedSettings, Mode, Settings
 from bot_btc_1hr_kalshi.execution.broker.base import Broker
@@ -43,6 +49,7 @@ from bot_btc_1hr_kalshi.feedloop import (
     ws_connect_websockets,
 )
 from bot_btc_1hr_kalshi.market_data.bars import MultiTimeframeBus
+from bot_btc_1hr_kalshi.market_data.feeds.coinglass import CoinglassPoller
 from bot_btc_1hr_kalshi.market_data.feeds.kalshi import WSConnect
 from bot_btc_1hr_kalshi.market_data.feeds.spot import (
     SpotFeed,
@@ -54,6 +61,7 @@ from bot_btc_1hr_kalshi.market_data.feeds.spot import (
 from bot_btc_1hr_kalshi.market_data.feeds.staleness import StalenessTracker
 from bot_btc_1hr_kalshi.market_data.kalshi_rest import kalshi_date_header_probe
 from bot_btc_1hr_kalshi.market_data.spot_oracle import SpotOracle
+from bot_btc_1hr_kalshi.market_data.types import OpenInterestSample
 from bot_btc_1hr_kalshi.monitor.position_monitor import PositionMonitor
 from bot_btc_1hr_kalshi.obs.activity import ActivityTracker
 from bot_btc_1hr_kalshi.obs.clock import SystemClock
@@ -111,7 +119,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def _broker_for_mode(
-    mode: Mode, *, settings: Settings, clock: SystemClock,
+    mode: Mode,
+    *,
+    settings: Settings,
+    clock: SystemClock,
 ) -> tuple[Broker, httpx.AsyncClient | None]:
     """Select the broker for the given mode.
 
@@ -134,7 +145,9 @@ def _broker_for_mode(
 
 
 def _build_kalshi_broker(
-    *, settings: Settings, clock: SystemClock,
+    *,
+    settings: Settings,
+    clock: SystemClock,
 ) -> tuple[KalshiBroker, httpx.AsyncClient]:
     """Instantiate the live Kalshi REST broker from env-var-backed creds.
 
@@ -147,20 +160,22 @@ def _build_kalshi_broker(
     priv_path = os.getenv(KALSHI_PRIVATE_KEY_PATH_ENV)
     rest_url = _resolve_rest_url(settings.feeds.kalshi)
     missing = [
-        name for name, val in (
+        name
+        for name, val in (
             (KALSHI_API_KEY_ENV, api_key),
             (KALSHI_PRIVATE_KEY_PATH_ENV, priv_path),
             ("kalshi.rest_url (settings or env)", rest_url),
-        ) if not val
+        )
+        if not val
     ]
     if missing:
-        raise ValueError(
-            "live mode broker wiring requires: " + ", ".join(missing)
-        )
+        raise ValueError("live mode broker wiring requires: " + ", ".join(missing))
     # `missing` being empty means each of the three is set; narrow for mypy.
     pem_bytes = Path(cast(str, priv_path)).read_bytes()
     signer = KalshiSigner(
-        api_key_id=cast(str, api_key), private_key_pem=pem_bytes, clock=clock,
+        api_key_id=cast(str, api_key),
+        private_key_pem=pem_bytes,
+        clock=clock,
     )
     client = httpx.AsyncClient(base_url=cast(str, rest_url), timeout=10.0)
     broker = KalshiBroker(client=client, signer=signer, clock=clock)
@@ -183,7 +198,9 @@ def build_app(
     breakers = BreakerState(store=store)
     portfolio = Portfolio(bankroll_usd=bankroll)
     broker, kalshi_rest_client = _broker_for_mode(
-        mode, settings=settings, clock=clock,
+        mode,
+        settings=settings,
+        clock=clock,
     )
     lifecycle = LifecycleEmitter(clock=clock)
     activity = ActivityTracker(boot_ns=clock.now_ns())
@@ -241,6 +258,11 @@ async def serve(app: App, *, admin_token: str, host: str, port: int) -> None:
     feed_task: asyncio.Task[None] | None = None
     drift_task: asyncio.Task[None] | None = None
     spot_task: asyncio.Task[None] | None = None
+    calendar_task: asyncio.Task[None] | None = None
+    ff_refresh_task: asyncio.Task[None] | None = None
+    ff_client: httpx.AsyncClient | None = None
+    coinglass_task: asyncio.Task[None] | None = None
+    coinglass_client: httpx.AsyncClient | None = None
     rest_client: httpx.AsyncClient | None = None
 
     def _on_term() -> None:
@@ -250,20 +272,24 @@ async def serve(app: App, *, admin_token: str, host: str, port: int) -> None:
             trading_halted_before=app.trading_halted,
         )
         app.halt(reason="sigterm")
-        if feed_task is not None:
-            feed_task.cancel()
-        if drift_task is not None:
-            drift_task.cancel()
-        if spot_task is not None:
-            spot_task.cancel()
+        for t in (
+            feed_task,
+            drift_task,
+            spot_task,
+            calendar_task,
+            ff_refresh_task,
+            coinglass_task,
+        ):
+            if t is not None:
+                t.cancel()
         server.should_exit = True
 
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, _on_term)
 
-    feed_task, drift_task, spot_task, rest_client = _start_feed_loop_if_enabled(
-        app, log
-    )
+    feed_task, drift_task, spot_task, rest_client = _start_feed_loop_if_enabled(app, log)
+    calendar_task, ff_refresh_task, ff_client = _start_calendar_if_enabled(app, log)
+    coinglass_task, coinglass_client = _start_coinglass_if_enabled(app, log)
 
     # Supervise the background tasks. If any dies unexpectedly (not via
     # cancellation), the container must restart — silently running without
@@ -272,7 +298,11 @@ async def serve(app: App, *, admin_token: str, host: str, port: int) -> None:
     # exits. This matches the SpotOracle docstring's stated contract:
     # "if either one raises unexpectedly we want the App to crash so Cloud
     # Run restarts the container rather than silently running half-deaf."
-    def _make_supervisor(name: str) -> Callable[[asyncio.Task[None]], None]:
+    def _make_supervisor(
+        name: str,
+        *,
+        halt_on_death: bool = True,
+    ) -> Callable[[asyncio.Task[None]], None]:
         def _on_done(task: asyncio.Task[None]) -> None:
             if task.cancelled():
                 return
@@ -286,17 +316,28 @@ async def serve(app: App, *, admin_token: str, host: str, port: int) -> None:
                     error=str(exc),
                     exc_type=type(exc).__name__,
                 )
-            app.halt(reason=f"{name}_died")
-            server.should_exit = True
+            if halt_on_death:
+                app.halt(reason=f"{name}_died")
+                server.should_exit = True
+
         return _on_done
 
+    # Critical tasks: death of any halts the container (Cloud Run restarts).
     for name, task in (
         ("feed-loop", feed_task),
         ("clock-drift", drift_task),
         ("spot-oracle", spot_task),
+        ("calendar-guard", calendar_task),
+        ("forex-factory-refresh", ff_refresh_task),
     ):
         if task is not None:
             task.add_done_callback(_make_supervisor(name))
+    # Non-critical: Coinglass OI is observational (Slice 11 P2 shadow).
+    # Logging its death is sufficient — traps don't gate on OI yet, so
+    # a dead poller must not force a container restart (that would let
+    # a third-party API outage take the trading graph down with it).
+    if coinglass_task is not None:
+        coinglass_task.add_done_callback(_make_supervisor("coinglass-oi", halt_on_death=False))
 
     log.info("boot.serving", mode=app.settings.mode, host=host, port=port)
     try:
@@ -306,6 +347,9 @@ async def serve(app: App, *, admin_token: str, host: str, port: int) -> None:
             ("feed-loop", feed_task),
             ("clock-drift", drift_task),
             ("spot-oracle", spot_task),
+            ("calendar-guard", calendar_task),
+            ("forex-factory-refresh", ff_refresh_task),
+            ("coinglass-oi", coinglass_task),
         ):
             if task is None:
                 continue
@@ -316,6 +360,10 @@ async def serve(app: App, *, admin_token: str, host: str, port: int) -> None:
                 pass
             except Exception as exc:
                 log.warning("shutdown.task_error", task=name, error=str(exc))
+        if ff_client is not None:
+            await ff_client.aclose()
+        if coinglass_client is not None:
+            await coinglass_client.aclose()
         if rest_client is not None:
             await rest_client.aclose()
         if app.kalshi_rest_client is not None:
@@ -330,8 +378,176 @@ async def serve(app: App, *, admin_token: str, host: str, port: int) -> None:
             )
 
 
+def _start_calendar_if_enabled(
+    app: App,
+    log: Any,
+) -> tuple[
+    asyncio.Task[None] | None,
+    asyncio.Task[None] | None,
+    httpx.AsyncClient | None,
+]:
+    """Spin up the tier-1 guard loop + optional Forex Factory refresher.
+
+    Returns `(guard_tick_task, ff_refresh_task, ff_http_client)`. All are
+    None when calendar is effectively disabled (no YAML path AND no FF
+    fetch). The caller cancels tasks and closes the client on shutdown.
+
+    Design:
+    * Static YAML entries (operator-curated) have precedence on name
+      collisions with fetched FF entries — operators can override a
+      mis-scheduled FF print without editing upstream data.
+    * The guard's `_fired` ledger survives refreshes via
+      `replace_events`, so a re-fetched FOMC row does not re-fire.
+    """
+    settings = app.settings.calendar
+    # Static YAML path (optional — operator-curated entries).
+    static_events: tuple[ScheduledEvent, ...] = ()
+    if settings.path:
+        cfg_dir = Path.cwd() / "config"
+        cal_path = cfg_dir / settings.path
+        try:
+            static_events = load_calendar(cal_path)
+            log.info(
+                "boot.calendar_static_loaded",
+                path=str(cal_path),
+                count=len(static_events),
+            )
+        except (FileNotFoundError, ValueError) as exc:
+            log.error("boot.calendar_static_failed", path=str(cal_path), error=str(exc))
+            return None, None, None
+
+    fetch_enabled = settings.fetch_enabled and app.settings.mode in MODES_WITH_FEED_LOOP
+    if not static_events and not fetch_enabled:
+        log.info("boot.calendar_disabled", reason="no static path and FF fetch disabled")
+        return None, None, None
+
+    # Build the guard. `app.tier1_override()` is the single approved
+    # automatic trigger (hard rule #8: flatten winners AND losers).
+    async def _trigger() -> None:
+        outcomes = await app.tier1_override()
+        log.warning(
+            "calendar.tier1_flatten_executed",
+            outcome_count=len(outcomes),
+        )
+
+    guard = CalendarGuard(
+        clock=app.clock,
+        events=static_events,
+        trigger=_trigger,
+        lead_seconds=settings.lead_seconds,
+    )
+    static_names = frozenset(e.name for e in static_events)
+
+    async def _guard_loop() -> None:
+        while True:
+            await guard.tick()
+            await asyncio.sleep(settings.tick_interval_sec)
+
+    calendar_task = asyncio.create_task(_guard_loop(), name="calendar-guard")
+
+    ff_refresh_task: asyncio.Task[None] | None = None
+    ff_client: httpx.AsyncClient | None = None
+    if fetch_enabled:
+        ff_client = httpx.AsyncClient(timeout=10.0)
+
+        async def _on_refresh(events: tuple[ScheduledEvent, ...]) -> None:
+            # Static YAML entries override FF rows on name collision —
+            # operators may have corrected a stale FF schedule.
+            merged = list(static_events) + [e for e in events if e.name not in static_names]
+            guard.replace_events(merged)
+            log.info(
+                "calendar.refreshed",
+                static=len(static_events),
+                fetched=len(events),
+                merged=len(merged),
+            )
+
+        refresher = ForexFactoryRefresher(
+            client=ff_client,
+            on_refresh=_on_refresh,
+            url=settings.fetch_url,
+            interval_sec=settings.fetch_interval_sec,
+            tier_1_countries=settings.tier_1_countries,
+            tier_1_impacts=settings.tier_1_impacts,
+        )
+        ff_refresh_task = asyncio.create_task(
+            refresher.run(),
+            name="forex-factory-refresh",
+        )
+        log.info(
+            "boot.forex_factory_enabled",
+            url=settings.fetch_url,
+            interval_sec=settings.fetch_interval_sec,
+            countries=list(settings.tier_1_countries),
+            impacts=list(settings.tier_1_impacts),
+        )
+
+    return calendar_task, ff_refresh_task, ff_client
+
+
+def _start_coinglass_if_enabled(
+    app: App,
+    log: Any,
+) -> tuple[asyncio.Task[None] | None, httpx.AsyncClient | None]:
+    """Spin up the Coinglass OI poller (Slice 11 P2 — shadow).
+
+    Observational only: each sample is logged and stashed on
+    `App.latest_open_interest`, but traps do not gate on it yet. Gated
+    on the same `MODES_WITH_FEED_LOOP` set as the other feeds — dev
+    mode stays offline by default. The task supervisor treats this
+    poller the same as any other background task: an unexpected death
+    halts the app and lets Cloud Run restart it.
+    """
+    settings = app.settings.feeds.coinglass
+    if not settings.enabled:
+        log.info("boot.coinglass_disabled", reason="feeds.coinglass.enabled=false")
+        return None, None
+    if app.settings.mode not in MODES_WITH_FEED_LOOP:
+        log.info("boot.coinglass_skipped", mode=app.settings.mode)
+        return None, None
+
+    api_key = os.getenv(settings.api_key_env) or None
+    if not api_key:
+        log.warning(
+            "boot.coinglass_unkeyed",
+            note=(
+                f"{settings.api_key_env} not set; using free-tier unkeyed path "
+                "(stricter rate limits, may fail on shared IP)"
+            ),
+        )
+
+    client = httpx.AsyncClient(timeout=10.0)
+
+    async def _on_sample(sample: OpenInterestSample) -> None:
+        app.latest_open_interest = sample
+
+    poller = CoinglassPoller(
+        client=client,
+        clock=app.clock,
+        on_sample=_on_sample,
+        base_url=settings.base_url,
+        oi_path=settings.oi_path,
+        symbol=settings.symbol,
+        interval=settings.interval,
+        api_key=api_key,
+        poll_interval_sec=settings.poll_interval_sec,
+    )
+    task = asyncio.create_task(poller.run(), name="coinglass-oi")
+    log.info(
+        "boot.coinglass_enabled",
+        base_url=settings.base_url,
+        path=settings.oi_path,
+        symbol=settings.symbol,
+        interval=settings.interval,
+        poll_interval_sec=settings.poll_interval_sec,
+        keyed=bool(api_key),
+    )
+    return task, client
+
+
 def _start_feed_loop_if_enabled(
-    app: App, log: Any,
+    app: App,
+    log: Any,
 ) -> tuple[
     asyncio.Task[None] | None,
     asyncio.Task[None] | None,
@@ -358,12 +574,14 @@ def _start_feed_loop_if_enabled(
     series_ticker = os.getenv(SERIES_TICKER_ENV, "KXBTC")
 
     missing = [
-        name for name, val in (
+        name
+        for name, val in (
             ("kalshi.ws_url", kalshi_ws),
             ("kalshi.rest_url", rest_url),
             ("coinbase.ws_url", coinbase_ws),
             ("kraken.ws_url", kraken_ws),
-        ) if not val
+        )
+        if not val
     ]
     if missing or kalshi_ws is None or rest_url is None or coinbase_ws is None or kraken_ws is None:
         log.error("boot.feed_loop_missing_config", missing=missing)
@@ -505,9 +723,7 @@ def main(argv: list[str] | None = None) -> int:
     configure_logging(level="INFO", development=(ns.mode == "dev"))
 
     if ns.mode == "live" and os.getenv("RISK_COMMITTEE_SIGNED") != "yes":
-        sys.stderr.write(
-            "live mode requires RISK_COMMITTEE_SIGNED=yes (hard rule #2).\n"
-        )
+        sys.stderr.write("live mode requires RISK_COMMITTEE_SIGNED=yes (hard rule #2).\n")
         return 2
 
     token = os.getenv(ns.admin_token_env)

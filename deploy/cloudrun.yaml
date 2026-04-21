@@ -152,6 +152,19 @@ spec:
                 secretKeyRef:
                   name: BOT_BTC_1HR_KALSHI_ADMIN_TOKEN
                   key: latest
+            # Coinglass OI key (Slice 11 P2 — shadow). Optional: free-tier
+            # endpoints accept unkeyed requests with stricter rate limits,
+            # so missing-secret boots into unkeyed mode with a warning.
+            # Create the secret once before enabling the keyed path:
+            #   gcloud secrets create BOT_BTC_1HR_KALSHI_COINGLASS_API_KEY \
+            #     --replication-policy=automatic
+            #   echo -n "<key>" | gcloud secrets versions add \
+            #     BOT_BTC_1HR_KALSHI_COINGLASS_API_KEY --data-file=-
+            - name: BOT_BTC_1HR_KALSHI_COINGLASS_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: BOT_BTC_1HR_KALSHI_COINGLASS_API_KEY
+                  key: latest
 
           startupProbe:
             # /healthz, not /readyz: the startup probe answers "is uvicorn

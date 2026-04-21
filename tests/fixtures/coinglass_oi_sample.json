@@ -1,0 +1,18 @@
+{
+  "code": "0",
+  "msg": "success",
+  "data": [
+    {
+      "time": 1745236800000,
+      "aggregated_open_interest_usd": 58234567890.12,
+      "aggregated_open_interest": 1024571.34,
+      "exchange_count": 18
+    },
+    {
+      "time": 1745237100000,
+      "aggregated_open_interest_usd": 58300123456.78,
+      "aggregated_open_interest": 1025873.91,
+      "exchange_count": 18
+    }
+  ]
+}

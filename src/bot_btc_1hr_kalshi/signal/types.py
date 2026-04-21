@@ -5,12 +5,19 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from bot_btc_1hr_kalshi.market_data import L2Book
+from bot_btc_1hr_kalshi.market_data.types import OpenInterestSample
 from bot_btc_1hr_kalshi.obs.schemas import Features, Side, TrapName
 
 
 @dataclass(frozen=True, slots=True)
 class MarketSnapshot:
-    """Everything a trap needs to decide at a single point in time."""
+    """Everything a trap needs to decide at a single point in time.
+
+    `open_interest` is populated from the Coinglass poller (Slice 11 P2)
+    when available; traps treat it as *observational* until shadow-mode
+    data justifies a microstructure-gated entry. `None` is the
+    pre-wiring default and also the value during warmup / fetch failure.
+    """
 
     market_id: str
     book: L2Book
@@ -18,6 +25,7 @@ class MarketSnapshot:
     spot_btc_usd: float
     minutes_to_settlement: float
     strike_usd: float
+    open_interest: OpenInterestSample | None = None
 
 
 @dataclass(frozen=True, slots=True)

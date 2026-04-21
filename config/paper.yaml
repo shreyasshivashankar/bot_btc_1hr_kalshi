@@ -26,6 +26,20 @@ feeds:
   kraken:
     ws_url: wss://ws.kraken.com/v2
     staleness_halt_ms: 5000
+  # Coinglass open-interest poller (Slice 11 P2 — SHADOW mode only).
+  # Observational: samples are logged and attached to MarketSnapshot but
+  # no trap gates on OI yet. Pending paper-soak data + risk-committee
+  # review before promotion to an entry gate. A dead poller does NOT
+  # halt the container (non-critical supervisor) — third-party API
+  # outage must not take the trading graph down with it.
+  coinglass:
+    enabled: true
+    base_url: https://open-api-v4.coinglass.com
+    oi_path: /api/futures/open-interest/aggregated-history
+    symbol: BTC
+    interval: 5m
+    poll_interval_sec: 30.0
+    api_key_env: BOT_BTC_1HR_KALSHI_COINGLASS_API_KEY
 
 risk:
   # Sized for a $50 starter bankroll; bot restarts each session at $50 (see
@@ -93,3 +107,20 @@ integrity:
   velocity_window_sec: 1.0
   active_disagreement_floor_usd: 25.0   # noise floor; primary velocity below this is not "a move"
   stale_halt_sec: 60.0                  # fail-closed on broken confirmation feed
+
+calendar:
+  # Slice 11 P1 — Macro Blockers. Pull the US/High-impact print schedule
+  # from the Forex Factory community mirror (no auth, no code changes on
+  # schedule shifts). The pre-emptive flatten still fires at T-lead_seconds
+  # (hard rule #8 / RISK.md §6). Static YAML via `path:` takes precedence
+  # on name collisions — operators may override a stale FF entry without
+  # editing upstream data. 30min refresh: FF updates at most weekly; this
+  # is conservative but cheap. Widening `tier_1_impacts` beyond "High"
+  # requires risk-committee sign-off — medium-impact prints historically
+  # move BTC vol but not enough to justify a maker-only hour's flatten.
+  lead_seconds: 60.0
+  tick_interval_sec: 5.0
+  fetch_enabled: true
+  fetch_interval_sec: 1800.0
+  tier_1_countries: ["USD"]
+  tier_1_impacts: ["High"]

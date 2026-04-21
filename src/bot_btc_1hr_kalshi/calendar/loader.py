@@ -57,9 +57,7 @@ def _build_event(idx: int, entry: dict[str, Any]) -> ScheduledEvent:
         raise ValueError(f"events[{idx}] missing required key {e}") from e
 
     if importance not in _VALID_IMPORTANCES:
-        raise ValueError(
-            f"events[{idx}] importance {importance!r} not in {sorted(_VALID_IMPORTANCES)}"
-        )
+        raise ValueError(f"events[{idx}] importance {importance!r} not in {sorted(_VALID_IMPORTANCES)}")
 
     if isinstance(when, datetime):
         dt = when

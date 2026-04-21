@@ -87,4 +87,22 @@ class SpotTick:
         return self.price_micros / MICROS_PER_USD
 
 
+@dataclass(frozen=True, slots=True)
+class OpenInterestSample:
+    """Aggregated BTC-futures open-interest snapshot (Slice 11 P2 — shadow).
+
+    Sourced from Coinglass; *observed only* — not gating live signals yet.
+    Emitted as structured log records so a future promotion decision has
+    paper-soak data to lean on. Fields map directly onto the Coinglass v4
+    aggregated-open-interest payload so provenance is obvious in log
+    readers without round-tripping the raw response.
+    """
+
+    ts_ns: int
+    symbol: str
+    total_oi_usd: float
+    exchanges_count: int | None = None
+    source: str = "coinglass"
+
+
 FeedEvent = BookUpdate | TradeEvent | SpotTick
