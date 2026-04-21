@@ -20,6 +20,7 @@ Wire formats (public docs, as of 2026):
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from datetime import datetime
 from typing import Any
@@ -246,8 +247,25 @@ class SpotFeed:
                 async for tick in self._session():
                     backoff = self._backoff_initial
                     yield tick
-            except SessionEndedError as exc:
-                _log.warning(f"feed.{self._name}.reconnect", reason=str(exc), backoff_sec=backoff)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                # `_session` wraps connect errors into SessionEndedError but
+                # does NOT wrap errors raised during `async for raw in conn`
+                # iteration — e.g. websockets' ConnectionClosedError, OS
+                # errors, or a ping timeout. Without this broad catch those
+                # escape, the oracle's gather() propagates them, the spot
+                # task dies unsupervised, and the feed loop then logs
+                # `discovery_waiting_on_spot` forever. Treat every
+                # non-cancellation exception here as "session ended,
+                # reconnect with backoff" — matches the intent of the
+                # backoff loop.
+                _log.warning(
+                    f"feed.{self._name}.reconnect",
+                    reason=str(exc),
+                    exc_type=type(exc).__name__,
+                    backoff_sec=backoff,
+                )
                 await self._sleep(backoff)
                 backoff = min(self._backoff_max, backoff * 2.0)
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from typing import Any
 
 import orjson
 import pytest
@@ -290,6 +291,127 @@ async def test_spotfeed_coinbase_yields_ticks_and_sends_subscribe() -> None:
 
     assert conn.sent and b'"subscribe"' in conn.sent[0]
     assert st.last_msg_ns is not None
+
+
+class RaisingConn:
+    """Conn whose iteration raises a non-SessionEndedError once, then yields."""
+
+    def __init__(self, exc: Exception, recovery_frame: bytes) -> None:
+        self._exc = exc
+        self._recovery = recovery_frame
+        self._raised = False
+        self.sent: list[bytes | str] = []
+        self.closed = False
+
+    async def send(self, data: bytes | str) -> None:
+        self.sent.append(data)
+
+    def __aiter__(self) -> AsyncIterator[bytes]:
+        return self._iter()
+
+    async def _iter(self) -> AsyncIterator[bytes]:
+        if not self._raised:
+            self._raised = True
+            raise self._exc
+        yield self._recovery
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+async def test_spotfeed_recovers_from_non_session_exception() -> None:
+    """Regression: a non-SessionEndedError during WS iteration (e.g.
+    websockets.ConnectionClosedError) used to escape `events()`, killing
+    the generator. The SpotOracle's gather() then propagated it, the spot
+    task died unsupervised, and the feed loop logged
+    `discovery_waiting_on_spot` forever. The outer loop must treat any
+    non-cancellation exception as 'session ended, reconnect'."""
+    from bot_btc_1hr_kalshi.market_data.feeds.staleness import StalenessTracker
+
+    good_frame = orjson.dumps({
+        "type": "ticker", "product_id": "BTC-USD", "price": "60000",
+        "last_size": "0.1", "time": "2026-04-17T04:00:00Z",
+    })
+
+    class FakeConnectionClosedError(Exception):
+        pass
+
+    # Two sequential conns: first raises mid-iteration, second yields one tick.
+    conns = [
+        RaisingConn(FakeConnectionClosedError("ping timeout"), good_frame),
+        FakeConn([good_frame]),
+    ]
+    conn_iter = iter(conns)
+    clock = ManualClock(0)
+    st = StalenessTracker(name="coinbase", clock=clock, threshold_ms=2000)
+
+    async def connect(url: str) -> Any:
+        return next(conn_iter)
+
+    async def no_sleep(_: float) -> None:
+        return None
+
+    feed = SpotFeed(
+        name="coinbase",
+        ws_url="ws://fake",
+        clock=clock,
+        ws_connect=connect,  # type: ignore[arg-type]
+        staleness=st,
+        parse=coinbase_parser(clock),
+        subscribe=build_coinbase_subscribe(["BTC-USD"]),
+        sleep=no_sleep,
+    )
+
+    async for tick in feed.events():
+        assert tick.venue == "coinbase"
+        break
+    # First connection was attempted and failed; second succeeded.
+    assert conns[0].closed
+    assert conns[1].sent  # subscribe was re-sent on the reconnected session
+
+
+async def test_spotfeed_reraises_cancelled_error() -> None:
+    """Graceful shutdown must not be masked: task cancellation should
+    propagate through events() unchanged, never swallowed by the broad
+    reconnect handler."""
+    from bot_btc_1hr_kalshi.market_data.feeds.staleness import StalenessTracker
+
+    class CancellingConn:
+        def __init__(self) -> None:
+            self.sent: list[bytes | str] = []
+            self.closed = False
+
+        async def send(self, data: bytes | str) -> None:
+            pass
+
+        def __aiter__(self) -> AsyncIterator[bytes]:
+            return self._iter()
+
+        async def _iter(self) -> AsyncIterator[bytes]:
+            import asyncio as _asyncio
+            raise _asyncio.CancelledError()
+            yield b""  # pragma: no cover
+
+        async def close(self) -> None:
+            pass
+
+    import asyncio as _asyncio
+
+    clock = ManualClock(0)
+    st = StalenessTracker(name="coinbase", clock=clock, threshold_ms=2000)
+
+    async def connect(url: str) -> Any:
+        return CancellingConn()
+
+    feed = SpotFeed(
+        name="coinbase", ws_url="ws://fake", clock=clock,
+        ws_connect=connect,  # type: ignore[arg-type]
+        staleness=st, parse=coinbase_parser(clock), subscribe=None,
+    )
+
+    with pytest.raises(_asyncio.CancelledError):
+        async for _ in feed.events():
+            pass
 
 
 async def test_spotfeed_kraken_sends_v2_subscribe() -> None:

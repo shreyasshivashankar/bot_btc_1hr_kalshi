@@ -17,6 +17,7 @@ import asyncio
 import os
 import signal
 import sys
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, cast
 
@@ -263,6 +264,39 @@ async def serve(app: App, *, admin_token: str, host: str, port: int) -> None:
     feed_task, drift_task, spot_task, rest_client = _start_feed_loop_if_enabled(
         app, log
     )
+
+    # Supervise the background tasks. If any dies unexpectedly (not via
+    # cancellation), the container must restart — silently running without
+    # a spot oracle or feed loop produces zombie state (`discovery_waiting_on_spot`
+    # forever). Cloud Run's min=1 guarantees a fresh container when uvicorn
+    # exits. This matches the SpotOracle docstring's stated contract:
+    # "if either one raises unexpectedly we want the App to crash so Cloud
+    # Run restarts the container rather than silently running half-deaf."
+    def _make_supervisor(name: str) -> Callable[[asyncio.Task[None]], None]:
+        def _on_done(task: asyncio.Task[None]) -> None:
+            if task.cancelled():
+                return
+            exc = task.exception()
+            if exc is None:
+                log.error("boot.background_task_exited", task=name)
+            else:
+                log.error(
+                    "boot.background_task_died",
+                    task=name,
+                    error=str(exc),
+                    exc_type=type(exc).__name__,
+                )
+            app.halt(reason=f"{name}_died")
+            server.should_exit = True
+        return _on_done
+
+    for name, task in (
+        ("feed-loop", feed_task),
+        ("clock-drift", drift_task),
+        ("spot-oracle", spot_task),
+    ):
+        if task is not None:
+            task.add_done_callback(_make_supervisor(name))
 
     log.info("boot.serving", mode=app.settings.mode, host=host, port=port)
     try:

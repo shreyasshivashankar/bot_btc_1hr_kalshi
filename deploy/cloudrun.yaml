@@ -154,12 +154,21 @@ spec:
                   key: latest
 
           startupProbe:
+            # /healthz, not /readyz: the startup probe answers "is uvicorn
+            # up?" — that's the Cloud Run restart contract. /readyz gates
+            # on downstream feed health (Kalshi book populated, no breaker
+            # tripped), which is a slower chain (spot WS → discovery →
+            # Kalshi WS → first book snapshot) and doesn't fit the 2m5s
+            # probe budget on cold start. Feed-health readiness is covered
+            # separately by the livenessProbe on /healthz + app-level
+            # activity logs; a stuck feed shows up as
+            # feedloop.discovery_waiting_on_spot, not as a probe failure.
             httpGet:
-              path: /readyz
+              path: /healthz
               port: 8080
             initialDelaySeconds: 5
             periodSeconds: 5
-            failureThreshold: 24   # allow up to 2 min for all feeds to connect
+            failureThreshold: 24
           livenessProbe:
             httpGet:
               path: /healthz
