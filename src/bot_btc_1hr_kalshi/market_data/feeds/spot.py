@@ -20,7 +20,7 @@ Wire formats (public docs, as of 2026):
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from datetime import datetime
 from typing import Any
 
@@ -88,13 +88,18 @@ def parse_coinbase(raw: bytes | str, *, recv_ts_ns: int) -> SpotTick | None:
 
 
 def parse_kraken(raw: bytes | str, *, recv_ts_ns: int) -> SpotTick | None:
-    """Parse a Kraken V2 WS trade frame into a SpotTick.
+    """Parse a Kraken V2 WS frame (trade or ticker) into a SpotTick.
 
-    Kraken emits both the subscribe ack (`{"method":"subscribe","success":true}`)
-    and per-symbol snapshots (`type=="snapshot"`). Only `type=="update"` on
-    `channel=="trade"` produces ticks downstream; snapshots are Kraken's
-    "last trade at subscribe time" which we intentionally discard so the
-    velocity tracker doesn't latch onto a stale print.
+    We subscribe to both `trade` and `ticker`. Trades carry taker side and
+    size for CVD. Ticker carries `last` + bid/ask on every top-of-book
+    change — which on BTC/USD is 1-10 Hz even when actual prints are
+    sparse. This matters for the integrity gate (`signal/integrity.py`):
+    without ticker, a genuinely quiet BTC/USD trade channel on Kraken
+    can silence `record_confirmation` for minutes and trip the gate's
+    `stale_halt_sec` fail-closed branch even though the feed is
+    connected and correct. Ticker gives us a steady confirmation
+    heartbeat. Snapshot frames are still dropped so the velocity
+    tracker doesn't latch onto a stale subscribe-time value.
     """
     try:
         data = orjson.loads(raw)
@@ -102,10 +107,19 @@ def parse_kraken(raw: bytes | str, *, recv_ts_ns: int) -> SpotTick | None:
         raise SpotParseError(f"invalid JSON: {exc}") from exc
     if not isinstance(data, dict):
         raise SpotParseError("frame is not an object")
-    if data.get("channel") != "trade":
-        return None
     if data.get("type") != "update":
         return None
+    channel = data.get("channel")
+    if channel == "trade":
+        return _parse_kraken_trade(data, recv_ts_ns=recv_ts_ns)
+    if channel == "ticker":
+        return _parse_kraken_ticker(data, recv_ts_ns=recv_ts_ns)
+    return None
+
+
+def _parse_kraken_trade(
+    data: dict[str, Any], *, recv_ts_ns: int
+) -> SpotTick | None:
     items = data.get("data")
     if not isinstance(items, list) or not items:
         return None
@@ -135,15 +149,56 @@ def parse_kraken(raw: bytes | str, *, recv_ts_ns: int) -> SpotTick | None:
     )
 
 
+def _parse_kraken_ticker(
+    data: dict[str, Any], *, recv_ts_ns: int
+) -> SpotTick | None:
+    items = data.get("data")
+    if not isinstance(items, list) or not items:
+        return None
+    last = items[-1]
+    if not isinstance(last, dict):
+        raise SpotParseError("ticker entry is not an object")
+    try:
+        price = float(last["last"])
+    except (KeyError, ValueError, TypeError) as exc:
+        raise SpotParseError(f"missing ticker last price: {exc}") from exc
+    # Ticker frames are liveness-only for our purposes — no taker side,
+    # no trade size. Clock stamps at receive time since Kraken ticker
+    # frames don't carry a per-update timestamp.
+    return SpotTick(
+        ts_ns=recv_ts_ns,
+        venue="kraken",
+        price_micros=usd_to_micros(price),
+        size=0.0,
+        aggressor=None,
+    )
+
+
 def build_coinbase_subscribe(product_ids: list[str]) -> bytes:
     return orjson.dumps(
         {"type": "subscribe", "product_ids": product_ids, "channels": ["ticker"]}
     )
 
 
-def build_kraken_subscribe(symbols: list[str]) -> bytes:
-    return orjson.dumps(
-        {"method": "subscribe", "params": {"channel": "trade", "symbol": symbols}}
+def build_kraken_subscribe(symbols: list[str]) -> tuple[bytes, ...]:
+    # Two separate WS frames — Kraken V2 subscribes one channel at a
+    # time. `trade` carries taker side + size for CVD; `ticker` updates
+    # on every top-of-book change and provides the reliable confirmation
+    # liveness the integrity gate needs (trades alone can be sparse on
+    # quieter BTC pairs, tripping `stale_halt_sec` on a healthy feed).
+    return (
+        orjson.dumps(
+            {
+                "method": "subscribe",
+                "params": {"channel": "trade", "symbol": symbols},
+            }
+        ),
+        orjson.dumps(
+            {
+                "method": "subscribe",
+                "params": {"channel": "ticker", "symbol": symbols},
+            }
+        ),
     )
 
 
@@ -162,7 +217,7 @@ class SpotFeed:
         ws_connect: WSConnect,
         staleness: StalenessTracker,
         parse: Callable[[bytes | str], SpotTick | None],
-        subscribe: bytes | None = None,
+        subscribe: bytes | Sequence[bytes] | None = None,
         backoff_initial_sec: float = 1.0,
         backoff_max_sec: float = 30.0,
         sleep: Callable[[float], Awaitable[Any]] | None = None,
@@ -173,7 +228,13 @@ class SpotFeed:
         self._connect = ws_connect
         self._staleness = staleness
         self._parse = parse
-        self._subscribe_frame = subscribe
+        # Normalize to a tuple: one WS send() per frame on session start.
+        if subscribe is None:
+            self._subscribe_frames: tuple[bytes, ...] = ()
+        elif isinstance(subscribe, bytes):
+            self._subscribe_frames = (subscribe,)
+        else:
+            self._subscribe_frames = tuple(subscribe)
         self._backoff_initial = backoff_initial_sec
         self._backoff_max = backoff_max_sec
         self._sleep = sleep or _default_sleep
@@ -197,8 +258,8 @@ class SpotFeed:
             raise SessionEndedError(f"connect_failed:{exc}") from exc
 
         try:
-            if self._subscribe_frame is not None:
-                await conn.send(self._subscribe_frame)
+            for frame in self._subscribe_frames:
+                await conn.send(frame)
             async for raw in conn:
                 self._staleness.mark()
                 try:

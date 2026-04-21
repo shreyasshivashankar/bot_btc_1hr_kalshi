@@ -147,6 +147,51 @@ def test_kraken_subscribe_ack_ignored() -> None:
     assert parse_kraken(frame, recv_ts_ns=RECV_NS) is None
 
 
+def test_kraken_ticker_update_parses_as_liveness_tick() -> None:
+    """Ticker frames are the confirmation-liveness workhorse — they arrive
+    on every top-of-book change. We use `last` as the tick price, stamp
+    recv-time (Kraken ticker has no per-update timestamp), and emit with
+    size=0 / aggressor=None so CVD accumulators correctly ignore them."""
+    frame = orjson.dumps({
+        "channel": "ticker",
+        "type": "update",
+        "data": [{
+            "symbol": "BTC/USD",
+            "bid": 60000.1, "bid_qty": 1.5,
+            "ask": 60000.5, "ask_qty": 2.0,
+            "last": 60000.3,
+            "volume": 1234.5,
+        }],
+    })
+    tick = parse_kraken(frame, recv_ts_ns=RECV_NS)
+    assert isinstance(tick, SpotTick)
+    assert tick.venue == "kraken"
+    assert tick.ts_ns == RECV_NS
+    assert tick.size == 0.0
+    assert tick.aggressor is None
+
+
+def test_kraken_ticker_snapshot_ignored() -> None:
+    """Like trade snapshots, ticker snapshots are subscribe-time state and
+    shouldn't latch the velocity tracker onto a pre-subscribe price."""
+    frame = orjson.dumps({
+        "channel": "ticker",
+        "type": "snapshot",
+        "data": [{"symbol": "BTC/USD", "last": 60000, "bid": 59999, "ask": 60001}],
+    })
+    assert parse_kraken(frame, recv_ts_ns=RECV_NS) is None
+
+
+def test_kraken_ticker_missing_last_raises() -> None:
+    frame = orjson.dumps({
+        "channel": "ticker",
+        "type": "update",
+        "data": [{"symbol": "BTC/USD", "bid": 60000, "ask": 60001}],
+    })
+    with pytest.raises(SpotParseError):
+        parse_kraken(frame, recv_ts_ns=RECV_NS)
+
+
 def test_kraken_missing_fields_raises() -> None:
     frame = orjson.dumps({
         "channel": "trade",
@@ -175,11 +220,19 @@ def test_build_coinbase_subscribe_shape() -> None:
 
 
 def test_build_kraken_subscribe_shape() -> None:
-    raw = build_kraken_subscribe(["BTC/USD"])
-    data = orjson.loads(raw)
-    assert data == {
+    """Kraken V2 subscribes one channel per frame, so the helper returns a
+    tuple: the trade frame (CVD-bearing taker info) followed by the ticker
+    frame (reliable confirmation liveness)."""
+    frames = build_kraken_subscribe(["BTC/USD"])
+    assert isinstance(frames, tuple)
+    assert len(frames) == 2
+    assert orjson.loads(frames[0]) == {
         "method": "subscribe",
         "params": {"channel": "trade", "symbol": ["BTC/USD"]},
+    }
+    assert orjson.loads(frames[1]) == {
+        "method": "subscribe",
+        "params": {"channel": "ticker", "symbol": ["BTC/USD"]},
     }
 
 
@@ -270,4 +323,8 @@ async def test_spotfeed_kraken_sends_v2_subscribe() -> None:
     async for tick in feed.events():
         assert tick.venue == "kraken"
         break
-    assert conn.sent and b'"subscribe"' in conn.sent[0]
+    # Both trade + ticker subscriptions must hit the wire — ticker is the
+    # one that keeps the integrity gate's confirmation liveness fresh.
+    assert len(conn.sent) == 2
+    assert b'"channel":"trade"' in conn.sent[0]
+    assert b'"channel":"ticker"' in conn.sent[1]
