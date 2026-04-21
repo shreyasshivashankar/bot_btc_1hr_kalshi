@@ -103,10 +103,21 @@ class OMS:
             kelly_fraction=self._risk.kelly_fraction,
             bankroll_usd=self._portfolio.bankroll_usd,
             max_notional_usd=self._risk.max_position_notional_usd,
+            inverted_risk_threshold_cents=self._risk.inverted_risk_threshold_cents,
+            inverted_risk_kelly_multiplier=self._risk.inverted_risk_kelly_multiplier,
         )
 
+        # Record the EFFECTIVE fractional Kelly after the inverted-risk clip
+        # (Slice 11 Phase 3.2): the decision journal now reflects what was
+        # actually applied, so tuning queries can correlate clip-triggered
+        # outcomes vs unclipped ones without reconstructing the rule from
+        # settings at emit time.
+        effective_kelly_fraction = self._risk.kelly_fraction
+        if signal.entry_price_cents >= self._risk.inverted_risk_threshold_cents:
+            effective_kelly_fraction *= self._risk.inverted_risk_kelly_multiplier
+
         sizing = Sizing(
-            kelly_fraction=self._risk.kelly_fraction,
+            kelly_fraction=effective_kelly_fraction,
             edge_cents=signal.edge_cents,
             variance_estimate=_binary_variance(signal.entry_price_cents),
             notional_usd=sized * signal.entry_price_cents / 100.0,

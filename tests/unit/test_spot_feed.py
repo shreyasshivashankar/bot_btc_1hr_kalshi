@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from typing import Any
 
 import orjson
 import pytest
@@ -147,6 +148,51 @@ def test_kraken_subscribe_ack_ignored() -> None:
     assert parse_kraken(frame, recv_ts_ns=RECV_NS) is None
 
 
+def test_kraken_ticker_update_parses_as_liveness_tick() -> None:
+    """Ticker frames are the confirmation-liveness workhorse — they arrive
+    on every top-of-book change. We use `last` as the tick price, stamp
+    recv-time (Kraken ticker has no per-update timestamp), and emit with
+    size=0 / aggressor=None so CVD accumulators correctly ignore them."""
+    frame = orjson.dumps({
+        "channel": "ticker",
+        "type": "update",
+        "data": [{
+            "symbol": "BTC/USD",
+            "bid": 60000.1, "bid_qty": 1.5,
+            "ask": 60000.5, "ask_qty": 2.0,
+            "last": 60000.3,
+            "volume": 1234.5,
+        }],
+    })
+    tick = parse_kraken(frame, recv_ts_ns=RECV_NS)
+    assert isinstance(tick, SpotTick)
+    assert tick.venue == "kraken"
+    assert tick.ts_ns == RECV_NS
+    assert tick.size == 0.0
+    assert tick.aggressor is None
+
+
+def test_kraken_ticker_snapshot_ignored() -> None:
+    """Like trade snapshots, ticker snapshots are subscribe-time state and
+    shouldn't latch the velocity tracker onto a pre-subscribe price."""
+    frame = orjson.dumps({
+        "channel": "ticker",
+        "type": "snapshot",
+        "data": [{"symbol": "BTC/USD", "last": 60000, "bid": 59999, "ask": 60001}],
+    })
+    assert parse_kraken(frame, recv_ts_ns=RECV_NS) is None
+
+
+def test_kraken_ticker_missing_last_raises() -> None:
+    frame = orjson.dumps({
+        "channel": "ticker",
+        "type": "update",
+        "data": [{"symbol": "BTC/USD", "bid": 60000, "ask": 60001}],
+    })
+    with pytest.raises(SpotParseError):
+        parse_kraken(frame, recv_ts_ns=RECV_NS)
+
+
 def test_kraken_missing_fields_raises() -> None:
     frame = orjson.dumps({
         "channel": "trade",
@@ -175,11 +221,19 @@ def test_build_coinbase_subscribe_shape() -> None:
 
 
 def test_build_kraken_subscribe_shape() -> None:
-    raw = build_kraken_subscribe(["BTC/USD"])
-    data = orjson.loads(raw)
-    assert data == {
+    """Kraken V2 subscribes one channel per frame, so the helper returns a
+    tuple: the trade frame (CVD-bearing taker info) followed by the ticker
+    frame (reliable confirmation liveness)."""
+    frames = build_kraken_subscribe(["BTC/USD"])
+    assert isinstance(frames, tuple)
+    assert len(frames) == 2
+    assert orjson.loads(frames[0]) == {
         "method": "subscribe",
         "params": {"channel": "trade", "symbol": ["BTC/USD"]},
+    }
+    assert orjson.loads(frames[1]) == {
+        "method": "subscribe",
+        "params": {"channel": "ticker", "symbol": ["BTC/USD"]},
     }
 
 
@@ -239,6 +293,127 @@ async def test_spotfeed_coinbase_yields_ticks_and_sends_subscribe() -> None:
     assert st.last_msg_ns is not None
 
 
+class RaisingConn:
+    """Conn whose iteration raises a non-SessionEndedError once, then yields."""
+
+    def __init__(self, exc: Exception, recovery_frame: bytes) -> None:
+        self._exc = exc
+        self._recovery = recovery_frame
+        self._raised = False
+        self.sent: list[bytes | str] = []
+        self.closed = False
+
+    async def send(self, data: bytes | str) -> None:
+        self.sent.append(data)
+
+    def __aiter__(self) -> AsyncIterator[bytes]:
+        return self._iter()
+
+    async def _iter(self) -> AsyncIterator[bytes]:
+        if not self._raised:
+            self._raised = True
+            raise self._exc
+        yield self._recovery
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+async def test_spotfeed_recovers_from_non_session_exception() -> None:
+    """Regression: a non-SessionEndedError during WS iteration (e.g.
+    websockets.ConnectionClosedError) used to escape `events()`, killing
+    the generator. The SpotOracle's gather() then propagated it, the spot
+    task died unsupervised, and the feed loop logged
+    `discovery_waiting_on_spot` forever. The outer loop must treat any
+    non-cancellation exception as 'session ended, reconnect'."""
+    from bot_btc_1hr_kalshi.market_data.feeds.staleness import StalenessTracker
+
+    good_frame = orjson.dumps({
+        "type": "ticker", "product_id": "BTC-USD", "price": "60000",
+        "last_size": "0.1", "time": "2026-04-17T04:00:00Z",
+    })
+
+    class FakeConnectionClosedError(Exception):
+        pass
+
+    # Two sequential conns: first raises mid-iteration, second yields one tick.
+    conns = [
+        RaisingConn(FakeConnectionClosedError("ping timeout"), good_frame),
+        FakeConn([good_frame]),
+    ]
+    conn_iter = iter(conns)
+    clock = ManualClock(0)
+    st = StalenessTracker(name="coinbase", clock=clock, threshold_ms=2000)
+
+    async def connect(url: str) -> Any:
+        return next(conn_iter)
+
+    async def no_sleep(_: float) -> None:
+        return None
+
+    feed = SpotFeed(
+        name="coinbase",
+        ws_url="ws://fake",
+        clock=clock,
+        ws_connect=connect,  # type: ignore[arg-type]
+        staleness=st,
+        parse=coinbase_parser(clock),
+        subscribe=build_coinbase_subscribe(["BTC-USD"]),
+        sleep=no_sleep,
+    )
+
+    async for tick in feed.events():
+        assert tick.venue == "coinbase"
+        break
+    # First connection was attempted and failed; second succeeded.
+    assert conns[0].closed
+    assert conns[1].sent  # subscribe was re-sent on the reconnected session
+
+
+async def test_spotfeed_reraises_cancelled_error() -> None:
+    """Graceful shutdown must not be masked: task cancellation should
+    propagate through events() unchanged, never swallowed by the broad
+    reconnect handler."""
+    from bot_btc_1hr_kalshi.market_data.feeds.staleness import StalenessTracker
+
+    class CancellingConn:
+        def __init__(self) -> None:
+            self.sent: list[bytes | str] = []
+            self.closed = False
+
+        async def send(self, data: bytes | str) -> None:
+            pass
+
+        def __aiter__(self) -> AsyncIterator[bytes]:
+            return self._iter()
+
+        async def _iter(self) -> AsyncIterator[bytes]:
+            import asyncio as _asyncio
+            raise _asyncio.CancelledError()
+            yield b""  # pragma: no cover
+
+        async def close(self) -> None:
+            pass
+
+    import asyncio as _asyncio
+
+    clock = ManualClock(0)
+    st = StalenessTracker(name="coinbase", clock=clock, threshold_ms=2000)
+
+    async def connect(url: str) -> Any:
+        return CancellingConn()
+
+    feed = SpotFeed(
+        name="coinbase", ws_url="ws://fake", clock=clock,
+        ws_connect=connect,  # type: ignore[arg-type]
+        staleness=st, parse=coinbase_parser(clock), subscribe=None,
+    )
+
+    with pytest.raises(_asyncio.CancelledError):
+        async for _ in feed.events():
+            pass
+
+
 async def test_spotfeed_kraken_sends_v2_subscribe() -> None:
     from bot_btc_1hr_kalshi.market_data.feeds.staleness import StalenessTracker
 
@@ -270,4 +445,8 @@ async def test_spotfeed_kraken_sends_v2_subscribe() -> None:
     async for tick in feed.events():
         assert tick.venue == "kraken"
         break
-    assert conn.sent and b'"subscribe"' in conn.sent[0]
+    # Both trade + ticker subscriptions must hit the wire — ticker is the
+    # one that keeps the integrity gate's confirmation liveness fresh.
+    assert len(conn.sent) == 2
+    assert b'"channel":"trade"' in conn.sent[0]
+    assert b'"channel":"ticker"' in conn.sent[1]

@@ -115,6 +115,82 @@ async def test_consider_entry_rejects_when_kelly_sizes_zero() -> None:
     assert result.decision.reject_reason == "zero_contracts"
 
 
+async def test_consider_entry_applies_inverted_risk_clip_at_60c() -> None:
+    """Slice 11 Phase 3.2 end-to-end: a 60¢ entry with clip enabled sizes
+    smaller than the same 60¢ entry with clip disabled. Proves the two
+    new RiskSettings fields are threaded through consider_entry into
+    kelly_contracts — unit tests of kelly_contracts alone can't catch a
+    regression where OMS forgets to pass the kwargs.
+
+    Uses a dedicated 60¢ book so the resulting maker order can actually
+    rest; entry_price below the premium cap (75¢) so Phase 3.1 doesn't
+    intercept first; bankroll large enough to leave Kelly unconstrained
+    by the per-position notional cap so the multiplier effect dominates."""
+    market = "KBTC-26APR1600-B60500"
+    book = L2Book(market)
+    book.apply(
+        BookUpdate(
+            seq=1,
+            ts_ns=1_000,
+            market_id=market,
+            bids=(BookLevel(59, 200),),
+            asks=(BookLevel(61, 200),),
+            is_snapshot=True,
+        )
+    )
+
+    def _build(multiplier: float) -> OMS:
+        clock = ManualClock(5_000)
+        broker = PaperBroker(clock=clock)
+        broker.register_book(book)
+        return OMS(
+            broker=broker,
+            portfolio=Portfolio(bankroll_usd=10_000.0),
+            breakers=BreakerState(),
+            risk_settings=RiskSettings(
+                kelly_fraction=0.25,
+                max_position_notional_usd=10_000.0,  # unconstrained — let Kelly speak
+                max_daily_loss_pct=0.05,
+                inverted_risk_threshold_cents=50,
+                inverted_risk_kelly_multiplier=multiplier,
+            ),
+            min_signal_confidence=0.5,
+            clock=clock,
+        )
+
+    signal_60c = TrapSignal(
+        trap="floor_reversion",
+        side="YES",
+        entry_price_cents=60,
+        confidence=0.8,
+        edge_cents=8.0,
+        features=Features(
+            regime_trend="flat",
+            regime_vol="normal",
+            signal_confidence=0.8,
+            bollinger_pct_b=-0.9,
+            atr_cents=10.0,
+            book_depth_at_entry=200.0,
+            spread_cents=2,
+            spot_btc_usd=60_000.0,
+            minutes_to_settlement=30.0,
+        ),
+    )
+
+    unclipped_oms = _build(multiplier=1.0)
+    clipped_oms = _build(multiplier=0.5)
+
+    unclipped = await unclipped_oms.consider_entry(signal=signal_60c, market_id=market)
+    clipped = await clipped_oms.consider_entry(signal=signal_60c, market_id=market)
+
+    assert unclipped.decision.approved and clipped.decision.approved
+    assert clipped.decision.sizing.contracts < unclipped.decision.sizing.contracts
+    # Recorded Kelly fraction reflects the effective (clipped) allocation,
+    # not the raw setting — journal readers can diff to detect clip firings.
+    assert clipped.decision.sizing.kelly_fraction == pytest.approx(0.25 * 0.5)
+    assert unclipped.decision.sizing.kelly_fraction == pytest.approx(0.25)
+
+
 async def test_full_lifecycle_entry_fill_exit_emits_outcome() -> None:
     oms, broker, portfolio, _book, _b, clock = _oms()
     result = await oms.consider_entry(signal=_signal(), market_id=MARKET)
@@ -167,14 +243,20 @@ async def test_exit_client_order_id_is_nonced() -> None:
     assert res.position_id is not None
     clock.advance_ns(1_000_000)
     trade = TradeEvent(
-        seq=2, ts_ns=clock.now_ns(), market_id=MARKET,
-        price_cents=29, size=res.decision.sizing.contracts,
-        aggressor="sell", taker_side="YES",
+        seq=2,
+        ts_ns=clock.now_ns(),
+        market_id=MARKET,
+        price_cents=29,
+        size=res.decision.sizing.contracts,
+        aggressor="sell",
+        taker_side="YES",
     )
     fills = await broker.match_trade(trade)
     oms.on_entry_fill(
-        decision_id=res.decision.decision_id, fill=fills[0],
-        trap=res.decision.trap, features_at_entry=res.decision.features,
+        decision_id=res.decision.decision_id,
+        fill=fills[0],
+        trap=res.decision.trap,
+        features_at_entry=res.decision.features,
     )
 
     submitted: list[OrderRequest] = []
@@ -209,29 +291,41 @@ async def test_submit_exit_partial_fill_shrinks_position_and_emits_partial_outco
     assert res.position_id is not None
     clock.advance_ns(1_000_000)
     trade = TradeEvent(
-        seq=2, ts_ns=clock.now_ns(), market_id=MARKET,
-        price_cents=29, size=res.decision.sizing.contracts,
-        aggressor="sell", taker_side="YES",
+        seq=2,
+        ts_ns=clock.now_ns(),
+        market_id=MARKET,
+        price_cents=29,
+        size=res.decision.sizing.contracts,
+        aggressor="sell",
+        taker_side="YES",
     )
     fills = await broker.match_trade(trade)
     oms.on_entry_fill(
-        decision_id=res.decision.decision_id, fill=fills[0],
-        trap=res.decision.trap, features_at_entry=res.decision.features,
+        decision_id=res.decision.decision_id,
+        fill=fills[0],
+        trap=res.decision.trap,
+        features_at_entry=res.decision.features,
     )
     contracts = res.decision.sizing.contracts
     assert contracts >= 10  # sanity — test depends on this
 
     # Thin the book: only 1 contract available at the 28 bid for YES exit.
-    book.apply(BookUpdate(
-        seq=3, ts_ns=clock.now_ns(), market_id=MARKET,
-        bids=(BookLevel(28, 1),),
-        asks=(BookLevel(32, 200),),
-        is_snapshot=True,
-    ))
+    book.apply(
+        BookUpdate(
+            seq=3,
+            ts_ns=clock.now_ns(),
+            market_id=MARKET,
+            bids=(BookLevel(28, 1),),
+            asks=(BookLevel(32, 200),),
+            is_snapshot=True,
+        )
+    )
 
     clock.advance_ns(60_000_000_000)
     exit_result = await oms.submit_exit(
-        position_id=res.position_id, limit_price_cents=28, exit_reason="soft_stop",
+        position_id=res.position_id,
+        limit_price_cents=28,
+        exit_reason="soft_stop",
     )
     assert exit_result.ack.status == "partially_filled"
     assert exit_result.bet_outcome is not None
@@ -251,26 +345,40 @@ async def test_submit_exit_rejected_does_not_mutate_portfolio() -> None:
     assert res.position_id is not None
     clock.advance_ns(1_000_000)
     trade = TradeEvent(
-        seq=2, ts_ns=clock.now_ns(), market_id=MARKET,
-        price_cents=29, size=res.decision.sizing.contracts,
-        aggressor="sell", taker_side="YES",
+        seq=2,
+        ts_ns=clock.now_ns(),
+        market_id=MARKET,
+        price_cents=29,
+        size=res.decision.sizing.contracts,
+        aggressor="sell",
+        taker_side="YES",
     )
     fills = await broker.match_trade(trade)
     oms.on_entry_fill(
-        decision_id=res.decision.decision_id, fill=fills[0],
-        trap=res.decision.trap, features_at_entry=res.decision.features,
+        decision_id=res.decision.decision_id,
+        fill=fills[0],
+        trap=res.decision.trap,
+        features_at_entry=res.decision.features,
     )
     contracts_before = portfolio.get(res.position_id).contracts  # type: ignore[union-attr]
 
     # Force a rejection: empty the book so the broker returns status=cancelled
     # (IOC with no liquidity produces no fills and is cancelled).
-    book.apply(BookUpdate(
-        seq=3, ts_ns=clock.now_ns(), market_id=MARKET,
-        bids=(), asks=(BookLevel(32, 200),), is_snapshot=True,
-    ))
+    book.apply(
+        BookUpdate(
+            seq=3,
+            ts_ns=clock.now_ns(),
+            market_id=MARKET,
+            bids=(),
+            asks=(BookLevel(32, 200),),
+            is_snapshot=True,
+        )
+    )
     clock.advance_ns(60_000_000_000)
     exit_result = await oms.submit_exit(
-        position_id=res.position_id, limit_price_cents=28, exit_reason="soft_stop",
+        position_id=res.position_id,
+        limit_price_cents=28,
+        exit_reason="soft_stop",
     )
     assert exit_result.ack.status in ("cancelled", "rejected")
     assert exit_result.bet_outcome is None
@@ -299,10 +407,28 @@ def test_aggregate_sell_fill_uses_round_half_up_not_bankers() -> None:
     # 50 @ 40¢ + 50 @ 41¢ → notional = 4050¢, total = 100 → exactly 40.5¢.
     # round() gives 40 (banker's), round-half-up gives 41.
     fills = (
-        Fill(order_id="o", client_order_id="c", market_id="M", side="YES",
-             action="SELL", price_cents=40, contracts=50, ts_ns=100, fees_usd=0.0),
-        Fill(order_id="o", client_order_id="c", market_id="M", side="YES",
-             action="SELL", price_cents=41, contracts=50, ts_ns=200, fees_usd=0.0),
+        Fill(
+            order_id="o",
+            client_order_id="c",
+            market_id="M",
+            side="YES",
+            action="SELL",
+            price_cents=40,
+            contracts=50,
+            ts_ns=100,
+            fees_usd=0.0,
+        ),
+        Fill(
+            order_id="o",
+            client_order_id="c",
+            market_id="M",
+            side="YES",
+            action="SELL",
+            price_cents=41,
+            contracts=50,
+            ts_ns=200,
+            fees_usd=0.0,
+        ),
     )
     agg = _aggregate_sell_fill(fills)
     assert agg.price_cents == 41
@@ -317,12 +443,39 @@ def test_aggregate_sell_fill_sums_fees_and_contracts() -> None:
     from bot_btc_1hr_kalshi.execution.oms import _aggregate_sell_fill
 
     fills = (
-        Fill(order_id="o", client_order_id="c", market_id="M", side="YES",
-             action="SELL", price_cents=30, contracts=10, ts_ns=1, fees_usd=0.10),
-        Fill(order_id="o", client_order_id="c", market_id="M", side="YES",
-             action="SELL", price_cents=31, contracts=20, ts_ns=2, fees_usd=0.20),
-        Fill(order_id="o", client_order_id="c", market_id="M", side="YES",
-             action="SELL", price_cents=32, contracts=30, ts_ns=3, fees_usd=0.30),
+        Fill(
+            order_id="o",
+            client_order_id="c",
+            market_id="M",
+            side="YES",
+            action="SELL",
+            price_cents=30,
+            contracts=10,
+            ts_ns=1,
+            fees_usd=0.10,
+        ),
+        Fill(
+            order_id="o",
+            client_order_id="c",
+            market_id="M",
+            side="YES",
+            action="SELL",
+            price_cents=31,
+            contracts=20,
+            ts_ns=2,
+            fees_usd=0.20,
+        ),
+        Fill(
+            order_id="o",
+            client_order_id="c",
+            market_id="M",
+            side="YES",
+            action="SELL",
+            price_cents=32,
+            contracts=30,
+            ts_ns=3,
+            fees_usd=0.30,
+        ),
     )
     agg = _aggregate_sell_fill(fills)
     assert agg.contracts == 60

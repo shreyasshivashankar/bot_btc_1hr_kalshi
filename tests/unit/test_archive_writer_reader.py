@@ -135,6 +135,36 @@ def test_reader_skips_malformed_line_but_continues(tmp_path: Path) -> None:
     assert len(events) == 2
 
 
+def test_writer_recovers_when_fh_closed_mid_hour(tmp_path: Path) -> None:
+    """Regression: GCS-FUSE can close the fh mid-hour (CSI driver remount,
+    transient upload stall). Before the fix the writer kept calling
+    fh.write() on the dead handle every tick, spamming
+    `feedloop.archive_write_error` at feed rate. The fix clears _fh on
+    write exception so the next call triggers a fresh _roll_to."""
+    h0 = _hour_ns(2026, 4, 17, 15)
+    w = ArchiveWriter(tmp_path)
+    try:
+        w.write(_book(h0 + 1))
+        # Simulate GCS-FUSE closing the underlying file handle out from
+        # under us, mid-hour, no exception until the next write.
+        assert w._fh is not None
+        w._fh.close()
+        import pytest
+        with pytest.raises(ValueError):
+            w.write(_book(h0 + 2, seq=2))
+        # Internal state must be cleared so the next write reopens cleanly.
+        assert w._fh is None
+        assert w._current_hour is None
+        # Next write succeeds against a freshly reopened (append) file.
+        w.write(_book(h0 + 3, seq=3))
+    finally:
+        w.close()
+    events = [e for e in iter_archive(tmp_path) if isinstance(e, BookUpdate)]
+    # seq=1 landed on disk before close(); seq=2 was lost with the dead
+    # handle; seq=3 landed after recovery.
+    assert [e.seq for e in events] == [1, 3]
+
+
 def test_reader_ignores_unrelated_files(tmp_path: Path) -> None:
     h0 = _hour_ns(2026, 4, 17, 15)
     with ArchiveWriter(tmp_path) as w:

@@ -69,7 +69,16 @@ class ArchiveWriter:
         fh = self._fh
         if fh is None:  # pragma: no cover — _roll_to always sets _fh
             raise RuntimeError("archive writer file handle not open")
-        fh.write(json.dumps(to_dict(event), separators=(",", ":")) + "\n")
+        try:
+            fh.write(json.dumps(to_dict(event), separators=(",", ":")) + "\n")
+        except Exception:
+            # GCS-FUSE can close the fh mid-hour (CSI driver remount, transient
+            # upload stall). Without clearing state the next write re-uses the
+            # dead handle and loops indefinitely; clearing _fh forces the next
+            # call to re-open the hour file fresh.
+            self._fh = None
+            self._current_hour = None
+            raise
         self._lines_written += 1
 
     def close(self) -> None:

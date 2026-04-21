@@ -39,6 +39,17 @@ risk:
   # diversification intent because all N strikes settle from the same BTC
   # terminal price. Raise only after risk-committee review.
   max_correlated_positions: 1
+  # Slice 11 Phase 3.1 — premium cap. Hard reject on 76¢+ entries: 3:1
+  # inverted risk/reward clears Kelly math but not prudent practice. One
+  # 75¢ loss erases three wins at the same price. Loosening requires
+  # risk-committee sign-off (docs/RISK.md).
+  max_entry_price_cents: 75
+  # Slice 11 Phase 3.2 — inverted-risk sizing clip. At 50¢+ loss-per-
+  # contract > win-per-contract and raw Kelly sizes UP (smaller 1-p).
+  # Halve fractional Kelly in that band. Monotonic tightening; committee
+  # sign-off required to change the multiplier toward 1.0.
+  inverted_risk_threshold_cents: 50
+  inverted_risk_kelly_multiplier: 0.5
 
 signal:
   bollinger_period_bars: 20

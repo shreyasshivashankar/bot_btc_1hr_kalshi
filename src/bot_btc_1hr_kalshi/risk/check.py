@@ -8,14 +8,21 @@ Checks, in order (first reject wins):
   2. no breaker tripped
   3. signal confidence >= configured floor (defense-in-depth — registry already
      filtered, but we re-check here)
-  4. correlation cap: count of open positions on the SAME settlement hour +
+  4. premium cap: entry price <= `max_entry_price_cents` (Slice 11 Phase 3.1).
+     Inverted-risk guard — at 75¢ you risk 75 to make 25, and one loss erases
+     three wins. Kelly's math alone tolerates this; prudent practice does not.
+  5. correlation cap: count of open positions on the SAME settlement hour +
      SAME side is below `max_correlated_positions`. Under the multi-strike
      architecture, three YES bets on adjacent strikes of the same hourly
      session are structurally one directional bet on BTC — the aggregate
      notional cap alone does not enforce diversification intent.
-  5. daily-loss ceiling not breached
-  6. per-position notional cap
-  7. aggregate open-exposure cap (3x single-position cap by default)
+  6. daily-loss ceiling not breached
+  7. per-position notional cap
+  8. aggregate open-exposure cap (3x single-position cap by default)
+
+Ordering note: confidence floor runs BEFORE premium/correlation caps so
+below-confidence ticks don't pollute the decision journal with cap rejects
+that would never have fired if the signal were strong enough to surface.
 """
 
 from __future__ import annotations
@@ -68,6 +75,9 @@ def check(req: RiskInput, settings: RiskSettings) -> RiskDecision:
 
     if req.signal.confidence < req.min_signal_confidence:
         return Reject("below_confidence_floor")
+
+    if req.signal.entry_price_cents > settings.max_entry_price_cents:
+        return Reject("premium_cap")
 
     if req.correlated_open_positions_count >= settings.max_correlated_positions:
         return Reject("correlation_cap")
