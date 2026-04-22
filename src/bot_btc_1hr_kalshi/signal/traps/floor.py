@@ -12,12 +12,24 @@ Fires when:
      net aggressor selling is a cascade, not a dip to fade — "falling
      knife" veto. Lives inside the trap for the same reason as HTF.
   6. Confidence (|pct_b|, weighted by 5m RSI alignment) clears the floor.
+  7. Microstructure (Slice 11 P3 — shadow): if a liquidation-heatmap
+     cluster sits within `heatmap_adverse_cluster_pct` *below* spot, a
+     long here is running straight into a stop-hunt pocket. Similarly,
+     aggregated BTC futures OI below `oi_compression_threshold_usd` is a
+     conviction-drained tape. When `enable_microstructure_gating=True`
+     these become hard vetoes; when False (default) they tag
+     `features.shadow_veto_reason` so the tuning loop can learn the
+     right threshold against paper-soak outcomes BEFORE the risk
+     committee promotes the gate. No behavior change until a threshold
+     is signed off.
 
 Side = YES: we're betting the spot will revert upward, making YES more valuable.
 
 Warmup (rsi_1h / rsi_5m / cvd_1m_usd == None): HTF veto, RSI weighting, and
 CVD veto all fail-open — matches pre-Slice-8/9 behavior while accumulators
-fill on cold start (1H RSI needs ~14 hours of 1h closes).
+fill on cold start (1H RSI needs ~14 hours of 1h closes). Microstructure
+checks likewise fail-open when the feeds are absent (Coinglass disabled,
+cold-start pre-first-poll, or transient fetch failure).
 
 Edge: Normal-CDF settlement probability (DESIGN.md §6.2 / signal/edge_model.py)
 minus the maker-entry price in cents. A trap with zero edge is dropped by the
@@ -53,12 +65,44 @@ def _floor_rsi_weight(rsi_5m: float | None) -> float:
     return 1.0 - decay * (1.0 - _RSI_WEIGHT_FLOOR)
 
 
+def _floor_microstructure_veto(
+    snap: MarketSnapshot,
+    *,
+    heatmap_adverse_cluster_pct: float,
+    oi_compression_threshold_usd: float,
+) -> str | None:
+    """Return a veto reason for the floor (long) setup or None.
+
+    Adverse direction for a long: clusters *below* spot — a downward
+    stop-hunt pocket we'd run into. OI compression is directionless
+    (conviction drain) so it vetoes long and short alike.
+    """
+    heatmap = snap.liquidation_heatmap
+    if heatmap is not None and snap.spot_btc_usd > 0.0:
+        gap_frac = (snap.spot_btc_usd - heatmap.peak_cluster_price_usd) / snap.spot_btc_usd
+        if 0.0 < gap_frac <= heatmap_adverse_cluster_pct:
+            return "heatmap_adverse_cluster_below"
+
+    oi = snap.open_interest
+    if (
+        oi is not None
+        and oi_compression_threshold_usd > 0.0
+        and oi.total_oi_usd < oi_compression_threshold_usd
+    ):
+        return "oi_compression"
+
+    return None
+
+
 def detect_floor_reversion(
     snap: MarketSnapshot,
     *,
     min_confidence: float,
     htf_bearish_veto_rsi: float = 45.0,
     cvd_1m_veto_threshold_usd: float = 5_000_000.0,
+    enable_microstructure_gating: bool = False,
+    heatmap_adverse_cluster_pct: float = 0.005,
+    oi_compression_threshold_usd: float = 0.0,
 ) -> TrapSignal | None:
     if not snap.book.valid:
         return None
@@ -91,6 +135,18 @@ def detect_floor_reversion(
     if confidence < min_confidence:
         return None
 
+    # Microstructure (Slice 11 P3) — compute reason first so the
+    # decision journal carries the tag even when gating is off. Hard-
+    # gating is risk-committee-controlled via SignalSettings; the trap
+    # itself never chooses to reject without the config saying so.
+    micro_reason = _floor_microstructure_veto(
+        snap,
+        heatmap_adverse_cluster_pct=heatmap_adverse_cluster_pct,
+        oi_compression_threshold_usd=oi_compression_threshold_usd,
+    )
+    if micro_reason is not None and enable_microstructure_gating:
+        return None
+
     # Hard rule #1: maker BUY at best bid.
     entry_price_cents = best_bid.price_cents
     q_yes = settlement_prob_yes(
@@ -103,11 +159,17 @@ def detect_floor_reversion(
     if edge <= 0:
         return None
 
+    features = (
+        snap.features.model_copy(update={"shadow_veto_reason": micro_reason})
+        if micro_reason is not None
+        else snap.features
+    )
+
     return TrapSignal(
         trap="floor_reversion",
         side="YES",
         entry_price_cents=entry_price_cents,
         confidence=confidence,
         edge_cents=edge,
-        features=snap.features,
+        features=features,
     )

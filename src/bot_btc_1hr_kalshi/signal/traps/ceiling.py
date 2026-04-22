@@ -18,6 +18,14 @@ Fires when:
      persistent net aggressor buying is a breakout, not a rip to fade
      — mirror of the floor's falling-knife veto.
   7. Confidence (|pct_b|, weighted by 5m RSI alignment) clears the floor.
+  8. Microstructure (Slice 11 P3 — shadow): mirror of the floor's
+     microstructure check with adverse direction inverted — for a short
+     setup the adverse cluster sits *above* spot (upside stop-hunt
+     pocket). OI compression applies symmetrically. When
+     `enable_microstructure_gating=True` the veto is hard; when False
+     (default) it only tags `features.shadow_veto_reason` so the tuning
+     loop can derive calibrated thresholds from paper-soak outcomes
+     before the risk committee promotes the gate.
 
 Side = NO: we bet spot reverts downward -> YES becomes less valuable
 -> NO pays off. Entry is a maker BUY on the NO side at NO best bid
@@ -25,7 +33,8 @@ Side = NO: we bet spot reverts downward -> YES becomes less valuable
 
 Warmup (rsi_1h / rsi_5m / move_24h_pct / cvd_1m_usd == None): all
 Slice-8/9 gates fail-open — matches pre-slice behavior while
-accumulators fill.
+accumulators fill. Microstructure checks likewise fail-open when the
+Coinglass feeds are absent.
 
 Edge is the Normal-CDF settlement probability for NO minus the NO entry
 price in cents (see signal/edge_model.py).
@@ -55,6 +64,35 @@ def _ceiling_rsi_weight(rsi_5m: float | None) -> float:
     return 1.0 - decay * (1.0 - _RSI_WEIGHT_FLOOR)
 
 
+def _ceiling_microstructure_veto(
+    snap: MarketSnapshot,
+    *,
+    heatmap_adverse_cluster_pct: float,
+    oi_compression_threshold_usd: float,
+) -> str | None:
+    """Return a veto reason for the ceiling (short) setup or None.
+
+    Adverse direction for a short: clusters *above* spot — an upside
+    stop-hunt pocket we'd run into. OI compression is directionless so
+    it vetoes long and short alike.
+    """
+    heatmap = snap.liquidation_heatmap
+    if heatmap is not None and snap.spot_btc_usd > 0.0:
+        gap_frac = (heatmap.peak_cluster_price_usd - snap.spot_btc_usd) / snap.spot_btc_usd
+        if 0.0 < gap_frac <= heatmap_adverse_cluster_pct:
+            return "heatmap_adverse_cluster_above"
+
+    oi = snap.open_interest
+    if (
+        oi is not None
+        and oi_compression_threshold_usd > 0.0
+        and oi.total_oi_usd < oi_compression_threshold_usd
+    ):
+        return "oi_compression"
+
+    return None
+
+
 def detect_ceiling_reversion(
     snap: MarketSnapshot,
     *,
@@ -62,6 +100,9 @@ def detect_ceiling_reversion(
     htf_bullish_veto_rsi: float = 55.0,
     runaway_train_halt_pct: float = 0.05,
     cvd_1m_veto_threshold_usd: float = 5_000_000.0,
+    enable_microstructure_gating: bool = False,
+    heatmap_adverse_cluster_pct: float = 0.005,
+    oi_compression_threshold_usd: float = 0.0,
 ) -> TrapSignal | None:
     if not snap.book.valid:
         return None
@@ -99,6 +140,17 @@ def detect_ceiling_reversion(
     if confidence < min_confidence:
         return None
 
+    # Microstructure (Slice 11 P3) — compute first so the tag lands on
+    # the journal even when gating is off; hard-reject only when the
+    # risk committee has flipped the flag.
+    micro_reason = _ceiling_microstructure_veto(
+        snap,
+        heatmap_adverse_cluster_pct=heatmap_adverse_cluster_pct,
+        oi_compression_threshold_usd=oi_compression_threshold_usd,
+    )
+    if micro_reason is not None and enable_microstructure_gating:
+        return None
+
     entry_price_cents = no_bid.price_cents
     q_yes = settlement_prob_yes(
         spot_usd=snap.spot_btc_usd,
@@ -110,11 +162,17 @@ def detect_ceiling_reversion(
     if edge <= 0:
         return None
 
+    features = (
+        snap.features.model_copy(update={"shadow_veto_reason": micro_reason})
+        if micro_reason is not None
+        else snap.features
+    )
+
     return TrapSignal(
         trap="ceiling_reversion",
         side="NO",
         entry_price_cents=entry_price_cents,
         confidence=confidence,
         edge_cents=edge,
-        features=snap.features,
+        features=features,
     )

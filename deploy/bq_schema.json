@@ -32,6 +32,7 @@
     {"name": "move_24h_pct", "type": "FLOAT64", "mode": "NULLABLE"},
     {"name": "cvd_1m_usd", "type": "FLOAT64", "mode": "NULLABLE"},
     {"name": "spot_range_60s", "type": "FLOAT64", "mode": "NULLABLE"},
-    {"name": "open_interest_usd", "type": "FLOAT64", "mode": "NULLABLE"}
+    {"name": "open_interest_usd", "type": "FLOAT64", "mode": "NULLABLE"},
+    {"name": "shadow_veto_reason", "type": "STRING", "mode": "NULLABLE"}
   ]}
 ]

@@ -43,6 +43,9 @@ def run_traps(snap: MarketSnapshot, *, settings: SignalSettings) -> TrapSignal |
         min_confidence=min_confidence,
         htf_bearish_veto_rsi=settings.htf_bearish_veto_rsi,
         cvd_1m_veto_threshold_usd=settings.cvd_1m_veto_threshold_usd,
+        enable_microstructure_gating=settings.enable_microstructure_gating,
+        heatmap_adverse_cluster_pct=settings.heatmap_adverse_cluster_pct,
+        oi_compression_threshold_usd=settings.oi_compression_threshold_usd,
     )
     if floor is not None:
         candidates.append(floor)
@@ -53,6 +56,9 @@ def run_traps(snap: MarketSnapshot, *, settings: SignalSettings) -> TrapSignal |
         htf_bullish_veto_rsi=settings.htf_bullish_veto_rsi,
         runaway_train_halt_pct=settings.runaway_train_halt_pct,
         cvd_1m_veto_threshold_usd=settings.cvd_1m_veto_threshold_usd,
+        enable_microstructure_gating=settings.enable_microstructure_gating,
+        heatmap_adverse_cluster_pct=settings.heatmap_adverse_cluster_pct,
+        oi_compression_threshold_usd=settings.oi_compression_threshold_usd,
     )
     if ceiling is not None:
         candidates.append(ceiling)

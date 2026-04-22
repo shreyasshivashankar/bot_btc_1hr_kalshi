@@ -3,6 +3,10 @@ from __future__ import annotations
 from typing import Literal
 
 from bot_btc_1hr_kalshi.market_data import BookLevel, BookUpdate, L2Book
+from bot_btc_1hr_kalshi.market_data.types import (
+    LiquidationHeatmapSample,
+    OpenInterestSample,
+)
 from bot_btc_1hr_kalshi.obs.schemas import Features, RegimeVol
 from bot_btc_1hr_kalshi.signal import MarketSnapshot, detect_floor_reversion
 
@@ -53,6 +57,8 @@ def _snap(
     *,
     spot: float = 60_100.0,
     strike: float = 60_000.0,
+    open_interest: OpenInterestSample | None = None,
+    liquidation_heatmap: LiquidationHeatmapSample | None = None,
     **kwargs: object,
 ) -> MarketSnapshot:
     return MarketSnapshot(
@@ -62,6 +68,26 @@ def _snap(
         spot_btc_usd=spot,
         minutes_to_settlement=30.0,
         strike_usd=strike,
+        open_interest=open_interest,
+        liquidation_heatmap=liquidation_heatmap,
+    )
+
+
+def _heatmap(peak_price: float, total: float = 1_000_000.0) -> LiquidationHeatmapSample:
+    return LiquidationHeatmapSample(
+        ts_ns=1,
+        symbol="BTCUSDT",
+        total_liquidation_usd=total,
+        peak_cluster_price_usd=peak_price,
+        peak_cluster_liquidation_usd=total,
+    )
+
+
+def _oi(total_usd: float) -> OpenInterestSample:
+    return OpenInterestSample(
+        ts_ns=1,
+        symbol="BTCUSDT",
+        total_oi_usd=total_usd,
     )
 
 
@@ -248,3 +274,109 @@ def test_cvd_veto_does_not_block_on_positive_flow_of_equal_magnitude() -> None:
         min_confidence=0.3,
     )
     assert sig is not None
+
+
+# ---- Microstructure shadow gate (Slice 11 P3) --------------------------------
+
+
+def test_microstructure_off_still_emits_signal_and_tags_reason() -> None:
+    # Spot 60_100, cluster at 59_800 → gap_frac = 300/60_100 ≈ 0.00499,
+    # which is <= default 0.005 → adverse cluster BELOW spot for the long.
+    # With gating OFF (default), the trap must still emit the signal but
+    # tag `shadow_veto_reason` on the features payload.
+    sig = detect_floor_reversion(
+        _snap(
+            ask_price=20,
+            pct_b=-0.9,
+            liquidation_heatmap=_heatmap(peak_price=59_800.0),
+        ),
+        min_confidence=0.3,
+    )
+    assert sig is not None
+    assert sig.features.shadow_veto_reason == "heatmap_adverse_cluster_below"
+
+
+def test_microstructure_on_rejects_when_cluster_below_spot() -> None:
+    sig = detect_floor_reversion(
+        _snap(
+            ask_price=20,
+            pct_b=-0.9,
+            liquidation_heatmap=_heatmap(peak_price=59_800.0),
+        ),
+        min_confidence=0.3,
+        enable_microstructure_gating=True,
+    )
+    assert sig is None
+
+
+def test_microstructure_ignores_cluster_above_spot_for_long() -> None:
+    # Cluster above spot is in our favor for a long bet — no veto,
+    # no tag, plain signal.
+    sig = detect_floor_reversion(
+        _snap(
+            ask_price=20,
+            pct_b=-0.9,
+            liquidation_heatmap=_heatmap(peak_price=60_300.0),
+        ),
+        min_confidence=0.3,
+    )
+    assert sig is not None
+    assert sig.features.shadow_veto_reason is None
+
+
+def test_microstructure_ignores_distant_cluster() -> None:
+    # Cluster 58_000 is > 0.5% below spot 60_100 — outside the adverse band.
+    sig = detect_floor_reversion(
+        _snap(
+            ask_price=20,
+            pct_b=-0.9,
+            liquidation_heatmap=_heatmap(peak_price=58_000.0),
+        ),
+        min_confidence=0.3,
+    )
+    assert sig is not None
+    assert sig.features.shadow_veto_reason is None
+
+
+def test_microstructure_oi_compression_tags_off_rejects_on() -> None:
+    # OI below threshold → conviction-drained tape, directionless veto.
+    snap = _snap(ask_price=20, pct_b=-0.9, open_interest=_oi(total_usd=1_000_000.0))
+    shadow = detect_floor_reversion(
+        snap,
+        min_confidence=0.3,
+        oi_compression_threshold_usd=5_000_000.0,
+    )
+    assert shadow is not None
+    assert shadow.features.shadow_veto_reason == "oi_compression"
+
+    gated = detect_floor_reversion(
+        snap,
+        min_confidence=0.3,
+        enable_microstructure_gating=True,
+        oi_compression_threshold_usd=5_000_000.0,
+    )
+    assert gated is None
+
+
+def test_microstructure_oi_threshold_zero_is_disabled() -> None:
+    # Default threshold 0.0 means "no OI check at all" — even a tiny OI
+    # must not trigger the veto (guard against accidentally enabling the
+    # gate just by plumbing OI through).
+    sig = detect_floor_reversion(
+        _snap(ask_price=20, pct_b=-0.9, open_interest=_oi(total_usd=0.0)),
+        min_confidence=0.3,
+        enable_microstructure_gating=True,
+    )
+    assert sig is not None
+    assert sig.features.shadow_veto_reason is None
+
+
+def test_microstructure_absent_feeds_fail_open() -> None:
+    # No heatmap, no OI sample — matches pre-Coinglass behavior.
+    sig = detect_floor_reversion(
+        _snap(ask_price=20, pct_b=-0.9),
+        min_confidence=0.3,
+        enable_microstructure_gating=True,
+    )
+    assert sig is not None
+    assert sig.features.shadow_veto_reason is None

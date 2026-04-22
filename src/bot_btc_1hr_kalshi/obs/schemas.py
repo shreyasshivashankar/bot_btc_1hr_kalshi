@@ -75,6 +75,16 @@ class Features(BaseModel):
     # from soaked data. NULLABLE in BigQuery for back-compat with pre-P2
     # rows (i.e., every historical row written before this shipped).
     open_interest_usd: float | None = Field(default=None, ge=0.0)
+    # Microstructure shadow-veto tag (Slice 11 P3). When a trap's micro
+    # check (heatmap stop-hunt cluster, OI compression band, etc.) would
+    # have rejected the entry, the trap stamps the reason here and still
+    # emits the signal — `signal.enable_microstructure_gating` controls
+    # whether the reason escalates to a hard reject. This field is how
+    # the tuning loop / risk committee discover empirical thresholds
+    # from paper-soak data before any behavior change reaches live.
+    # `None` when no micro veto applies or gating is disabled and the
+    # trap chose not to tag. NULLABLE in BigQuery for back-compat.
+    shadow_veto_reason: str | None = None
 
 
 class Sizing(BaseModel):

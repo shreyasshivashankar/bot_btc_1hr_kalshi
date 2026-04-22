@@ -155,6 +155,32 @@ class SignalSettings(BaseModel):
     # relative to the inbound print and the "edge" is adverse selection.
     arb_basis_threshold_cents: int = Field(gt=0, default=15)
     arb_dead_spot_range_usd: float = Field(gt=0.0, default=20.0)
+    # Microstructure gating (Slice 11 P3 — shadow plumbing). When
+    # `enable_microstructure_gating=False` (DEFAULT), the floor/ceiling
+    # traps evaluate the heatmap + OI checks below but only *tag* the
+    # outgoing signal's `features.shadow_veto_reason` — the trade still
+    # proceeds. The risk committee uses the tagged telemetry to pick
+    # empirical thresholds before flipping the switch. When True, any
+    # non-None shadow veto reason hard-rejects the trap. Hard rule #2's
+    # backtest → paper → shadow → live progression governs the flip:
+    # do not toggle this to True until the tuning loop has real soak
+    # data justifying the specific thresholds below.
+    enable_microstructure_gating: bool = False
+    # Heatmap adverse-cluster fraction. A trap rejects (or shadow-tags)
+    # when the peak liquidation cluster sits within this fraction of
+    # current spot on the *adverse* side of the trade — long trades
+    # fear a cluster below (stop-hunt down), short trades fear a cluster
+    # above. 0.005 = 0.5% — a placeholder starting point; the committee
+    # will tune against tagged paper-soak outcomes before promotion.
+    heatmap_adverse_cluster_pct: float = Field(gt=0.0, le=1.0, default=0.005)
+    # Open-interest compression floor (USD). When total aggregated BTC
+    # futures OI drops below this level, the trap tags a compression
+    # veto: very low OI often follows a liquidation cascade, and mean-
+    # reversion immediately post-cascade is structurally different from
+    # reversion in normal regimes. 0.0 disables without removing the
+    # plumbing — the committee sets a real threshold once shadow-soak
+    # produces an OI distribution to anchor against.
+    oi_compression_threshold_usd: float = Field(ge=0.0, default=0.0)
 
 
 class SoftStopSettings(BaseModel):
