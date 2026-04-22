@@ -5,7 +5,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from bot_btc_1hr_kalshi.market_data import L2Book
-from bot_btc_1hr_kalshi.market_data.types import OpenInterestSample
+from bot_btc_1hr_kalshi.market_data.types import (
+    LiquidationHeatmapSample,
+    OpenInterestSample,
+)
 from bot_btc_1hr_kalshi.obs.schemas import Features, Side, TrapName
 
 
@@ -17,6 +20,8 @@ class MarketSnapshot:
     when available; traps treat it as *observational* until shadow-mode
     data justifies a microstructure-gated entry. `None` is the
     pre-wiring default and also the value during warmup / fetch failure.
+
+    `liquidation_heatmap` follows the same contract (Slice 11 P3).
     """
 
     market_id: str
@@ -26,6 +31,7 @@ class MarketSnapshot:
     minutes_to_settlement: float
     strike_usd: float
     open_interest: OpenInterestSample | None = None
+    liquidation_heatmap: LiquidationHeatmapSample | None = None
 
 
 @dataclass(frozen=True, slots=True)
