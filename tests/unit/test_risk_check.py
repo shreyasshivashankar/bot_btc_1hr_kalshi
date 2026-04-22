@@ -55,6 +55,7 @@ def _req(
     breakers: BreakerState | None = None,
     correlated_count: int = 0,
     entry_price_cents: int = 30,
+    calendar_blocked: bool = False,
 ) -> RiskInput:
     return RiskInput(
         signal=_signal(confidence=confidence, entry_price_cents=entry_price_cents),
@@ -66,6 +67,7 @@ def _req(
         now_ns=1_000_000_000,
         min_signal_confidence=min_conf,
         correlated_open_positions_count=correlated_count,
+        calendar_blocked=calendar_blocked,
     )
 
 
@@ -196,6 +198,28 @@ def test_premium_cap_ordered_after_confidence_floor() -> None:
     )
     assert isinstance(d, Reject)
     assert d.reason == "below_confidence_floor"
+
+
+def test_reject_when_calendar_blocked() -> None:
+    """Slice 11 P1 follow-up: when the caller reports a tier-1 macro event
+    blackout window is active, risk rejects fresh entries with a clear
+    reason. Pairs with `CalendarGuard.tick()`'s pre-event flatten — the
+    two together cover the full `[T-60s, T+30min]` window (docs/RISK.md
+    §Macro-blockers)."""
+    d = check(_req(calendar_blocked=True), _settings())
+    assert isinstance(d, Reject)
+    assert d.reason == "calendar_blocked"
+
+
+def test_calendar_block_ordered_after_breakers_before_confidence() -> None:
+    """A tripped breaker takes precedence (a halted feed is a harder
+    condition than a scheduled blackout). But calendar_blocked must fire
+    before below_confidence_floor so the decision journal reflects the
+    actual root cause when a low-quality tick happens inside the blackout
+    — otherwise we'd chase a phantom signal-quality issue during CPI."""
+    d = check(_req(confidence=0.3, min_conf=0.5, calendar_blocked=True), _settings())
+    assert isinstance(d, Reject)
+    assert d.reason == "calendar_blocked"
 
 
 def test_premium_cap_ordered_before_correlation_cap() -> None:

@@ -42,6 +42,29 @@ class CoinglassSettings(BaseModel):
     api_key_env: str = "BOT_BTC_1HR_KALSHI_COINGLASS_API_KEY"
 
 
+class CoinglassHeatmapSettings(BaseModel):
+    """Coinglass liquidation-heatmap poller (Slice 11 P3 — shadow only).
+
+    Same observational-only contract as `CoinglassSettings`. `enabled:
+    false` disables the polling task entirely. The heatmap endpoint is
+    generally keyed in production; the unkeyed path may return 401 on
+    paid-tier-only endpoints.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    base_url: str = "https://open-api-v4.coinglass.com"
+    heatmap_path: str = "/api/futures/liquidation/aggregated-heatmap"
+    symbol: str = "BTC"
+    interval: str = "1h"
+    poll_interval_sec: float = Field(gt=0.0, default=60.0)
+    # Re-uses the same Coinglass API-key env var as the OI poller: a
+    # single key covers both endpoints, and splitting the binding would
+    # just double the operator secret-rotation work.
+    api_key_env: str = "BOT_BTC_1HR_KALSHI_COINGLASS_API_KEY"
+
+
 class FeedsSettings(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -49,6 +72,7 @@ class FeedsSettings(BaseModel):
     coinbase: FeedSettings
     kraken: FeedSettings
     coinglass: CoinglassSettings = CoinglassSettings()
+    coinglass_heatmap: CoinglassHeatmapSettings = CoinglassHeatmapSettings()
 
 
 class RiskSettings(BaseModel):
@@ -196,6 +220,12 @@ class CalendarSettings(BaseModel):
 
     path: str | None = None
     lead_seconds: float = Field(gt=0.0, default=60.0)
+    # Post-event blackout (docs/RISK.md §Macro-blockers). New entries stay
+    # rejected for this long AFTER ev.ts_ns — pairs with `lead_seconds`
+    # (pre-event flatten) to cover the full volatility skirt around CPI /
+    # FOMC / NFP prints. `risk.check()` reads the combined window via
+    # `CalendarGuard.is_blocked(now_ns)`.
+    cooldown_seconds: float = Field(gt=0.0, default=1800.0)
     tick_interval_sec: float = Field(gt=0.0, default=5.0)
     # Forex Factory auto-refresh (Slice 11 P1 — Macro Blockers). When
     # enabled, a background task polls `fetch_url` every `fetch_interval_sec`

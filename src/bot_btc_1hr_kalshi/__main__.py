@@ -50,6 +50,9 @@ from bot_btc_1hr_kalshi.feedloop import (
 )
 from bot_btc_1hr_kalshi.market_data.bars import MultiTimeframeBus
 from bot_btc_1hr_kalshi.market_data.feeds.coinglass import CoinglassPoller
+from bot_btc_1hr_kalshi.market_data.feeds.coinglass_heatmap import (
+    CoinglassHeatmapPoller,
+)
 from bot_btc_1hr_kalshi.market_data.feeds.kalshi import WSConnect
 from bot_btc_1hr_kalshi.market_data.feeds.spot import (
     SpotFeed,
@@ -61,7 +64,10 @@ from bot_btc_1hr_kalshi.market_data.feeds.spot import (
 from bot_btc_1hr_kalshi.market_data.feeds.staleness import StalenessTracker
 from bot_btc_1hr_kalshi.market_data.kalshi_rest import kalshi_date_header_probe
 from bot_btc_1hr_kalshi.market_data.spot_oracle import SpotOracle
-from bot_btc_1hr_kalshi.market_data.types import OpenInterestSample
+from bot_btc_1hr_kalshi.market_data.types import (
+    LiquidationHeatmapSample,
+    OpenInterestSample,
+)
 from bot_btc_1hr_kalshi.monitor.position_monitor import PositionMonitor
 from bot_btc_1hr_kalshi.obs.activity import ActivityTracker
 from bot_btc_1hr_kalshi.obs.clock import SystemClock
@@ -263,6 +269,8 @@ async def serve(app: App, *, admin_token: str, host: str, port: int) -> None:
     ff_client: httpx.AsyncClient | None = None
     coinglass_task: asyncio.Task[None] | None = None
     coinglass_client: httpx.AsyncClient | None = None
+    heatmap_task: asyncio.Task[None] | None = None
+    heatmap_client: httpx.AsyncClient | None = None
     rest_client: httpx.AsyncClient | None = None
 
     def _on_term() -> None:
@@ -279,6 +287,7 @@ async def serve(app: App, *, admin_token: str, host: str, port: int) -> None:
             calendar_task,
             ff_refresh_task,
             coinglass_task,
+            heatmap_task,
         ):
             if t is not None:
                 t.cancel()
@@ -290,6 +299,7 @@ async def serve(app: App, *, admin_token: str, host: str, port: int) -> None:
     feed_task, drift_task, spot_task, rest_client = _start_feed_loop_if_enabled(app, log)
     calendar_task, ff_refresh_task, ff_client = _start_calendar_if_enabled(app, log)
     coinglass_task, coinglass_client = _start_coinglass_if_enabled(app, log)
+    heatmap_task, heatmap_client = _start_coinglass_heatmap_if_enabled(app, log)
 
     # Supervise the background tasks. If any dies unexpectedly (not via
     # cancellation), the container must restart — silently running without
@@ -338,6 +348,10 @@ async def serve(app: App, *, admin_token: str, host: str, port: int) -> None:
     # a third-party API outage take the trading graph down with it).
     if coinglass_task is not None:
         coinglass_task.add_done_callback(_make_supervisor("coinglass-oi", halt_on_death=False))
+    if heatmap_task is not None:
+        heatmap_task.add_done_callback(
+            _make_supervisor("coinglass-heatmap", halt_on_death=False)
+        )
 
     log.info("boot.serving", mode=app.settings.mode, host=host, port=port)
     try:
@@ -350,6 +364,7 @@ async def serve(app: App, *, admin_token: str, host: str, port: int) -> None:
             ("calendar-guard", calendar_task),
             ("forex-factory-refresh", ff_refresh_task),
             ("coinglass-oi", coinglass_task),
+            ("coinglass-heatmap", heatmap_task),
         ):
             if task is None:
                 continue
@@ -364,6 +379,8 @@ async def serve(app: App, *, admin_token: str, host: str, port: int) -> None:
             await ff_client.aclose()
         if coinglass_client is not None:
             await coinglass_client.aclose()
+        if heatmap_client is not None:
+            await heatmap_client.aclose()
         if rest_client is not None:
             await rest_client.aclose()
         if app.kalshi_rest_client is not None:
@@ -435,7 +452,13 @@ def _start_calendar_if_enabled(
         events=static_events,
         trigger=_trigger,
         lead_seconds=settings.lead_seconds,
+        cooldown_seconds=settings.cooldown_seconds,
     )
+    # Wire the "no new entries inside the blackout window" half of the tier-1
+    # policy (docs/RISK.md §Macro-blockers). The guard's own `tick()` loop
+    # handles the pre-event flatten; this callback gates fresh entries from
+    # `risk.check()` during `[ev.ts_ns - lead, ev.ts_ns + cooldown]`.
+    app.oms.attach_calendar_guard(guard.is_blocked)
     static_names = frozenset(e.name for e in static_events)
 
     async def _guard_loop() -> None:
@@ -537,6 +560,65 @@ def _start_coinglass_if_enabled(
         "boot.coinglass_enabled",
         base_url=settings.base_url,
         path=settings.oi_path,
+        symbol=settings.symbol,
+        interval=settings.interval,
+        poll_interval_sec=settings.poll_interval_sec,
+        keyed=bool(api_key),
+    )
+    return task, client
+
+
+def _start_coinglass_heatmap_if_enabled(
+    app: App,
+    log: Any,
+) -> tuple[asyncio.Task[None] | None, httpx.AsyncClient | None]:
+    """Spin up the Coinglass liquidation-heatmap poller (Slice 11 P3 —
+    shadow). Same contract as `_start_coinglass_if_enabled`: observational
+    only, non-critical background task (death logged, not halting). Lives
+    on a separate httpx client so a stuck heatmap endpoint cannot share
+    connection-pool pressure with the OI poller."""
+    settings = app.settings.feeds.coinglass_heatmap
+    if not settings.enabled:
+        log.info(
+            "boot.coinglass_heatmap_disabled",
+            reason="feeds.coinglass_heatmap.enabled=false",
+        )
+        return None, None
+    if app.settings.mode not in MODES_WITH_FEED_LOOP:
+        log.info("boot.coinglass_heatmap_skipped", mode=app.settings.mode)
+        return None, None
+
+    api_key = os.getenv(settings.api_key_env) or None
+    if not api_key:
+        log.warning(
+            "boot.coinglass_heatmap_unkeyed",
+            note=(
+                f"{settings.api_key_env} not set; heatmap endpoint commonly "
+                "requires a paid-tier key and may 401 unkeyed"
+            ),
+        )
+
+    client = httpx.AsyncClient(timeout=10.0)
+
+    async def _on_sample(sample: LiquidationHeatmapSample) -> None:
+        app.latest_liquidation_heatmap = sample
+
+    poller = CoinglassHeatmapPoller(
+        client=client,
+        clock=app.clock,
+        on_sample=_on_sample,
+        base_url=settings.base_url,
+        heatmap_path=settings.heatmap_path,
+        symbol=settings.symbol,
+        interval=settings.interval,
+        api_key=api_key,
+        poll_interval_sec=settings.poll_interval_sec,
+    )
+    task = asyncio.create_task(poller.run(), name="coinglass-heatmap")
+    log.info(
+        "boot.coinglass_heatmap_enabled",
+        base_url=settings.base_url,
+        path=settings.heatmap_path,
         symbol=settings.symbol,
         interval=settings.interval,
         poll_interval_sec=settings.poll_interval_sec,

@@ -67,6 +67,14 @@ class Features(BaseModel):
     # basis is adverse-selection bait. `None` during warmup on cold start
     # and NULLABLE in BigQuery for back-compat with pre-arb rows.
     spot_range_60s: float | None = Field(default=None, ge=0.0)
+    # Aggregated BTC-futures open interest in USD (Slice 11 P2 — shadow).
+    # Sourced from the Coinglass poller; `None` when disabled, during the
+    # first poll, or on fetch failure. Observational only — the OI signal
+    # is logged into `DecisionRecord.features_at_entry` so a future risk-
+    # committee decision to gate entries on OI compression can be justified
+    # from soaked data. NULLABLE in BigQuery for back-compat with pre-P2
+    # rows (i.e., every historical row written before this shipped).
+    open_interest_usd: float | None = Field(default=None, ge=0.0)
 
 
 class Sizing(BaseModel):

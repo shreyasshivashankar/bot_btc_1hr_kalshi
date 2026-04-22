@@ -420,6 +420,8 @@ class FeedLoop:
         move_24h = self._features.move_24h_pct()
         cvd_1m = self._features.cvd("1m", periods=CVD_ROLLING_PERIODS)
         spot_range_60s = self._spot_range_60s()
+        latest_oi = self._app.latest_open_interest
+        oi_usd = latest_oi.total_oi_usd if latest_oi is not None else None
 
         snaps: list[MarketSnapshot] = []
         for market_id, book in self._books.items():
@@ -446,6 +448,7 @@ class FeedLoop:
                 move_24h_pct=move_24h,
                 cvd_1m_usd=cvd_1m,
                 spot_range_60s=spot_range_60s,
+                open_interest_usd=oi_usd,
             )
             snaps.append(MarketSnapshot(
                 market_id=market_id,
@@ -454,6 +457,7 @@ class FeedLoop:
                 spot_btc_usd=spot,
                 minutes_to_settlement=mts,
                 strike_usd=strike,
+                open_interest=latest_oi,
             ))
         return snaps
 

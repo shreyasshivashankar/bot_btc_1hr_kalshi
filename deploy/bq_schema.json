@@ -30,6 +30,8 @@
     {"name": "rsi_5m", "type": "FLOAT64", "mode": "NULLABLE"},
     {"name": "rsi_1h", "type": "FLOAT64", "mode": "NULLABLE"},
     {"name": "move_24h_pct", "type": "FLOAT64", "mode": "NULLABLE"},
-    {"name": "cvd_1m_usd", "type": "FLOAT64", "mode": "NULLABLE"}
+    {"name": "cvd_1m_usd", "type": "FLOAT64", "mode": "NULLABLE"},
+    {"name": "spot_range_60s", "type": "FLOAT64", "mode": "NULLABLE"},
+    {"name": "open_interest_usd", "type": "FLOAT64", "mode": "NULLABLE"}
   ]}
 ]

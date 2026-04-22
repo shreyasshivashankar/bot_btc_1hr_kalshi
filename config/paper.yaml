@@ -41,6 +41,20 @@ feeds:
     poll_interval_sec: 30.0
     api_key_env: BOT_BTC_1HR_KALSHI_COINGLASS_API_KEY
 
+  # Coinglass liquidation-heatmap poller (Slice 11 P3 — shadow). Same
+  # observational-only contract as the OI poller. Disabled by default;
+  # the heatmap endpoint is paid-tier-only on most Coinglass plans and
+  # unkeyed requests typically 401. Flip `enabled: true` once a key is
+  # provisioned into the BOT_BTC_1HR_KALSHI_COINGLASS_API_KEY secret.
+  coinglass_heatmap:
+    enabled: false
+    base_url: https://open-api-v4.coinglass.com
+    heatmap_path: /api/futures/liquidation/aggregated-heatmap
+    symbol: BTC
+    interval: 1h
+    poll_interval_sec: 60.0
+    api_key_env: BOT_BTC_1HR_KALSHI_COINGLASS_API_KEY
+
 risk:
   # Sized for a $50 starter bankroll; bot restarts each session at $50 (see
   # --bankroll default in __main__.py). Per-position cap = bankroll / 2 so

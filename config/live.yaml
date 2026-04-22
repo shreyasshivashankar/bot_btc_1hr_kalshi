@@ -35,6 +35,19 @@ feeds:
     poll_interval_sec: 30.0
     api_key_env: BOT_BTC_1HR_KALSHI_COINGLASS_API_KEY
 
+  # Coinglass liquidation-heatmap poller (Slice 11 P3 — SHADOW). Same
+  # observational-only contract as the OI poller. Disabled by default;
+  # enable only after a paid-tier Coinglass key is provisioned into
+  # the shared secret, since the heatmap endpoint typically 401s unkeyed.
+  coinglass_heatmap:
+    enabled: false
+    base_url: https://open-api-v4.coinglass.com
+    heatmap_path: /api/futures/liquidation/aggregated-heatmap
+    symbol: BTC
+    interval: 1h
+    poll_interval_sec: 60.0
+    api_key_env: BOT_BTC_1HR_KALSHI_COINGLASS_API_KEY
+
 risk:
   kelly_fraction: 0.25            # ½-Kelly cap — hard ceiling
   max_position_notional_usd: 250  # initial ceiling; raise only after 1 live week

@@ -19,7 +19,10 @@ from bot_btc_1hr_kalshi.execution.oms import OMS
 from bot_btc_1hr_kalshi.market_data.bars import MultiTimeframeBus
 from bot_btc_1hr_kalshi.market_data.book import L2Book
 from bot_btc_1hr_kalshi.market_data.spot_oracle import SpotOracle
-from bot_btc_1hr_kalshi.market_data.types import OpenInterestSample
+from bot_btc_1hr_kalshi.market_data.types import (
+    LiquidationHeatmapSample,
+    OpenInterestSample,
+)
 from bot_btc_1hr_kalshi.monitor.position_monitor import PositionMonitor
 from bot_btc_1hr_kalshi.obs.activity import ActivityTracker
 from bot_btc_1hr_kalshi.obs.clock import Clock
@@ -72,6 +75,11 @@ class App:
     # Not currently gating any signal — observation only pending a
     # risk-committee promotion decision.
     latest_open_interest: OpenInterestSample | None = None
+    # Latest Coinglass liquidation-heatmap snapshot (Slice 11 P3 — shadow).
+    # Observation-only summary (total, peak cluster, peak price) polled
+    # on cadence. Same promotion contract as `latest_open_interest`:
+    # risk-committee sign-off required before any trap reads this.
+    latest_liquidation_heatmap: LiquidationHeatmapSample | None = None
     books: dict[str, L2Book] = field(default_factory=dict)
     trading_halted: bool = False
     tier1_override_active: bool = False

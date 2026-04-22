@@ -12,6 +12,7 @@ Responsibilities:
 from __future__ import annotations
 
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from bot_btc_1hr_kalshi.config.settings import RiskSettings
@@ -64,6 +65,7 @@ class OMS:
         clock: Clock,
         lifecycle: LifecycleEmitter | None = None,
         activity: ActivityTracker | None = None,
+        calendar_is_blocked: Callable[[int], bool] | None = None,
     ) -> None:
         self._broker = broker
         self._portfolio = portfolio
@@ -80,10 +82,25 @@ class OMS:
         # Optional — when set, every consider_entry stamps the tracker so
         # a process watchdog can detect a wedged decision loop.
         self._activity = activity
+        # Optional — when set, every consider_entry asks the callback whether
+        # `now_ns` is inside a tier-1 macro-event blackout window and threads
+        # the verdict to `risk.check`. Wired by `__main__` via
+        # `attach_calendar_guard` after the guard is constructed; default
+        # None keeps tests and calendar-disabled paths green.
+        self._calendar_is_blocked = calendar_is_blocked
         # Counter for partial-close bet_id suffixing. A position that fully
         # closes after N partials will have emitted outcomes p1..pN plus a
         # final unsuffixed outcome for the remainder.
         self._partial_seq: dict[str, int] = {}
+
+    def attach_calendar_guard(
+        self, is_blocked: Callable[[int], bool] | None
+    ) -> None:
+        """Late-binding setter: `CalendarGuard` is built after the OMS in
+        the startup sequence, so we wire the `is_blocked` callback once the
+        guard exists. Passing `None` disables the gate (used when calendar
+        is absent / empty)."""
+        self._calendar_is_blocked = is_blocked
 
     async def consider_entry(
         self,
@@ -127,6 +144,11 @@ class OMS:
         correlated_count = self._portfolio.count_correlated_open(
             side=signal.side, settlement_ts_ns=settlement_ts_ns
         )
+        calendar_blocked = (
+            self._calendar_is_blocked(now_ns)
+            if self._calendar_is_blocked is not None
+            else False
+        )
         verdict = check(
             RiskInput(
                 signal=signal,
@@ -138,6 +160,7 @@ class OMS:
                 now_ns=now_ns,
                 min_signal_confidence=self._min_conf,
                 correlated_open_positions_count=correlated_count,
+                calendar_blocked=calendar_blocked,
             ),
             self._risk,
         )

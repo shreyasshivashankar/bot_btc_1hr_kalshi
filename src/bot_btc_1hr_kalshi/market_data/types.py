@@ -105,4 +105,32 @@ class OpenInterestSample:
     source: str = "coinglass"
 
 
+@dataclass(frozen=True, slots=True)
+class LiquidationHeatmapSample:
+    """Aggregated BTC liquidation-heatmap snapshot (Slice 11 P3 — shadow).
+
+    Sourced from the Coinglass liquidation-heatmap endpoint. Full heatmap
+    payloads are large 2D grids of (price, time, liquidation_usd); we
+    compress each poll to three summary stats that are cheap to log and
+    sufficient for the observational-only question we want to answer in
+    paper-soak: "where are the nearest liquidation clusters relative to
+    spot, and how dense are they?"
+
+    * `total_liquidation_usd` — sum over the grid (activity proxy).
+    * `peak_cluster_price_usd` — price coordinate of the densest bucket.
+    * `peak_cluster_liquidation_usd` — the density of that bucket.
+
+    Any future decision to gate trap entries on proximity to a cluster
+    (a microstructure change) would require risk-committee sign-off per
+    docs/RISK.md — same contract as `OpenInterestSample`.
+    """
+
+    ts_ns: int
+    symbol: str
+    total_liquidation_usd: float
+    peak_cluster_price_usd: float
+    peak_cluster_liquidation_usd: float
+    source: str = "coinglass"
+
+
 FeedEvent = BookUpdate | TradeEvent | SpotTick

@@ -23,6 +23,10 @@ from bot_btc_1hr_kalshi.obs.clock import Clock
 log = structlog.get_logger(__name__)
 
 _DEFAULT_LEAD_SECONDS = 60.0
+# docs/RISK.md §Macro-blockers: "No new entries until T+30 minutes after
+# release." The cooldown is the post-event half of the blockout window;
+# the T-lead flatten is the pre-event half.
+_DEFAULT_COOLDOWN_SECONDS = 1800.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -34,7 +38,7 @@ class GuardTick:
 class CalendarGuard:
     """Drives pre-emptive tier-1 overrides against an injected clock."""
 
-    __slots__ = ("_clock", "_events", "_fired", "_lead_ns", "_trigger")
+    __slots__ = ("_clock", "_cooldown_ns", "_events", "_fired", "_lead_ns", "_trigger")
 
     def __init__(
         self,
@@ -43,13 +47,17 @@ class CalendarGuard:
         events: Iterable[ScheduledEvent],
         trigger: Callable[[], Awaitable[object]],
         lead_seconds: float = _DEFAULT_LEAD_SECONDS,
+        cooldown_seconds: float = _DEFAULT_COOLDOWN_SECONDS,
     ) -> None:
         if lead_seconds <= 0:
             raise ValueError("lead_seconds must be > 0")
+        if cooldown_seconds <= 0:
+            raise ValueError("cooldown_seconds must be > 0")
         self._clock = clock
         self._events = tuple(sorted(events, key=lambda e: e.ts_ns))
         self._trigger = trigger
         self._lead_ns = int(lead_seconds * 1_000_000_000)
+        self._cooldown_ns = int(cooldown_seconds * 1_000_000_000)
         self._fired: set[str] = set()
 
     @property
@@ -59,6 +67,31 @@ class CalendarGuard:
     @property
     def already_fired(self) -> frozenset[str]:
         return frozenset(self._fired)
+
+    def is_blocked(self, now_ns: int) -> bool:
+        """True when `now_ns` sits inside the blackout window of any tier-1
+        event: `[ev.ts_ns - lead_ns, ev.ts_ns + cooldown_ns]`.
+
+        Pure function of (events, now_ns) — safe to call from the hot
+        decision path. Closes the gap between "flatten at T-60s" (which
+        `tick()` handles) and "no new entries until T+30min" (docs/RISK.md
+        §Macro-blockers). Without this, a trap could fire at T-30s after
+        the flatten and re-open a position into the event.
+
+        Already-fired events still contribute to the block: the ledger
+        protects against double-flatten, not against late entries.
+        """
+        for ev in self._events:
+            if not ev.is_tier_one:
+                continue
+            window_start = ev.ts_ns - self._lead_ns
+            window_end = ev.ts_ns + self._cooldown_ns
+            if window_start <= now_ns <= window_end:
+                return True
+            if now_ns < window_start:
+                # Sorted by ts_ns — nothing later can overlap `now_ns` either.
+                return False
+        return False
 
     def replace_events(self, new: Iterable[ScheduledEvent]) -> None:
         """Swap the scheduled-event list in place. Preserves `_fired` so

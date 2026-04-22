@@ -93,6 +93,84 @@ async def test_lead_seconds_must_be_positive() -> None:
         )
 
 
+async def test_cooldown_seconds_must_be_positive() -> None:
+    with pytest.raises(ValueError, match="cooldown_seconds must be > 0"):
+        CalendarGuard(
+            clock=ManualClock(),
+            events=[],
+            trigger=_TriggerSpy(),
+            lead_seconds=60.0,
+            cooldown_seconds=0.0,
+        )
+
+
+async def test_is_blocked_covers_pre_event_cooldown_and_outside_windows() -> None:
+    clock = ManualClock(start_ns=0)
+    guard = CalendarGuard(
+        clock=clock,
+        events=[_event("CPI", 3600)],
+        trigger=_TriggerSpy(),
+        lead_seconds=60.0,
+        cooldown_seconds=1800.0,
+    )
+    # Before lead window (>60s before event).
+    assert guard.is_blocked(3000 * NS_PER_SEC) is False
+    # Inside lead window (T-30s).
+    assert guard.is_blocked(3570 * NS_PER_SEC) is True
+    # Exactly at event.
+    assert guard.is_blocked(3600 * NS_PER_SEC) is True
+    # Inside cooldown (T+10min).
+    assert guard.is_blocked((3600 + 600) * NS_PER_SEC) is True
+    # Exactly at cooldown boundary.
+    assert guard.is_blocked((3600 + 1800) * NS_PER_SEC) is True
+    # After cooldown.
+    assert guard.is_blocked((3600 + 1801) * NS_PER_SEC) is False
+
+
+async def test_is_blocked_ignores_non_tier_one_events() -> None:
+    guard = CalendarGuard(
+        clock=ManualClock(),
+        events=[_event("Retail_Sales", 3600, tier_one=False)],
+        trigger=_TriggerSpy(),
+        lead_seconds=60.0,
+        cooldown_seconds=1800.0,
+    )
+    assert guard.is_blocked(3600 * NS_PER_SEC) is False
+
+
+async def test_is_blocked_still_true_after_event_fired() -> None:
+    # The `_fired` ledger prevents double-flatten, but the blackout window
+    # must still block new entries through the cooldown half.
+    clock = ManualClock(start_ns=0)
+    guard = CalendarGuard(
+        clock=clock,
+        events=[_event("CPI", 120)],
+        trigger=_TriggerSpy(),
+        lead_seconds=60.0,
+        cooldown_seconds=1800.0,
+    )
+    clock.set_ns(70 * NS_PER_SEC)
+    await guard.tick()
+    assert "CPI" in guard.already_fired
+    # T+10min after the event is well inside the cooldown.
+    assert guard.is_blocked((120 + 600) * NS_PER_SEC) is True
+
+
+async def test_is_blocked_unions_overlapping_event_windows() -> None:
+    guard = CalendarGuard(
+        clock=ManualClock(),
+        events=[_event("FOMC", 3600), _event("NFP", 4000)],
+        trigger=_TriggerSpy(),
+        lead_seconds=60.0,
+        cooldown_seconds=1800.0,
+    )
+    # Between FOMC cooldown end (5400) and NFP cooldown start (3940) — the
+    # two windows overlap, so any point between 3540 and 5800 is blocked.
+    assert guard.is_blocked(3800 * NS_PER_SEC) is True
+    assert guard.is_blocked(5000 * NS_PER_SEC) is True
+    assert guard.is_blocked(6000 * NS_PER_SEC) is False
+
+
 async def test_sorted_iteration_short_circuits_future_events() -> None:
     # If the first future tier-1 is still outside the lead window, the guard
     # must not consider later events at all — guarantees O(1) amortized ticks.

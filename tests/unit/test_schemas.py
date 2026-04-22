@@ -39,12 +39,46 @@ def _sizing() -> Sizing:
 def test_features_happy_path() -> None:
     f = _features()
     assert f.signal_confidence == 0.7
-    # HTF + CVD fields default to None during warmup — existing callers that
-    # omit them must still validate.
+    # HTF + CVD + OI fields default to None during warmup — existing callers
+    # that omit them must still validate.
     assert f.rsi_5m is None
     assert f.rsi_1h is None
     assert f.move_24h_pct is None
     assert f.cvd_1m_usd is None
+    assert f.spot_range_60s is None
+    assert f.open_interest_usd is None
+
+
+def test_features_open_interest_populated() -> None:
+    f = Features(
+        regime_trend="flat",
+        regime_vol="normal",
+        signal_confidence=0.5,
+        bollinger_pct_b=0.0,
+        atr_cents=1.0,
+        book_depth_at_entry=1.0,
+        spread_cents=1,
+        spot_btc_usd=1.0,
+        minutes_to_settlement=1.0,
+        open_interest_usd=42_000_000_000.0,
+    )
+    assert f.open_interest_usd == 42_000_000_000.0
+
+
+def test_features_open_interest_rejects_negative() -> None:
+    with pytest.raises(ValidationError):
+        Features(
+            regime_trend="flat",
+            regime_vol="normal",
+            signal_confidence=0.5,
+            bollinger_pct_b=0.0,
+            atr_cents=1.0,
+            book_depth_at_entry=1.0,
+            spread_cents=1,
+            spot_btc_usd=1.0,
+            minutes_to_settlement=1.0,
+            open_interest_usd=-1.0,
+        )
 
 
 def test_features_cvd_field_populated_and_signed() -> None:
