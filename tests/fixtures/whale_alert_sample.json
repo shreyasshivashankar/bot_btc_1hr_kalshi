@@ -1,0 +1,62 @@
+{
+  "result": "success",
+  "cursor": "abc123",
+  "count": 5,
+  "transactions": [
+    {
+      "blockchain": "bitcoin",
+      "symbol": "BTC",
+      "transaction_type": "transfer",
+      "hash": "0xaaa",
+      "amount": 500.0,
+      "amount_usd": 30000000.0,
+      "timestamp": 1712345678,
+      "from": {"address": "1A", "owner": "unknown", "owner_type": "unknown"},
+      "to": {"address": "1B", "owner": "binance", "owner_type": "exchange"}
+    },
+    {
+      "blockchain": "bitcoin",
+      "symbol": "BTC",
+      "transaction_type": "transfer",
+      "hash": "0xbbb",
+      "amount": 120.0,
+      "amount_usd": 7200000.0,
+      "timestamp": 1712345690,
+      "from": {"address": "1C", "owner": "coinbase", "owner_type": "exchange"},
+      "to": {"address": "1D", "owner": "unknown", "owner_type": "unknown"}
+    },
+    {
+      "blockchain": "bitcoin",
+      "symbol": "BTC",
+      "transaction_type": "transfer",
+      "hash": "0xccc",
+      "amount": 50.0,
+      "amount_usd": 3000000.0,
+      "timestamp": 1712345700,
+      "from": {"address": "1E", "owner": "kraken", "owner_type": "exchange"},
+      "to": {"address": "1F", "owner": "bitstamp", "owner_type": "exchange"}
+    },
+    {
+      "blockchain": "bitcoin",
+      "symbol": "BTC",
+      "transaction_type": "transfer",
+      "hash": "0xddd",
+      "amount": 25.0,
+      "amount_usd": 1500000.0,
+      "timestamp": 1712345710,
+      "from": {"address": "1G", "owner": "unknown", "owner_type": "unknown"},
+      "to": {"address": "1H", "owner": "unknown", "owner_type": "personal"}
+    },
+    {
+      "blockchain": "bitcoin",
+      "symbol": "BTC",
+      "transaction_type": "transfer",
+      "hash": "0xeee",
+      "amount": 200.0,
+      "amount_usd": 12000000.0,
+      "timestamp": 1712345720,
+      "from": {"address": "1I", "owner": "unknown", "owner_type": "unknown"},
+      "to": {"address": "1J", "owner": "bitfinex", "owner_type": "exchange"}
+    }
+  ]
+}

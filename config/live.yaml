@@ -48,6 +48,18 @@ feeds:
     poll_interval_sec: 60.0
     api_key_env: BOT_BTC_1HR_KALSHI_COINGLASS_API_KEY
 
+  # Whale Alert poller (Slice 11 P4 — shadow only). Observational-only;
+  # no trap gates on it yet. Disabled by default; flip after
+  # BOT_BTC_1HR_KALSHI_WHALE_ALERT_API_KEY is in Secret Manager.
+  whale_alert:
+    enabled: false
+    base_url: https://api.whale-alert.io
+    path: /v1/transactions
+    symbol: btc
+    min_value_usd: 1000000
+    poll_interval_sec: 60.0
+    api_key_env: BOT_BTC_1HR_KALSHI_WHALE_ALERT_API_KEY
+
 risk:
   kelly_fraction: 0.25            # ½-Kelly cap — hard ceiling
   max_position_notional_usd: 250  # initial ceiling; raise only after 1 live week

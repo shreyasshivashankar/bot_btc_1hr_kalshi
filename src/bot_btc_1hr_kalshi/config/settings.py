@@ -65,6 +65,33 @@ class CoinglassHeatmapSettings(BaseModel):
     api_key_env: str = "BOT_BTC_1HR_KALSHI_COINGLASS_API_KEY"
 
 
+class WhaleAlertSettings(BaseModel):
+    """Whale Alert poller (Slice 11 P4 — shadow only).
+
+    Same observational-only contract as the two Coinglass pollers.
+    `enabled: false` disables the polling task entirely. Whale Alert
+    requires an API key (no free-tier unauthenticated path); if the
+    key env var is unset the boot wiring logs a warning and skips
+    starting the poller rather than crashing the process.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    base_url: str = "https://api.whale-alert.io"
+    path: str = "/v1/transactions"
+    # Whale Alert uses lower-case currency codes in the v1 API.
+    symbol: str = "btc"
+    # Minimum transaction USD filter — narrower window = fewer rows
+    # per poll = lower log volume. $1M matches Whale Alert's public
+    # tier default; a paid tier can drop it further if useful.
+    min_value_usd: int = Field(gt=0, default=1_000_000)
+    poll_interval_sec: float = Field(gt=0.0, default=60.0)
+    # Env var name (not the key itself). The actual API key loads
+    # via Secret Manager in Cloud Run / env in dev.
+    api_key_env: str = "BOT_BTC_1HR_KALSHI_WHALE_ALERT_API_KEY"
+
+
 class FeedsSettings(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -73,6 +100,7 @@ class FeedsSettings(BaseModel):
     kraken: FeedSettings
     coinglass: CoinglassSettings = CoinglassSettings()
     coinglass_heatmap: CoinglassHeatmapSettings = CoinglassHeatmapSettings()
+    whale_alert: WhaleAlertSettings = WhaleAlertSettings()
 
 
 class RiskSettings(BaseModel):

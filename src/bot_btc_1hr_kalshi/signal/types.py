@@ -8,6 +8,7 @@ from bot_btc_1hr_kalshi.market_data import L2Book
 from bot_btc_1hr_kalshi.market_data.types import (
     LiquidationHeatmapSample,
     OpenInterestSample,
+    WhaleAlertSample,
 )
 from bot_btc_1hr_kalshi.obs.schemas import Features, Side, TrapName
 
@@ -22,6 +23,10 @@ class MarketSnapshot:
     pre-wiring default and also the value during warmup / fetch failure.
 
     `liquidation_heatmap` follows the same contract (Slice 11 P3).
+
+    `whale_alert` is the Whale Alert rolling-window summary (Slice 11
+    P4 — shadow). Observational only — no trap reads it yet; the field
+    is plumbed so a future promotion decision has a wired substrate.
     """
 
     market_id: str
@@ -32,6 +37,7 @@ class MarketSnapshot:
     strike_usd: float
     open_interest: OpenInterestSample | None = None
     liquidation_heatmap: LiquidationHeatmapSample | None = None
+    whale_alert: WhaleAlertSample | None = None
 
 
 @dataclass(frozen=True, slots=True)

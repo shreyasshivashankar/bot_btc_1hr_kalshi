@@ -133,4 +133,46 @@ class LiquidationHeatmapSample:
     source: str = "coinglass"
 
 
+@dataclass(frozen=True, slots=True)
+class WhaleAlertSample:
+    """Rolling whale-alert summary (Slice 11 P4 — shadow only).
+
+    Sourced from the Whale Alert v1 `transactions` endpoint. Same
+    observational-only contract as `OpenInterestSample` /
+    `LiquidationHeatmapSample`: the poller emits samples onto the App
+    state and structured logs, but no trap gates on them until shadow-
+    soak justifies a specific threshold — docs/RISK.md sign-off path.
+
+    Compressed to four summary stats per poll window (the raw endpoint
+    returns a per-transaction list that would dominate the log budget if
+    emitted unshaped):
+
+    * `net_exchange_flow_usd` — sum over the window of (to-exchange USD)
+      minus (from-exchange USD). Positive = net whales *depositing* to
+      exchanges = a supply-to-sellers proxy (bearish prior). Negative =
+      net withdrawals = removal from trading venues (bullish prior).
+    * `largest_txn_usd` — biggest single whale-tagged transaction in
+      the window. Discrete shocks matter; a single $500M inflow prints
+      differently than ten $50M mid-tier moves.
+    * `txn_count` — number of whale-tagged transactions in the window.
+      A zero sample after a known large move means we're losing events
+      to rate limits or filter drift.
+    * `window_sec` — length of the polling window the summary was
+      accumulated over, so the log reader can normalize across a
+      future poll-cadence change without re-parsing history.
+
+    `source` is always `"whale_alert"` today; kept as a field so a
+    future multi-source aggregator can stamp provenance without a
+    schema migration.
+    """
+
+    ts_ns: int
+    symbol: str
+    net_exchange_flow_usd: float
+    largest_txn_usd: float
+    txn_count: int
+    window_sec: float
+    source: str = "whale_alert"
+
+
 FeedEvent = BookUpdate | TradeEvent | SpotTick

@@ -22,6 +22,7 @@ from bot_btc_1hr_kalshi.market_data.spot_oracle import SpotOracle
 from bot_btc_1hr_kalshi.market_data.types import (
     LiquidationHeatmapSample,
     OpenInterestSample,
+    WhaleAlertSample,
 )
 from bot_btc_1hr_kalshi.monitor.position_monitor import PositionMonitor
 from bot_btc_1hr_kalshi.obs.activity import ActivityTracker
@@ -80,6 +81,10 @@ class App:
     # on cadence. Same promotion contract as `latest_open_interest`:
     # risk-committee sign-off required before any trap reads this.
     latest_liquidation_heatmap: LiquidationHeatmapSample | None = None
+    # Latest Whale Alert rolling summary (Slice 11 P4 — shadow). Net
+    # exchange-flow USD over the polling window; observational only
+    # until shadow-soak + risk-committee sign-off justify a threshold.
+    latest_whale_alert: WhaleAlertSample | None = None
     books: dict[str, L2Book] = field(default_factory=dict)
     trading_halted: bool = False
     tier1_override_active: bool = False

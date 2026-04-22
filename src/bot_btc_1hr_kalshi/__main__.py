@@ -62,11 +62,13 @@ from bot_btc_1hr_kalshi.market_data.feeds.spot import (
     kraken_parser,
 )
 from bot_btc_1hr_kalshi.market_data.feeds.staleness import StalenessTracker
+from bot_btc_1hr_kalshi.market_data.feeds.whale_alert import WhaleAlertPoller
 from bot_btc_1hr_kalshi.market_data.kalshi_rest import kalshi_date_header_probe
 from bot_btc_1hr_kalshi.market_data.spot_oracle import SpotOracle
 from bot_btc_1hr_kalshi.market_data.types import (
     LiquidationHeatmapSample,
     OpenInterestSample,
+    WhaleAlertSample,
 )
 from bot_btc_1hr_kalshi.monitor.position_monitor import PositionMonitor
 from bot_btc_1hr_kalshi.obs.activity import ActivityTracker
@@ -271,6 +273,8 @@ async def serve(app: App, *, admin_token: str, host: str, port: int) -> None:
     coinglass_client: httpx.AsyncClient | None = None
     heatmap_task: asyncio.Task[None] | None = None
     heatmap_client: httpx.AsyncClient | None = None
+    whale_task: asyncio.Task[None] | None = None
+    whale_client: httpx.AsyncClient | None = None
     rest_client: httpx.AsyncClient | None = None
 
     def _on_term() -> None:
@@ -288,6 +292,7 @@ async def serve(app: App, *, admin_token: str, host: str, port: int) -> None:
             ff_refresh_task,
             coinglass_task,
             heatmap_task,
+            whale_task,
         ):
             if t is not None:
                 t.cancel()
@@ -300,6 +305,7 @@ async def serve(app: App, *, admin_token: str, host: str, port: int) -> None:
     calendar_task, ff_refresh_task, ff_client = _start_calendar_if_enabled(app, log)
     coinglass_task, coinglass_client = _start_coinglass_if_enabled(app, log)
     heatmap_task, heatmap_client = _start_coinglass_heatmap_if_enabled(app, log)
+    whale_task, whale_client = _start_whale_alert_if_enabled(app, log)
 
     # Supervise the background tasks. If any dies unexpectedly (not via
     # cancellation), the container must restart — silently running without
@@ -352,6 +358,11 @@ async def serve(app: App, *, admin_token: str, host: str, port: int) -> None:
         heatmap_task.add_done_callback(
             _make_supervisor("coinglass-heatmap", halt_on_death=False)
         )
+    # Whale Alert is observational-only (Slice 11 P4 shadow) — treat as
+    # non-critical for the same reason as Coinglass: a third-party API
+    # hiccup must not take the trading graph down.
+    if whale_task is not None:
+        whale_task.add_done_callback(_make_supervisor("whale-alert", halt_on_death=False))
 
     log.info("boot.serving", mode=app.settings.mode, host=host, port=port)
     try:
@@ -365,6 +376,7 @@ async def serve(app: App, *, admin_token: str, host: str, port: int) -> None:
             ("forex-factory-refresh", ff_refresh_task),
             ("coinglass-oi", coinglass_task),
             ("coinglass-heatmap", heatmap_task),
+            ("whale-alert", whale_task),
         ):
             if task is None:
                 continue
@@ -381,6 +393,8 @@ async def serve(app: App, *, admin_token: str, host: str, port: int) -> None:
             await coinglass_client.aclose()
         if heatmap_client is not None:
             await heatmap_client.aclose()
+        if whale_client is not None:
+            await whale_client.aclose()
         if rest_client is not None:
             await rest_client.aclose()
         if app.kalshi_rest_client is not None:
@@ -623,6 +637,64 @@ def _start_coinglass_heatmap_if_enabled(
         interval=settings.interval,
         poll_interval_sec=settings.poll_interval_sec,
         keyed=bool(api_key),
+    )
+    return task, client
+
+
+def _start_whale_alert_if_enabled(
+    app: App,
+    log: Any,
+) -> tuple[asyncio.Task[None] | None, httpx.AsyncClient | None]:
+    """Spin up the Whale Alert poller (Slice 11 P4 — shadow).
+
+    Same contract as the Coinglass pollers: observational only, non-
+    critical. Unlike Coinglass, Whale Alert has no unauthenticated tier
+    — if the API-key env var is unset we log a warning and skip the
+    task entirely rather than fire 401s on every poll.
+    """
+    settings = app.settings.feeds.whale_alert
+    if not settings.enabled:
+        log.info("boot.whale_alert_disabled", reason="feeds.whale_alert.enabled=false")
+        return None, None
+    if app.settings.mode not in MODES_WITH_FEED_LOOP:
+        log.info("boot.whale_alert_skipped", mode=app.settings.mode)
+        return None, None
+
+    api_key = os.getenv(settings.api_key_env) or None
+    if not api_key:
+        log.warning(
+            "boot.whale_alert_missing_key",
+            note=(
+                f"{settings.api_key_env} not set; whale-alert poller will not start "
+                "(endpoint requires a paid subscription key)"
+            ),
+        )
+        return None, None
+
+    client = httpx.AsyncClient(timeout=10.0)
+
+    async def _on_sample(sample: WhaleAlertSample) -> None:
+        app.latest_whale_alert = sample
+
+    poller = WhaleAlertPoller(
+        client=client,
+        clock=app.clock,
+        on_sample=_on_sample,
+        api_key=api_key,
+        base_url=settings.base_url,
+        path=settings.path,
+        symbol=settings.symbol,
+        min_value_usd=settings.min_value_usd,
+        poll_interval_sec=settings.poll_interval_sec,
+    )
+    task = asyncio.create_task(poller.run(), name="whale-alert")
+    log.info(
+        "boot.whale_alert_enabled",
+        base_url=settings.base_url,
+        path=settings.path,
+        symbol=settings.symbol,
+        min_value_usd=settings.min_value_usd,
+        poll_interval_sec=settings.poll_interval_sec,
     )
     return task, client
 

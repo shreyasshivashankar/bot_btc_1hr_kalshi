@@ -55,6 +55,20 @@ feeds:
     poll_interval_sec: 60.0
     api_key_env: BOT_BTC_1HR_KALSHI_COINGLASS_API_KEY
 
+  # Whale Alert poller (Slice 11 P4 — shadow only). Observational-only
+  # exchange-inflow / outflow summary; no trap reads it yet. Disabled
+  # by default; flip to true once BOT_BTC_1HR_KALSHI_WHALE_ALERT_API_KEY
+  # is provisioned — the endpoint has no free-tier path so the boot
+  # wiring refuses to start unkeyed (drops a warning in logs).
+  whale_alert:
+    enabled: false
+    base_url: https://api.whale-alert.io
+    path: /v1/transactions
+    symbol: btc
+    min_value_usd: 1000000
+    poll_interval_sec: 60.0
+    api_key_env: BOT_BTC_1HR_KALSHI_WHALE_ALERT_API_KEY
+
 risk:
   # Sized for a $50 starter bankroll; bot restarts each session at $50 (see
   # --bankroll default in __main__.py). Per-position cap = bankroll / 2 so

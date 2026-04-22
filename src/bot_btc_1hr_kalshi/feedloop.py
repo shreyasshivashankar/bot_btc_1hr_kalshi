@@ -423,6 +423,7 @@ class FeedLoop:
         latest_oi = self._app.latest_open_interest
         oi_usd = latest_oi.total_oi_usd if latest_oi is not None else None
         latest_heatmap = self._app.latest_liquidation_heatmap
+        latest_whale_alert = self._app.latest_whale_alert
 
         snaps: list[MarketSnapshot] = []
         for market_id, book in self._books.items():
@@ -460,6 +461,7 @@ class FeedLoop:
                 strike_usd=strike,
                 open_interest=latest_oi,
                 liquidation_heatmap=latest_heatmap,
+                whale_alert=latest_whale_alert,
             ))
         return snaps
 
