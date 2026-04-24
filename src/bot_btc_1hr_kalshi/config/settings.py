@@ -92,6 +92,30 @@ class WhaleAlertSettings(BaseModel):
     api_key_env: str = "BOT_BTC_1HR_KALSHI_WHALE_ALERT_API_KEY"
 
 
+class HyperliquidSettings(BaseModel):
+    """Hyperliquid public WS feed for BTC OI (PR-A: DerivativesOracle).
+
+    Replaces the Coinglass HTTP poller with a push-based source —
+    `metaAndAssetCtxs` pushes a fresh asset-context snapshot at the
+    venue's internal cadence (typically a few seconds), so staleness
+    is measured against arrival time rather than against a 30s polling
+    cycle. Disabled by default so existing dev/test configs boot
+    without a derivatives feed; enable per-mode in YAML.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    ws_url: str = "wss://api.hyperliquid.xyz/ws"
+    asset: str = "BTC"
+    # Hard staleness ceiling for `DerivativesOracle.get_open_interest`.
+    # 30s = 6x the venue's typical asset-ctx cadence; gives reconnect
+    # backoff a window to recover before fail-closing the accessor.
+    # Snapshot / telemetry consumers use `_or_none` and tolerate a
+    # cold start gracefully.
+    staleness_halt_ms: int = Field(gt=0, default=30_000)
+
+
 class FeedsSettings(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -101,6 +125,7 @@ class FeedsSettings(BaseModel):
     coinglass: CoinglassSettings = CoinglassSettings()
     coinglass_heatmap: CoinglassHeatmapSettings = CoinglassHeatmapSettings()
     whale_alert: WhaleAlertSettings = WhaleAlertSettings()
+    hyperliquid: HyperliquidSettings = HyperliquidSettings()
 
 
 class RiskSettings(BaseModel):

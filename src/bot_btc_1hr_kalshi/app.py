@@ -18,6 +18,7 @@ from bot_btc_1hr_kalshi.execution.broker.base import Broker
 from bot_btc_1hr_kalshi.execution.oms import OMS
 from bot_btc_1hr_kalshi.market_data.bars import MultiTimeframeBus
 from bot_btc_1hr_kalshi.market_data.book import L2Book
+from bot_btc_1hr_kalshi.market_data.derivatives_oracle import DerivativesOracle
 from bot_btc_1hr_kalshi.market_data.spot_oracle import SpotOracle
 from bot_btc_1hr_kalshi.market_data.types import (
     LiquidationHeatmapSample,
@@ -54,6 +55,11 @@ class App:
     # 6 — replaces the previous per-session SpotFeed ownership). None when
     # the feed loop is disabled (dev mode, unit tests).
     spot_oracle: SpotOracle | None = None
+    # Persistent BTC derivatives source (PR-A: Hyperliquid OI; PR-B+: Bybit).
+    # Lives at App scope alongside `spot_oracle`. Coinglass HTTP poller
+    # remains wired in parallel until parity is observed in soak — both
+    # paths write to `latest_open_interest` and the most recent wins.
+    derivatives_oracle: DerivativesOracle | None = None
     # Multi-timeframe bar bus (Slice 7). Downstreams that need candle-closed
     # views of spot (RSI, VWAP, HTF alignment) subscribe to the relevant
     # timeframe here instead of re-aggregating from raw ticks. Fed by
