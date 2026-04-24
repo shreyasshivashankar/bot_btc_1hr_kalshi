@@ -5,28 +5,48 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from bot_btc_1hr_kalshi.market_data import L2Book
-from bot_btc_1hr_kalshi.market_data.types import (
-    LiquidationHeatmapSample,
-    OpenInterestSample,
-    WhaleAlertSample,
-)
+from bot_btc_1hr_kalshi.market_data.types import OpenInterestSample
 from bot_btc_1hr_kalshi.obs.schemas import Features, Side, TrapName
+
+
+@dataclass(frozen=True, slots=True)
+class LiquidationPressure:
+    """Recent liquidation pressure within a price band around spot (PR-C).
+
+    Pre-aggregated by the snapshot builder so each trap only does a
+    single threshold compare. Built from the FeatureEngine rolling
+    deque, which is fed live by the Bybit liquidation stream via
+    DerivativesOracle.subscribe_liquidations.
+
+    `long_usd_below_spot`: USD notional of long-side liquidations whose
+    print price sat strictly below current spot inside the lookback
+    window. A floor (long-side) trap reads this — large recent long
+    wipes below us means a downside cascade is in progress, not a dip
+    to fade.
+
+    `short_usd_above_spot`: symmetric, mirrored above spot. A ceiling
+    (short-side) trap reads this — large recent short wipes above us
+    means an upside cascade is in progress, not a rip to fade.
+    """
+
+    long_usd_below_spot: float
+    short_usd_above_spot: float
 
 
 @dataclass(frozen=True, slots=True)
 class MarketSnapshot:
     """Everything a trap needs to decide at a single point in time.
 
-    `open_interest` is populated from the Coinglass poller (Slice 11 P2)
-    when available; traps treat it as *observational* until shadow-mode
-    data justifies a microstructure-gated entry. `None` is the
-    pre-wiring default and also the value during warmup / fetch failure.
+    `open_interest` is populated from `App.latest_open_interest`, which
+    DerivativesOracle writes from the Hyperliquid `metaAndAssetCtxs`
+    and Bybit `tickers` push streams. Traps treat it as observational
+    until shadow-soak data justifies a microstructure-gated entry. `None`
+    is the cold-start / disabled-feed value.
 
-    `liquidation_heatmap` follows the same contract (Slice 11 P3).
-
-    `whale_alert` is the Whale Alert rolling-window summary (Slice 11
-    P4 — shadow). Observational only — no trap reads it yet; the field
-    is plumbed so a future promotion decision has a wired substrate.
+    `liquidation_pressure` aggregates the FeatureEngine rolling
+    liquidation deque against current spot. Driven by the live Bybit
+    liquidation-prints stream via DerivativesOracle; shadow contract
+    (tag only, no gate) until risk-committee sign-off.
     """
 
     market_id: str
@@ -36,8 +56,7 @@ class MarketSnapshot:
     minutes_to_settlement: float
     strike_usd: float
     open_interest: OpenInterestSample | None = None
-    liquidation_heatmap: LiquidationHeatmapSample | None = None
-    whale_alert: WhaleAlertSample | None = None
+    liquidation_pressure: LiquidationPressure | None = None
 
 
 @dataclass(frozen=True, slots=True)

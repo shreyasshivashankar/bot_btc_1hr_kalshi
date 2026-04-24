@@ -73,7 +73,7 @@ from bot_btc_1hr_kalshi.risk.breakers import BreakerState
 from bot_btc_1hr_kalshi.signal.features import CVD_ROLLING_PERIODS, FeatureEngine
 from bot_btc_1hr_kalshi.signal.integrity import IntegrityTracker
 from bot_btc_1hr_kalshi.signal.registry import run_traps_cross_strike
-from bot_btc_1hr_kalshi.signal.types import MarketSnapshot
+from bot_btc_1hr_kalshi.signal.types import LiquidationPressure, MarketSnapshot
 
 _log = structlog.get_logger("bot_btc_1hr_kalshi.feedloop")
 
@@ -465,8 +465,7 @@ class FeedLoop:
         spot_range_60s = self._spot_range_60s()
         latest_oi = self._app.latest_open_interest
         oi_usd = latest_oi.total_oi_usd if latest_oi is not None else None
-        latest_heatmap = self._app.latest_liquidation_heatmap
-        latest_whale_alert = self._app.latest_whale_alert
+        liq_pressure = self._build_liquidation_pressure(spot=spot)
 
         snaps: list[MarketSnapshot] = []
         for market_id, book in self._books.items():
@@ -503,10 +502,43 @@ class FeedLoop:
                 minutes_to_settlement=mts,
                 strike_usd=strike,
                 open_interest=latest_oi,
-                liquidation_heatmap=latest_heatmap,
-                whale_alert=latest_whale_alert,
+                liquidation_pressure=liq_pressure,
             ))
         return snaps
+
+    def _build_liquidation_pressure(
+        self, *, spot: float
+    ) -> LiquidationPressure:
+        """Aggregate the FeatureEngine liquidation deque around `spot`.
+
+        `FeatureEngine` is a required FeedLoop dependency (enforced at
+        `run_forever` construction time), so this always returns a
+        concrete sample. Both totals default to 0.0 on cold start; the
+        trap gate compares against `total >= threshold`, so zeros fail
+        the check cleanly without special-casing.
+        """
+        signal = self._app.settings.signal
+        window_pct = signal.liquidation_window_pct
+        lookback = signal.liquidation_lookback_sec
+        now_ns = self._clock.now_ns()
+        long_below = self._features.liquidation_usd_in_window(
+            now_ns=now_ns,
+            lookback_sec=lookback,
+            side="long",
+            price_min=spot * (1.0 - window_pct),
+            price_max=spot,
+        )
+        short_above = self._features.liquidation_usd_in_window(
+            now_ns=now_ns,
+            lookback_sec=lookback,
+            side="short",
+            price_min=spot,
+            price_max=spot * (1.0 + window_pct),
+        )
+        return LiquidationPressure(
+            long_usd_below_spot=long_below,
+            short_usd_above_spot=short_above,
+        )
 
     def _spot_range_60s(self) -> float | None:
         """max(price) - min(price) across the last 60s of primary ticks.
