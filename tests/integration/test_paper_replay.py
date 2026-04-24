@@ -183,18 +183,24 @@ async def test_replay_floor_reversion_happy_path_emits_bet_outcome() -> None:
     app, orch, features = _build_app_and_orch()
     _prewarm_bollinger_quiet(features)
 
-    # Book snapshot + quiet spot noise — no trap should fire yet (pct_b is
-    # near mid-band from the pre-warm).
+    # Book snapshot + quiet spot noise — no trap should fire yet. Live
+    # spot ≈ 60k matches the bar-close-anchored bands ≈ 60k, so pct_b sits
+    # near mid. (Earlier this phase also included a 55k crash spot and
+    # asserted no trap — that relied on pct_b being frozen at the last
+    # bar close. With live-spot penetration, the 55k tick would arm the
+    # trap immediately, which is exactly the lag fix we want.)
     pre_crash: list[FeedEvent] = []
     pre_crash.extend(_warmup_events(NS_PER_SEC))
-    pre_crash.extend(_crash_events(pre_crash[-1].ts_ns))
     result = await replay(pre_crash, orch)
     assert result.entries_attempted == 0, "pre-crash: pct_b should still be near mid-band"
 
-    # Stamp the crash close → pct_b drops below -1 → floor-reversion primed.
+    # Stamp the crash close → bands pulled down → and crash the live spot
+    # via `_crash_events` so pct_b drops well below -1 → floor primed.
     _inject_crash_close(features)
 
-    post_crash = _fill_and_rebound_events(pre_crash[-1].ts_ns + NS_PER_SEC)
+    post_crash: list[FeedEvent] = []
+    post_crash.extend(_crash_events(pre_crash[-1].ts_ns + NS_PER_SEC))
+    post_crash.extend(_fill_and_rebound_events(post_crash[-1].ts_ns + NS_PER_SEC))
     result = await replay(post_crash, orch)
 
     assert result.entries_attempted >= 1, f"no entry attempted; rejects={result.reject_reasons}"
@@ -285,8 +291,13 @@ async def test_replay_cvd_veto_blocks_floor_entry_and_stays_silent() -> None:
     _prewarm_1m_cvd_heavy_selling(features)
     _inject_crash_close(features)
 
+    # Crash the live spot too — without it, pct_b is scored against the
+    # ~60k warmup spots and ends up positive (above the post-crash bands),
+    # which would route into the ceiling trap and bypass the floor-only
+    # CVD veto under test.
     events: list[FeedEvent] = []
     events.extend(_warmup_events(NS_PER_SEC))
+    events.extend(_crash_events(events[-1].ts_ns))
     events.extend(_fill_and_rebound_events(events[-1].ts_ns + NS_PER_SEC))
     result = await replay(events, orch)
 
@@ -314,8 +325,12 @@ async def test_replay_htf_veto_blocks_floor_entry_and_stays_silent() -> None:
     # Seed book + a few spot ticks so `_spot_price` is populated — without
     # this the snapshot returns None before the trap is even called, and
     # the test would pass trivially without exercising the HTF path.
+    # Crash the live spot for the same reason as the CVD-veto test: pct_b
+    # must be in floor-trap territory so the HTF veto is the gate that
+    # blocks entry, not a wrong-side trap routing.
     events: list[FeedEvent] = []
     events.extend(_warmup_events(NS_PER_SEC))
+    events.extend(_crash_events(events[-1].ts_ns))
     events.extend(_fill_and_rebound_events(events[-1].ts_ns + NS_PER_SEC))
     result = await replay(events, orch)
 

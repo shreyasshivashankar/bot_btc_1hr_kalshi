@@ -21,7 +21,9 @@ from bot_btc_1hr_kalshi.execution.broker.base import (
     Fill,
     OrderAck,
     OrderRequest,
+    OrderType,
 )
+from bot_btc_1hr_kalshi.market_data.types import TradeEvent
 from bot_btc_1hr_kalshi.obs.activity import ActivityTracker
 from bot_btc_1hr_kalshi.obs.clock import Clock
 from bot_btc_1hr_kalshi.obs.lifecycle import LifecycleEmitter
@@ -51,6 +53,20 @@ class EntryResult:
 class ExitResult:
     ack: OrderAck
     bet_outcome: BetOutcome | None
+
+
+@dataclass(frozen=True, slots=True)
+class _RestingExitInfo:
+    """Per-position bookkeeping for a maker exit that the broker has acked
+    as `resting`. Held until the order fills (via `on_trade_event`), is
+    cancelled (via `cancel_resting_exit`), or — in live mode — surfaces
+    through reconciliation. Stored separately from `_pending_exit` (the
+    in-flight submit lock) because resting orders persist across ticks."""
+
+    order_id: str
+    exit_reason: ExitReason
+    posted_at_ns: int
+    posted_price_cents: int
 
 
 class OMS:
@@ -92,6 +108,13 @@ class OMS:
         # closes after N partials will have emitted outcomes p1..pN plus a
         # final unsuffixed outcome for the remainder.
         self._partial_seq: dict[str, int] = {}
+        # Smart-router exit bookkeeping. `_resting_exits` maps position_id
+        # → resting maker exit info; `_resting_exits_by_order` is the
+        # reverse for fast match_trade fill lookup. Both stay coherent —
+        # every mutation updates both. Cleared when the order fully fills,
+        # is cancelled, or the position closes for any other reason.
+        self._resting_exits: dict[str, _RestingExitInfo] = {}
+        self._resting_exits_by_order: dict[str, str] = {}
 
     def attach_calendar_guard(
         self, is_blocked: Callable[[int], bool] | None
@@ -262,6 +285,7 @@ class OMS:
         position_id: str,
         limit_price_cents: int,
         exit_reason: ExitReason,
+        order_type: OrderType = "ioc",
     ) -> ExitResult:
         pos = self._portfolio.get(position_id)
         if pos is None:
@@ -269,18 +293,43 @@ class OMS:
 
         # Nonce the client_order_id so that a retry after a lost ack doesn't
         # double-execute against a broker that de-dupes by client_order_id.
+        now_ns = self._clock.now_ns()
         req = OrderRequest(
-            client_order_id=f"exit-{position_id}-{self._clock.now_ns()}",
+            client_order_id=f"exit-{position_id}-{now_ns}",
             market_id=pos.market_id,
             side=pos.side,
             action="SELL",
             limit_price_cents=limit_price_cents,
             contracts=pos.contracts,
-            order_type="ioc",
+            order_type=order_type,
         )
         ack = await self._broker.submit(req)
 
         bet_outcome: BetOutcome | None = None
+        if ack.status == "resting":
+            # Maker exit posted but not yet filled. Track so the monitor
+            # can (a) skip re-submission while it sits, (b) cancel + re-
+            # submit IOC if urgency escalates, and (c) finalize when
+            # `on_trade_event` matches a public-tape fill against it.
+            info = _RestingExitInfo(
+                order_id=ack.order_id,
+                exit_reason=exit_reason,
+                posted_at_ns=now_ns,
+                posted_price_cents=limit_price_cents,
+            )
+            self._resting_exits[position_id] = info
+            self._resting_exits_by_order[ack.order_id] = position_id
+            if self._lifecycle is not None:
+                self._lifecycle.order_ack(
+                    decision_id=position_id,
+                    client_order_id=ack.client_order_id,
+                    order_id=ack.order_id,
+                    status=ack.status,
+                    filled_contracts=ack.filled_contracts,
+                    remaining_contracts=ack.remaining_contracts,
+                    reason=ack.reason,
+                )
+            return ExitResult(ack=ack, bet_outcome=None)
         if ack.status == "filled" and len(ack.fills) > 0:
             exit_fill = _aggregate_sell_fill(ack.fills)
             bet_outcome = self._portfolio.close(
@@ -332,6 +381,119 @@ class OMS:
                 reason=ack.reason,
             )
         return ExitResult(ack=ack, bet_outcome=bet_outcome)
+
+    # ---- smart-router exit lifecycle -----------------------------------
+
+    def has_resting_exit(self, position_id: str) -> bool:
+        return position_id in self._resting_exits
+
+    def resting_exit_reason(self, position_id: str) -> ExitReason | None:
+        info = self._resting_exits.get(position_id)
+        return info.exit_reason if info is not None else None
+
+    async def cancel_resting_exit(self, position_id: str) -> bool:
+        """Cancel the maker exit currently resting for `position_id`.
+
+        Used by `PositionMonitor` when an urgency-tier exit (early cashout,
+        soft stop, tier-1 flatten) supersedes a patient exit already in
+        the book — we cancel the maker so we can resubmit IOC at the
+        cross. Returns True iff the broker confirmed a cancellation.
+        Even on False (broker says no such order — e.g., it filled in
+        the meantime), we drop our local registry: a fill update will
+        arrive separately via `on_trade_event`.
+        """
+        info = self._resting_exits.pop(position_id, None)
+        if info is None:
+            return False
+        self._resting_exits_by_order.pop(info.order_id, None)
+        cancelled = await self._broker.cancel(info.order_id)
+        if not cancelled:
+            self._log.info(
+                "exit.cancel_resting_no_op",
+                position_id=position_id,
+                order_id=info.order_id,
+            )
+        return cancelled
+
+    async def on_trade_event(self, trade: TradeEvent) -> tuple[Fill, ...]:
+        """Drive resting maker exits to fills using public-tape trades.
+
+        Called from the feedloop / replay orchestrator on every
+        `TradeEvent`. Delegates the match to the broker (PaperBroker
+        simulates; live brokers no-op), then for each returned fill:
+        looks up the owning position via `_resting_exits_by_order`,
+        applies the close (or partial close) through the portfolio,
+        emits the BetOutcome, and tidies the resting-exit registry.
+
+        Returns the fills that did **not** match a known resting exit.
+        These are entry-side fills (replay registers entries elsewhere)
+        or stray fills the caller may want to handle. The feedloop in
+        production ignores the return value because live brokers
+        no-op `match_trade` and entry fills arrive via reconciliation.
+        Replay routes the unhandled fills into `_apply_entry_fill`.
+        """
+        fills = await self._broker.match_trade(trade)
+        if not fills:
+            return ()
+        unhandled: list[Fill] = []
+        for fill in fills:
+            position_id = self._resting_exits_by_order.get(fill.order_id)
+            if position_id is None:
+                unhandled.append(fill)
+                continue
+            info = self._resting_exits.get(position_id)
+            if info is None:
+                # Defensive: order_id was registered but position-level
+                # mapping was cleared (race with cancel_resting_exit).
+                self._resting_exits_by_order.pop(fill.order_id, None)
+                continue
+            pos = self._portfolio.get(position_id)
+            if pos is None:
+                # Position closed elsewhere — drop registry and move on.
+                self._resting_exits.pop(position_id, None)
+                self._resting_exits_by_order.pop(fill.order_id, None)
+                continue
+            if fill.contracts >= pos.contracts:
+                bet_outcome = self._portfolio.close(
+                    position_id=position_id,
+                    exit_fill=fill,
+                    exit_reason=info.exit_reason,
+                )
+                self._outcomes_log.info("bet_outcome", **bet_outcome.model_dump())
+                self._partial_seq.pop(position_id, None)
+                self._resting_exits.pop(position_id, None)
+                self._resting_exits_by_order.pop(fill.order_id, None)
+                if self._lifecycle is not None:
+                    self._lifecycle.position_closed(
+                        position_id=position_id,
+                        exit_price_cents=fill.price_cents,
+                        net_pnl_usd=bet_outcome.net_pnl_usd,
+                        exit_reason=info.exit_reason,
+                    )
+            else:
+                seq = self._partial_seq.get(position_id, 0) + 1
+                self._partial_seq[position_id] = seq
+                bet_outcome = self._portfolio.partial_close(
+                    position_id=position_id,
+                    exit_fill=fill,
+                    exit_reason=info.exit_reason,
+                    partial_seq=seq,
+                )
+                self._outcomes_log.info("bet_outcome", **bet_outcome.model_dump())
+                if self._lifecycle is not None:
+                    self._lifecycle.position_partial_closed(
+                        position_id=position_id,
+                        closed_contracts=fill.contracts,
+                        remaining_contracts=pos.contracts,
+                        exit_price_cents=fill.price_cents,
+                        partial_seq=seq,
+                    )
+                # Resting order is still live for the remainder; keep the
+                # registry mapping. PaperBroker keeps the resting entry
+                # alive too (its own `_resting[oid]` is only deleted when
+                # remaining hits 0). If the next tick decides to escalate,
+                # cancel_resting_exit will tear it down cleanly.
+        return tuple(unhandled)
 
 
 def _binary_variance(price_cents: int) -> float:

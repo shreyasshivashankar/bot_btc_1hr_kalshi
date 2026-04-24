@@ -482,3 +482,206 @@ def test_aggregate_sell_fill_sums_fees_and_contracts() -> None:
     assert agg.fees_usd == pytest.approx(0.60)
     # weighted avg = (30*10 + 31*20 + 32*30) / 60 = 1880/60 ≈ 31.333 → 31 cents
     assert agg.price_cents == 31
+
+
+# ---- smart-router exit lifecycle (resting maker via match_trade) ---------
+
+
+async def _open_position(
+    oms: OMS, broker: PaperBroker, clock: ManualClock
+) -> str:
+    """Helper: drive an entry through to an open position via the public
+    tape. Returns the position_id."""
+    res = await oms.consider_entry(signal=_signal(), market_id=MARKET)
+    assert res.position_id is not None
+    clock.advance_ns(1_000_000)
+    trade = TradeEvent(
+        seq=2,
+        ts_ns=clock.now_ns(),
+        market_id=MARKET,
+        price_cents=29,
+        size=res.decision.sizing.contracts,
+        aggressor="sell",
+        taker_side="YES",
+    )
+    fills = await broker.match_trade(trade)
+    assert len(fills) == 1
+    oms.on_entry_fill(
+        decision_id=res.decision.decision_id,
+        fill=fills[0],
+        trap=res.decision.trap,
+        features_at_entry=res.decision.features,
+    )
+    return res.position_id
+
+
+async def test_submit_exit_maker_route_returns_resting_and_registers() -> None:
+    """A maker exit posted inside the spread gets `resting` status — no
+    BetOutcome yet, position stays open, OMS tracks the resting order so
+    the monitor can decide whether to escalate or wait."""
+    oms, broker, portfolio, _book, _b, clock = _oms()
+    pid = await _open_position(oms, broker, clock)
+
+    # Inside-the-spread maker SELL at 30 (bid=28, ask=32) → rests.
+    result = await oms.submit_exit(
+        position_id=pid,
+        limit_price_cents=30,
+        exit_reason="theta_net_target",
+        order_type="maker",
+    )
+    assert result.ack.status == "resting"
+    assert result.bet_outcome is None
+    assert oms.has_resting_exit(pid)
+    assert oms.resting_exit_reason(pid) == "theta_net_target"
+    assert portfolio.get(pid) is not None  # still open
+
+
+async def test_on_trade_event_routes_exit_fill_and_closes_position() -> None:
+    """A counter-aggressor that lifts the resting maker drives the position
+    closed via OMS.on_trade_event — emits BetOutcome, clears the registry,
+    returns no unhandled fills."""
+    oms, broker, portfolio, _book, _b, clock = _oms()
+    pid = await _open_position(oms, broker, clock)
+    result = await oms.submit_exit(
+        position_id=pid,
+        limit_price_cents=30,
+        exit_reason="theta_net_target",
+        order_type="maker",
+    )
+    assert result.ack.status == "resting"
+    contracts = portfolio.get(pid).contracts  # type: ignore[union-attr]
+
+    clock.advance_ns(1_000_000)
+    trade = TradeEvent(
+        seq=10,
+        ts_ns=clock.now_ns(),
+        market_id=MARKET,
+        price_cents=30,
+        size=contracts,
+        aggressor="buy",
+        taker_side="YES",
+    )
+    unhandled = await oms.on_trade_event(trade)
+    assert unhandled == ()  # was a known exit fill
+    assert portfolio.get(pid) is None
+    assert not oms.has_resting_exit(pid)
+
+
+async def test_on_trade_event_partial_fill_keeps_position_and_registry() -> None:
+    """A counter-aggressor partially lifts the resting maker. OMS partial-
+    closes the position, emits a partial BetOutcome, and keeps the resting-
+    exit registry — the broker's resting order also survives for the
+    remainder. A subsequent trade for the rest closes it cleanly."""
+    oms, broker, portfolio, _book, _b, clock = _oms()
+    pid = await _open_position(oms, broker, clock)
+    contracts = portfolio.get(pid).contracts  # type: ignore[union-attr]
+    assert contracts >= 4
+
+    await oms.submit_exit(
+        position_id=pid,
+        limit_price_cents=30,
+        exit_reason="theta_net_target",
+        order_type="maker",
+    )
+    assert oms.has_resting_exit(pid)
+
+    clock.advance_ns(1_000_000)
+    partial = TradeEvent(
+        seq=20,
+        ts_ns=clock.now_ns(),
+        market_id=MARKET,
+        price_cents=30,
+        size=2,
+        aggressor="buy",
+        taker_side="YES",
+    )
+    unhandled = await oms.on_trade_event(partial)
+    assert unhandled == ()
+    pos = portfolio.get(pid)
+    assert pos is not None
+    assert pos.contracts == contracts - 2
+    assert oms.has_resting_exit(pid)  # remainder still parked
+
+    clock.advance_ns(1_000_000)
+    rest = TradeEvent(
+        seq=21,
+        ts_ns=clock.now_ns(),
+        market_id=MARKET,
+        price_cents=30,
+        size=contracts - 2,
+        aggressor="buy",
+        taker_side="YES",
+    )
+    await oms.on_trade_event(rest)
+    assert portfolio.get(pid) is None
+    assert not oms.has_resting_exit(pid)
+
+
+async def test_cancel_resting_exit_calls_broker_and_clears_registry() -> None:
+    oms, broker, portfolio, _book, _b, clock = _oms()
+    pid = await _open_position(oms, broker, clock)
+    await oms.submit_exit(
+        position_id=pid,
+        limit_price_cents=30,
+        exit_reason="theta_net_target",
+        order_type="maker",
+    )
+    assert oms.has_resting_exit(pid)
+
+    cancelled = await oms.cancel_resting_exit(pid)
+    assert cancelled is True
+    assert not oms.has_resting_exit(pid)
+    assert oms.resting_exit_reason(pid) is None
+    # Position survives — caller is expected to resubmit (typically IOC).
+    assert portfolio.get(pid) is not None
+    # Broker state matches: no resting orders left for this client.
+    assert await broker.list_open_orders() == ()
+
+
+async def test_cancel_resting_exit_unknown_position_returns_false() -> None:
+    oms, _broker, _p, _book, _b, _clock = _oms()
+    cancelled = await oms.cancel_resting_exit("nonexistent")
+    assert cancelled is False
+
+
+async def test_on_trade_event_returns_unhandled_fills_for_entries() -> None:
+    """Entry-side fills (no resting-exit registration) bubble back to the
+    caller so replay can route them into `on_entry_fill`. This is the
+    contract that lets PaperBroker work through a single match_trade
+    call shared by both entry- and exit-side resting orders."""
+    oms, _broker, _p, _book, _b, clock = _oms()
+    # Submit an entry order — it rests as a maker BUY at 29 on YES.
+    res = await oms.consider_entry(signal=_signal(), market_id=MARKET)
+    assert res.ack is not None and res.ack.status == "resting"
+    # No exits have been submitted, so the resting-exits registry is empty.
+    assert not oms.has_resting_exit(res.position_id or "")
+
+    clock.advance_ns(1_000_000)
+    trade = TradeEvent(
+        seq=2,
+        ts_ns=clock.now_ns(),
+        market_id=MARKET,
+        price_cents=29,
+        size=res.decision.sizing.contracts,
+        aggressor="sell",
+        taker_side="YES",
+    )
+    unhandled = await oms.on_trade_event(trade)
+    assert len(unhandled) == 1
+    assert unhandled[0].action == "BUY"
+    assert unhandled[0].client_order_id == res.decision.decision_id
+
+
+async def test_on_trade_event_no_match_returns_empty() -> None:
+    oms, _broker, _p, _book, _b, clock = _oms()
+    trade = TradeEvent(
+        seq=1,
+        ts_ns=clock.now_ns(),
+        market_id=MARKET,
+        price_cents=29,
+        size=10,
+        aggressor="sell",
+        taker_side="YES",
+    )
+    unhandled = await oms.on_trade_event(trade)
+    assert unhandled == ()

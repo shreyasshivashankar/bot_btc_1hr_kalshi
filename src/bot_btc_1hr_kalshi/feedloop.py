@@ -311,9 +311,11 @@ class FeedLoop:
                 await self._kalshi_feed.force_reconnect()
                 return
         elif isinstance(event, TradeEvent):
-            # Paper-broker maker-match happens via book.apply crossings;
-            # trade events do not directly produce fills in our model.
-            pass
+            # Drive resting maker exits to fills using the public tape.
+            # OMS delegates to broker.match_trade — PaperBroker simulates,
+            # KalshiBroker / ShadowBroker no-op (live fills come back via
+            # ack / WS order channel / reconciler instead).
+            await self._app.oms.on_trade_event(event)
         elif isinstance(event, SpotTick):
             # Spot ticks arrive via oracle callbacks, not the Kalshi feed;
             # if one shows up here it's a mis-wired test fixture. Drop it
@@ -418,10 +420,6 @@ class FeedLoop:
         """
         if not self._book.valid:
             return []
-        pct_b = self._features.bollinger_pct_b(_PRIMARY_TF)
-        atr = self._features.atr(_PRIMARY_TF)
-        if pct_b is None or atr is None:
-            return []
         # Hard LastSpot contract: if the primary spot is stale, sit this
         # tick out. `get_primary_or_none` returns None on both cold-start
         # and staleness, identical to refusing to trade — which is what
@@ -430,6 +428,12 @@ class FeedLoop:
             max_age_ms=self._spot_staleness_max_age_ms
         )
         if spot is None:
+            return []
+        # Pass live spot so pct_b moves with the tape between bar closes
+        # — bands are still anchored to the latest 5m close on this TF.
+        pct_b = self._features.bollinger_pct_b(_PRIMARY_TF, live_price=spot)
+        atr = self._features.atr(_PRIMARY_TF)
+        if pct_b is None or atr is None:
             return []
         mts = self._mts_fn(self._clock.now_ns())
         regime_trend = self._features.regime_trend(_PRIMARY_TF)

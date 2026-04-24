@@ -31,6 +31,7 @@ from bot_btc_1hr_kalshi.execution.broker.base import (
     OrderStatus,
 )
 from bot_btc_1hr_kalshi.execution.broker.kalshi_signer import KalshiSigner
+from bot_btc_1hr_kalshi.market_data.types import TradeEvent
 from bot_btc_1hr_kalshi.obs.clock import Clock
 from bot_btc_1hr_kalshi.obs.schemas import Side
 
@@ -225,6 +226,14 @@ class KalshiBroker:
                 fills=(),
             ))
         return tuple(acks)
+
+    async def match_trade(self, trade: TradeEvent) -> tuple[Fill, ...]:
+        """Live broker doesn't synthesize fills from the public tape — fills
+        come back via the order ack on submit, the (future) WS order channel,
+        and the periodic reconciler. The Broker protocol mandates this method
+        so the OMS smart-router exit path can call it uniformly across paper
+        and live; here it's an explicit no-op."""
+        return ()
 
     async def list_positions(self) -> tuple[BrokerPosition, ...]:
         resp = await self._request("GET", "/portfolio/positions")

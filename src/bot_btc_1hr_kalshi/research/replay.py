@@ -97,7 +97,11 @@ class ReplayOrchestrator:
         if isinstance(event, BookUpdate):
             self._book.apply(event)
         elif isinstance(event, TradeEvent):
-            for fill in await self._broker.match_trade(event):
+            # OMS owns the broker.match_trade call. It consumes any fill
+            # whose order_id is registered as a resting maker exit and
+            # returns the rest — for the orchestrator those are entry
+            # fills against pending entries we tracked via _pending.
+            for fill in await self._app.oms.on_trade_event(event):
                 self._apply_entry_fill(fill)
                 self.result.fills.append(fill)
         elif isinstance(event, SpotTick):
@@ -168,9 +172,15 @@ class ReplayOrchestrator:
     def _snapshot(self) -> MarketSnapshot | None:
         if not self._book.valid:
             return None
-        pct_b = self._features.bollinger_pct_b(self._primary_tf)
+        if self._spot_price is None:
+            return None
+        # Live spot drives pct_b penetration; bands stay bar-anchored.
+        # See FeatureEngine.bollinger_pct_b for the rationale.
+        pct_b = self._features.bollinger_pct_b(
+            self._primary_tf, live_price=self._spot_price
+        )
         atr = self._features.atr(self._primary_tf)
-        if pct_b is None or atr is None or self._spot_price is None:
+        if pct_b is None or atr is None:
             return None
         spread = self._book.spread_cents
         if spread is None:
