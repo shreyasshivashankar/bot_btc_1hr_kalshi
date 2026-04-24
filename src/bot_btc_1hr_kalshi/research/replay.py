@@ -97,7 +97,11 @@ class ReplayOrchestrator:
         if isinstance(event, BookUpdate):
             self._book.apply(event)
         elif isinstance(event, TradeEvent):
-            for fill in await self._broker.match_trade(event):
+            # OMS owns the broker.match_trade call. It consumes any fill
+            # whose order_id is registered as a resting maker exit and
+            # returns the rest — for the orchestrator those are entry
+            # fills against pending entries we tracked via _pending.
+            for fill in await self._app.oms.on_trade_event(event):
                 self._apply_entry_fill(fill)
                 self.result.fills.append(fill)
         elif isinstance(event, SpotTick):

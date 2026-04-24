@@ -311,9 +311,11 @@ class FeedLoop:
                 await self._kalshi_feed.force_reconnect()
                 return
         elif isinstance(event, TradeEvent):
-            # Paper-broker maker-match happens via book.apply crossings;
-            # trade events do not directly produce fills in our model.
-            pass
+            # Drive resting maker exits to fills using the public tape.
+            # OMS delegates to broker.match_trade — PaperBroker simulates,
+            # KalshiBroker / ShadowBroker no-op (live fills come back via
+            # ack / WS order channel / reconciler instead).
+            await self._app.oms.on_trade_event(event)
         elif isinstance(event, SpotTick):
             # Spot ticks arrive via oracle callbacks, not the Kalshi feed;
             # if one shows up here it's a mis-wired test fixture. Drop it

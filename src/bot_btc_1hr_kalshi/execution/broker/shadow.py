@@ -24,9 +24,11 @@ from __future__ import annotations
 
 from bot_btc_1hr_kalshi.execution.broker.base import (
     BrokerPosition,
+    Fill,
     OrderAck,
     OrderRequest,
 )
+from bot_btc_1hr_kalshi.market_data.types import TradeEvent
 from bot_btc_1hr_kalshi.obs.clock import Clock
 from bot_btc_1hr_kalshi.obs.logging import get_logger
 
@@ -86,6 +88,12 @@ class ShadowBroker:
         return order_id.startswith("shadow-")
 
     async def list_open_orders(self) -> tuple[OrderAck, ...]:
+        return ()
+
+    async def match_trade(self, trade: TradeEvent) -> tuple[Fill, ...]:
+        # Shadow has no resting orders by construction (every submit is
+        # acked cancelled). Returning () keeps the OMS uniform across
+        # broker variants without forcing the caller to special-case.
         return ()
 
     async def list_positions(self) -> tuple[BrokerPosition, ...]:

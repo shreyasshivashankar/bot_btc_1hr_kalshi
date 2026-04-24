@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal, Protocol, runtime_checkable
 
+from bot_btc_1hr_kalshi.market_data.types import TradeEvent
 from bot_btc_1hr_kalshi.obs.schemas import Side
 
 OrderType = Literal["maker", "ioc"]
@@ -67,3 +68,14 @@ class Broker(Protocol):
     async def cancel(self, order_id: str) -> bool: ...
     async def list_open_orders(self) -> tuple[OrderAck, ...]: ...
     async def list_positions(self) -> tuple[BrokerPosition, ...]: ...
+    async def match_trade(self, trade: TradeEvent) -> tuple[Fill, ...]:
+        """Match a public TradeEvent against any locally-resting orders.
+
+        Used by PaperBroker to simulate maker-order fills. Live brokers
+        (KalshiBroker, ShadowBroker) return `()` — fills come back via
+        the trading-API order acks / WS order channel / reconciler, not
+        synthesized from public-tape trades. The smart-router exit path
+        relies on this to drive resting maker exits to fills under paper
+        and replay; live mode degrades to reconciler-driven fills until
+        the FIX execution-report channel lands."""
+        ...
