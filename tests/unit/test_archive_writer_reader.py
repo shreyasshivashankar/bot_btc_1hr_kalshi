@@ -165,6 +165,75 @@ def test_writer_recovers_when_fh_closed_mid_hour(tmp_path: Path) -> None:
     assert [e.seq for e in events] == [1, 3]
 
 
+def test_writer_keeps_archive_dir_empty_until_hour_roll(tmp_path: Path) -> None:
+    """Staging tier: hot writes land on local disk. Nothing touches the
+    operator's `archive_dir` (the GCS FUSE mount in prod) until an hour
+    rolls or close() is called. Regression for the FUSE thrash that was
+    emitting `feedloop.archive_write_error` at feed rate."""
+    archive_dir = tmp_path / "archive"
+    staging_dir = tmp_path / "staging"
+    h0 = _hour_ns(2026, 4, 17, 15)
+    w = ArchiveWriter(archive_dir, staging_dir=staging_dir)
+    try:
+        for i in range(50):
+            w.write(_book(h0 + i, seq=i + 1))
+        # 50 mid-hour writes: archive dir must still be empty.
+        assert list(archive_dir.iterdir()) == []
+        # Staging holds the active hour file.
+        assert (staging_dir / "events-2026-04-17T15.jsonl").exists()
+    finally:
+        w.close()
+    # close() finalizes: archive gets the file, staging is drained.
+    assert (archive_dir / "events-2026-04-17T15.jsonl").exists()
+    assert not (staging_dir / "events-2026-04-17T15.jsonl").exists()
+
+
+def test_writer_finalizes_to_archive_dir_on_hour_roll(tmp_path: Path) -> None:
+    """When the hour rolls, the prior-hour file moves from staging to
+    archive_dir in one shot. The new hour's writes go to staging, leaving
+    archive_dir untouched until that hour finishes too."""
+    archive_dir = tmp_path / "archive"
+    staging_dir = tmp_path / "staging"
+    h0 = _hour_ns(2026, 4, 17, 15)
+    h1 = _hour_ns(2026, 4, 17, 16)
+    w = ArchiveWriter(archive_dir, staging_dir=staging_dir)
+    try:
+        w.write(_book(h0 + 1))
+        w.write(_book(h0 + 2, seq=2))
+        # Cross hour boundary — h15 file should land in archive_dir.
+        w.write(_book(h1 + 1, seq=3))
+        assert (archive_dir / "events-2026-04-17T15.jsonl").exists()
+        assert not (staging_dir / "events-2026-04-17T15.jsonl").exists()
+        # h16 staging file is open; archive_dir does not yet have it.
+        assert not (archive_dir / "events-2026-04-17T16.jsonl").exists()
+        assert (staging_dir / "events-2026-04-17T16.jsonl").exists()
+    finally:
+        w.close()
+    # After close: both hours land in archive_dir.
+    assert sorted(p.name for p in archive_dir.iterdir()) == [
+        "events-2026-04-17T15.jsonl",
+        "events-2026-04-17T16.jsonl",
+    ]
+
+
+def test_writer_appends_when_archive_already_has_hour_file(tmp_path: Path) -> None:
+    """If a previous process finalized a partial hour (crashed, restarted
+    before the hour ended), the next finalize must concat the new staging
+    file onto the existing archive file — not overwrite it. Reader
+    contract: every event ever written to a given hour bucket survives."""
+    archive_dir = tmp_path / "archive"
+    staging_dir = tmp_path / "staging"
+    h0 = _hour_ns(2026, 4, 17, 15)
+    # First "process": writes seq=1, finalizes (close moves to archive_dir).
+    with ArchiveWriter(archive_dir, staging_dir=staging_dir) as w:
+        w.write(_book(h0 + 1))
+    # Second "process" in the same hour: writes seq=2, close() must append.
+    with ArchiveWriter(archive_dir, staging_dir=staging_dir) as w:
+        w.write(_book(h0 + 2, seq=2))
+    events = [e for e in iter_archive(archive_dir) if isinstance(e, BookUpdate)]
+    assert [e.seq for e in events] == [1, 2]
+
+
 def test_reader_ignores_unrelated_files(tmp_path: Path) -> None:
     h0 = _hour_ns(2026, 4, 17, 15)
     with ArchiveWriter(tmp_path) as w:

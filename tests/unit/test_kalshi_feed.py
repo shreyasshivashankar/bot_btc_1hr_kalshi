@@ -386,6 +386,92 @@ async def test_feed_runs_with_diagnostic_enabled(monkeypatch: pytest.MonkeyPatch
     assert len(events) == 3  # 2 books + 1 trade (parse error dropped)
 
 
+async def test_force_reconnect_drops_active_conn_and_resubscribes() -> None:
+    """Crash-only seq_gap recovery: force_reconnect() closes the active
+    socket so the next `_session` iteration reopens, re-subscribes, and
+    Kalshi ships a fresh `orderbook_snapshot` per ticker. We verify the
+    socket really did close, the second session ran (proving reconnect
+    fired), and the second subscribe frame went out — the last condition
+    is what guarantees a fresh snapshot."""
+    sleep_calls: list[float] = []
+
+    async def fake_sleep(sec: float) -> None:
+        sleep_calls.append(sec)
+
+    sessions: list[FakeConn] = []
+
+    class _Blocking(FakeConn):
+        """Holds the iterator open after frames are exhausted until close()
+        is called. Mirrors a real WS that stays alive until the server (or
+        force_reconnect) drops it."""
+
+        def __init__(self, frames: list[bytes]) -> None:
+            super().__init__(frames)
+            self._stop = asyncio.Event()
+
+        async def _iter(self) -> AsyncIterator[bytes]:
+            for f in self._frames:
+                yield f
+            await self._stop.wait()
+
+        async def close(self) -> None:
+            await super().close()
+            self._stop.set()
+
+    async def connect(url: str) -> WSConnection:
+        # First session: one snapshot then waits for force_reconnect to drop
+        # it. Second session: one snapshot then waits for the consumer to
+        # exit on its own.
+        conn = _Blocking([_snap(1) if not sessions else _snap(2)])
+        sessions.append(conn)
+        return conn
+
+    clock = ManualClock(0)
+    st = StalenessTracker(name="k", clock=clock, threshold_ms=2000)
+    feed = KalshiFeed(
+        ws_url="ws://fake",
+        market_tickers=["M"],
+        clock=clock,
+        ws_connect=connect,
+        staleness=st,
+        sleep=fake_sleep,
+        backoff_initial_sec=0.1,
+    )
+
+    out: list[BookUpdate] = []
+
+    async def consume() -> None:
+        async for ev in feed.events():
+            assert isinstance(ev, BookUpdate)
+            out.append(ev)
+            if len(out) == 1:
+                # Trigger the crash-only recovery from the consumer side,
+                # mirroring how feedloop calls it on book invalidation.
+                await feed.force_reconnect()
+            elif len(out) == 2:
+                return
+
+    await asyncio.wait_for(consume(), timeout=2.0)
+    assert len(sessions) == 2, "force_reconnect must trigger a fresh _session"
+    assert sessions[0].closed, "old conn must be closed by force_reconnect"
+    assert b'"cmd":"subscribe"' in sessions[1].sent[0]
+    assert sleep_calls == [0.1], "reconnect path uses the configured backoff"
+
+
+async def test_force_reconnect_when_no_active_conn_is_noop() -> None:
+    """Calling force_reconnect before `events()` has opened its first
+    socket must not raise. Defensive: feedloop creates the feed before
+    looping, and a paranoid early caller shouldn't crash the boot."""
+    feed = KalshiFeed(
+        ws_url="ws://fake",
+        market_tickers=["M"],
+        clock=ManualClock(0),
+        ws_connect=lambda _u: asyncio.sleep(0),  # type: ignore[arg-type,return-value]
+        staleness=StalenessTracker(name="k", clock=ManualClock(0), threshold_ms=100),
+    )
+    await feed.force_reconnect()
+
+
 def test_empty_ticker_list_rejected() -> None:
     with pytest.raises(ValueError, match="market_tickers"):
         KalshiFeed(
