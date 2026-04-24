@@ -131,6 +131,52 @@ def test_bollinger_pct_b_below_band_is_negative() -> None:
     assert pct_b is not None and pct_b < 0
 
 
+def test_bollinger_pct_b_uses_live_price_when_provided() -> None:
+    """Regression for the bar-close lag: penetration must follow live spot.
+
+    Without a `live_price`, pct_b is frozen at the last bar's close — so
+    a price move into / out of the bands inside the bar window is invisible
+    to the floor / ceiling / lag traps until the next 5m close. Passing
+    `live_price=spot` lets the same bands score the live tape instead.
+    """
+    fe = _engine(bb_period=5, std=2.0)
+    # Closes hug 100 → bands tight around 100. Last close = 100.
+    _push_closes(fe, "5m", [100.0, 100.0, 100.0, 100.0, 100.0])
+    bands = fe.bollinger_bands("5m")
+    assert bands is not None
+    # Constant series → zero-width bands → pct_b == 0.5 by convention,
+    # regardless of which price we score against. Push a close to widen.
+    _push_closes(fe, "5m", [99.0, 101.0, 99.0, 101.0, 100.0])
+    bands = fe.bollinger_bands("5m")
+    assert bands is not None
+    lower, _mid, upper = bands
+    assert upper > lower
+
+    bar_close_pct_b = fe.bollinger_pct_b("5m")
+    above_band_pct_b = fe.bollinger_pct_b("5m", live_price=upper + 1.0)
+    below_band_pct_b = fe.bollinger_pct_b("5m", live_price=lower - 1.0)
+
+    assert bar_close_pct_b is not None
+    assert above_band_pct_b is not None and above_band_pct_b > 1.0
+    assert below_band_pct_b is not None and below_band_pct_b < 0.0
+    # Live price moved away from the bar close, so the score must change.
+    assert above_band_pct_b != bar_close_pct_b
+    assert below_band_pct_b != bar_close_pct_b
+
+
+def test_bollinger_pct_b_falls_back_to_last_close_when_no_live_price() -> None:
+    """The live-price overload is opt-in. Backtest replay and unit tests
+    that don't have a live source must still get the bar-close-anchored
+    value — silently switching to a different default would break replay
+    determinism."""
+    fe = _engine(bb_period=5, std=2.0)
+    _push_closes(fe, "5m", [100.0, 101.0, 99.0, 102.0, 98.0])
+    no_arg = fe.bollinger_pct_b("5m")
+    explicit_none = fe.bollinger_pct_b("5m", live_price=None)
+    assert no_arg is not None
+    assert no_arg == explicit_none
+
+
 # ------------------------------- ATR ---------------------------------------
 
 

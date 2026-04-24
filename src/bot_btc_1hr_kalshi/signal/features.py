@@ -232,13 +232,30 @@ class FeatureEngine:
         state = self._states.get(tf)
         return state.bollinger.bands if state is not None else None
 
-    def bollinger_pct_b(self, tf: str) -> float | None:
-        """Percent-B against the latest close on this TF. `None` until both
-        warmups (window-full + at-least-one-close) are satisfied."""
+    def bollinger_pct_b(
+        self, tf: str, *, live_price: float | None = None
+    ) -> float | None:
+        """Percent-B against `live_price` if supplied, else the latest bar
+        close on this TF. `None` until both warmups (window-full +
+        at-least-one-close) are satisfied.
+
+        Bands stay bar-anchored — they recompute only when a new bar closes
+        — but the penetration measure passed through them moves with the
+        live tape. Without a live price, pct_b is frozen for up to one full
+        bar interval (5 minutes on the 5m TF), which delays floor / ceiling
+        / lag-trap fires by exactly that long. The live-price overload lets
+        callers feed the spot oracle's most recent tick so the trap arms
+        the moment price re-enters / exits a band, not on the next close.
+        Fallback to `last_close` keeps backtest replay and unit tests
+        deterministic when no live source is available.
+        """
         state = self._states.get(tf)
-        if state is None or state.last_close is None:
+        if state is None:
             return None
-        return state.bollinger.pct_b(state.last_close)
+        price = live_price if live_price is not None else state.last_close
+        if price is None:
+            return None
+        return state.bollinger.pct_b(price)
 
     def atr(self, tf: str) -> float | None:
         state = self._states.get(tf)

@@ -418,10 +418,6 @@ class FeedLoop:
         """
         if not self._book.valid:
             return []
-        pct_b = self._features.bollinger_pct_b(_PRIMARY_TF)
-        atr = self._features.atr(_PRIMARY_TF)
-        if pct_b is None or atr is None:
-            return []
         # Hard LastSpot contract: if the primary spot is stale, sit this
         # tick out. `get_primary_or_none` returns None on both cold-start
         # and staleness, identical to refusing to trade — which is what
@@ -430,6 +426,12 @@ class FeedLoop:
             max_age_ms=self._spot_staleness_max_age_ms
         )
         if spot is None:
+            return []
+        # Pass live spot so pct_b moves with the tape between bar closes
+        # — bands are still anchored to the latest 5m close on this TF.
+        pct_b = self._features.bollinger_pct_b(_PRIMARY_TF, live_price=spot)
+        atr = self._features.atr(_PRIMARY_TF)
+        if pct_b is None or atr is None:
             return []
         mts = self._mts_fn(self._clock.now_ns())
         regime_trend = self._features.regime_trend(_PRIMARY_TF)
