@@ -77,10 +77,19 @@ When end-of-hour IOC escalation fails to find any bid at all (§DESIGN 7.3.3), t
 ## 4. Exposure caps
 
 - **Max concurrent open positions:** 3
-- **Max correlated positions** (same hour, same direction): 1
+- **Max correlated positions** (same hour, same direction): 3 — see §4.1 Strike laddering
 - **Max open orders:** 10
 - **Max child orders per parent:** 5
 - **Single-hour gross exposure cap:** 25% of daily margin
+
+### 4.1 Strike laddering
+
+Under the multi-strike architecture, three YES bets on adjacent strikes of the same hourly session are structurally one directional bet on BTC. We allow the ladder (cap raised from 1 → 3) because adjacent strikes diversify *resolution risk* (which strike actually settles ITM) without diversifying the directional thesis. The risk is governed in two places:
+
+1. **Sizing (depth).** `OMS.consider_entry` divides the configured `kelly_fraction` by `max_correlated_positions`. With the default cap of 3, each rung sizes at base/3, so a fully-built 3-rung ladder approximates a single full-Kelly bet on the underlying directional thesis. This is automatic — there is no separate ladder-divisor knob; the correlation cap is the ladder width.
+2. **Width (count).** `risk.check()` rule 6 rejects entries once `max_correlated_positions` open positions exist on the same `(settlement_ts_ns, side)`. The aggregate-exposure cap (3× per-position notional) remains the hard ceiling on total open notional and backstops the ladder math.
+
+To disable laddering and revert to single-rung legacy behavior, set `max_correlated_positions = 1` in config — sizing then falls back to full `kelly_fraction` per entry.
 
 ## 5. Operational breakers
 
@@ -131,3 +140,4 @@ For unscheduled qualitative events (exchange hacks, geopolitical shocks, unexpec
 | ---------- | ------- | -------------------------- | -------- |
 | 2026-04-16 | 1.0     | Initial policy             | Shrey    |
 | 2026-04-16 | 1.1     | Added §3.1 soft stop (adaptive, tunable), §3.2 early cash-out (≥99¢ → IOC), §3.3 Abandoned-to-Settlement formal state. §6 Tier 1 rewritten: scheduled calendar pre-emptive flatten + human kill-switch; NLP explicitly forbidden. | Shrey |
+| 2026-04-24 | 1.2     | §4 max correlated positions raised 1 → 3; added §4.1 Strike laddering documenting auto-Kelly division by N rungs in `OMS.consider_entry` and reaffirming the aggregate-exposure cap as backstop. | Shrey |

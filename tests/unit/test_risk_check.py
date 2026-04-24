@@ -222,6 +222,19 @@ def test_calendar_block_ordered_after_breakers_before_confidence() -> None:
     assert d.reason == "calendar_blocked"
 
 
+def test_correlation_cap_at_default_three_allows_full_ladder() -> None:
+    """Strike laddering (RISK.md §4.1): the default cap is 3, so up to 3
+    correlated open positions on the same (settlement, side) approve.
+    The 4th rung is rejected — the ladder width is the cap value."""
+    settings = _settings(max_correlated_positions=3)
+    for count in (0, 1, 2):
+        d = check(_req(correlated_count=count), settings)
+        assert isinstance(d, Approve), f"count={count} should approve"
+    rejected = check(_req(correlated_count=3), settings)
+    assert isinstance(rejected, Reject)
+    assert rejected.reason == "correlation_cap"
+
+
 def test_premium_cap_ordered_before_correlation_cap() -> None:
     """Correlation cap is a journaling-sensitive reject too, but premium
     cap fires first: an inverted-risk entry never qualifies regardless of

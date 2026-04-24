@@ -18,7 +18,10 @@ Checks, in order (first reject wins):
      SAME side is below `max_correlated_positions`. Under the multi-strike
      architecture, three YES bets on adjacent strikes of the same hourly
      session are structurally one directional bet on BTC — the aggregate
-     notional cap alone does not enforce diversification intent.
+     notional cap alone does not enforce diversification intent. With the
+     default cap of 3, OMS auto-divides Kelly by the cap so a fully-built
+     ladder approximates a single full-Kelly bet (see oms.py); this gate
+     enforces the *width* of the ladder while sizing handles the *depth*.
   7. daily-loss ceiling not breached
   8. per-position notional cap
   9. aggregate open-exposure cap (3x single-position cap by default)
