@@ -328,12 +328,14 @@ class FeedLoop:
     async def _maybe_enter(self) -> None:
         if self._app.trading_halted:
             return
-        # One-entry-in-flight across the whole session. Open positions on
-        # any tracked strike short-circuit new cross-strike evaluation —
-        # the correlation cap in risk.check also guards same-side same-
-        # hour stacking, but bailing here avoids building N snapshots per
-        # tick and keeps the decision journal clean.
-        if self._pending or self._app.portfolio.open_positions:
+        # One-entry-in-flight across the whole session per pending lock.
+        # Beyond pending, bail only when *both* sides of this hour have
+        # already filled the correlation ladder — otherwise a rung might
+        # still be available and we want to evaluate. risk.check is the
+        # authoritative gate; this is just a perf short-circuit that
+        # also keeps the decision journal free of correlation_cap rejects
+        # on ticks where there's clearly no room.
+        if self._pending or self._all_correlation_sides_capped():
             return
         snaps = self._build_snapshots()
         if not snaps:
@@ -372,7 +374,7 @@ class FeedLoop:
 
         # Serialize consider_entry so two feeds can't both trigger at once.
         async with self._entry_guard:
-            if self._pending or self._app.portfolio.open_positions:
+            if self._pending or self._all_correlation_sides_capped():
                 return
             result: EntryResult = await self._app.oms.consider_entry(
                 signal=signal,
@@ -387,6 +389,24 @@ class FeedLoop:
                     trap=result.decision.trap,
                     features=result.decision.features,
                 )
+
+    def _all_correlation_sides_capped(self) -> bool:
+        """True iff *both* YES and NO already hold `max_correlated_positions`
+        rungs on this hour. Used by `_maybe_enter` to short-circuit before
+        snapshotting when no rung remains on either side; risk.check is the
+        authoritative per-side cap. With cap=1 (laddering disabled) this
+        reduces to the legacy "bail when any open position exists" because
+        opening one rung trivially fills that side and the cross-strike
+        evaluator only emits one side per tick anyway."""
+        cap = self._app.settings.risk.max_correlated_positions
+        portfolio = self._app.portfolio
+        yes_filled = portfolio.count_correlated_open(
+            side="YES", settlement_ts_ns=self._settlement_ns
+        )
+        no_filled = portfolio.count_correlated_open(
+            side="NO", settlement_ts_ns=self._settlement_ns
+        )
+        return yes_filled >= cap and no_filled >= cap
 
     async def _monitor_tick(self) -> None:
         if not self._app.portfolio.open_positions:

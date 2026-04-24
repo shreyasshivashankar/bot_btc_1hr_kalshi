@@ -185,10 +185,71 @@ async def test_consider_entry_applies_inverted_risk_clip_at_60c() -> None:
 
     assert unclipped.decision.approved and clipped.decision.approved
     assert clipped.decision.sizing.contracts < unclipped.decision.sizing.contracts
-    # Recorded Kelly fraction reflects the effective (clipped) allocation,
-    # not the raw setting — journal readers can diff to detect clip firings.
-    assert clipped.decision.sizing.kelly_fraction == pytest.approx(0.25 * 0.5)
-    assert unclipped.decision.sizing.kelly_fraction == pytest.approx(0.25)
+    # Recorded Kelly fraction reflects the effective (clipped + ladder-divided)
+    # allocation, not the raw setting — journal readers can diff to detect
+    # clip firings. With default `max_correlated_positions=3`, every entry
+    # is auto-divided by 3 first, then the inverted-risk multiplier applies.
+    ladder_divisor = 3.0
+    assert clipped.decision.sizing.kelly_fraction == pytest.approx(
+        0.25 / ladder_divisor * 0.5
+    )
+    assert unclipped.decision.sizing.kelly_fraction == pytest.approx(
+        0.25 / ladder_divisor
+    )
+
+
+async def test_consider_entry_divides_kelly_by_correlation_cap_for_ladder() -> None:
+    """Strike laddering (RISK.md §4.1): with `max_correlated_positions=N`,
+    each rung sizes at base_kelly / N so a fully-built N-rung ladder
+    approximates a single full-Kelly bet on the underlying directional
+    thesis. Compare cap=1 (full-Kelly per rung, legacy) against cap=3
+    (default — third the size per rung) on identical signals/bookrolls.
+
+    The recorded `kelly_fraction` in the decision record reflects the
+    effective post-divide allocation so the journal is auditable."""
+    market = "KBTC-26APR1600-LADDER"
+
+    def _build(cap: int) -> OMS:
+        clock = ManualClock(5_000)
+        book = L2Book(market)
+        book.apply(
+            BookUpdate(
+                seq=1,
+                ts_ns=1_000,
+                market_id=market,
+                bids=(BookLevel(28, 200),),
+                asks=(BookLevel(32, 200),),
+                is_snapshot=True,
+            )
+        )
+        broker = PaperBroker(clock=clock)
+        broker.register_book(book)
+        return OMS(
+            broker=broker,
+            portfolio=Portfolio(bankroll_usd=10_000.0),
+            breakers=BreakerState(),
+            risk_settings=RiskSettings(
+                kelly_fraction=0.25,
+                max_position_notional_usd=10_000.0,  # unconstrained
+                max_daily_loss_pct=0.05,
+                max_correlated_positions=cap,
+            ),
+            min_signal_confidence=0.5,
+            clock=clock,
+        )
+
+    legacy_oms = _build(cap=1)
+    laddered_oms = _build(cap=3)
+
+    legacy = await legacy_oms.consider_entry(signal=_signal(), market_id=market)
+    laddered = await laddered_oms.consider_entry(signal=_signal(), market_id=market)
+
+    assert legacy.decision.approved and laddered.decision.approved
+    assert legacy.decision.sizing.kelly_fraction == pytest.approx(0.25)
+    assert laddered.decision.sizing.kelly_fraction == pytest.approx(0.25 / 3.0)
+    # Contracts scale with kelly_fraction at the same entry price/edge —
+    # roughly 3x fewer per rung when laddered.
+    assert laddered.decision.sizing.contracts < legacy.decision.sizing.contracts
 
 
 async def test_full_lifecycle_entry_fill_exit_emits_outcome() -> None:

@@ -117,13 +117,17 @@ class RiskSettings(BaseModel):
     # Matches clock_drift_halt_ms by design: both gate the trading graph
     # against silent-stale-data-induced decisions.
     spot_staleness_halt_ms: int = Field(gt=0, default=1000)
-    # Correlation cap (multi-strike era). Prevents stacking N positions on
-    # adjacent strikes of the SAME hourly settlement on the SAME side — they
-    # are structurally one directional bet on BTC over the session, and a
-    # cascade would take N x the per-position drawdown in one move. Counted
-    # per (settlement_ts_ns, side) pair; default 1 means one bet at a time
-    # per hour-direction regardless of how many strikes are tracked.
-    max_correlated_positions: int = Field(ge=1, default=1)
+    # Correlation cap (multi-strike era). Counts open positions sharing
+    # (settlement_ts_ns, side) with the pending signal. Default 3 enables
+    # strike laddering: up to N adjacent-strike rungs may co-exist on the
+    # same hour-direction, with per-rung Kelly auto-scaled to 1/N of the
+    # base fraction inside `OMS.consider_entry` so the laddered total
+    # approximates a single full-Kelly bet on the underlying directional
+    # thesis. The aggregate-exposure cap (3x per-position cap) remains
+    # the hard ceiling on total notional. Set to 1 to disable laddering
+    # (legacy single-rung behavior); higher values widen the ladder and
+    # shrink each rung. See docs/RISK.md §4.
+    max_correlated_positions: int = Field(ge=1, default=3)
     # Premium cap (Slice 11 Phase 3.1). Hard reject on entries above this
     # price in cents. Kelly's math tolerates 75¢ entries (the (1-p) term
     # compensates mechanically) but the risk/reward is inverted: paying

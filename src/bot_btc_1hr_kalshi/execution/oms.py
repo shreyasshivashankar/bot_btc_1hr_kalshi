@@ -137,22 +137,35 @@ class OMS:
         if self._activity is not None:
             self._activity.mark_decision(now_ns)
 
+        # Strike-laddering Kelly divisor (Slice 12). Splits a single
+        # full-Kelly bet across the configured number of correlated
+        # rungs so a fully-built ladder approximates one full-Kelly bet
+        # on the underlying directional thesis instead of N stacked
+        # full-Kelly bets. Applied uniformly to every rung regardless of
+        # current correlated count — the discipline is "size for the
+        # ladder you intend to build"; an unfilled ladder ends up under-
+        # sized vs theory, which is the conservative side of the trade.
+        # Divisor of 1 (max_correlated_positions=1) leaves Kelly untouched.
+        ladder_divisor = float(self._risk.max_correlated_positions)
+        ladder_scaled_fraction = self._risk.kelly_fraction / ladder_divisor
+
         sized = kelly_contracts(
             edge_cents=signal.edge_cents,
             entry_price_cents=signal.entry_price_cents,
-            kelly_fraction=self._risk.kelly_fraction,
+            kelly_fraction=ladder_scaled_fraction,
             bankroll_usd=self._portfolio.bankroll_usd,
             max_notional_usd=self._risk.max_position_notional_usd,
             inverted_risk_threshold_cents=self._risk.inverted_risk_threshold_cents,
             inverted_risk_kelly_multiplier=self._risk.inverted_risk_kelly_multiplier,
         )
 
-        # Record the EFFECTIVE fractional Kelly after the inverted-risk clip
-        # (Slice 11 Phase 3.2): the decision journal now reflects what was
-        # actually applied, so tuning queries can correlate clip-triggered
-        # outcomes vs unclipped ones without reconstructing the rule from
-        # settings at emit time.
-        effective_kelly_fraction = self._risk.kelly_fraction
+        # Record the EFFECTIVE fractional Kelly after both the ladder
+        # divisor and the inverted-risk clip (Slice 11 Phase 3.2): the
+        # decision journal reflects what was actually applied, so tuning
+        # queries can correlate clip- and ladder-triggered outcomes vs
+        # baseline without reconstructing the rules from settings at
+        # emit time.
+        effective_kelly_fraction = ladder_scaled_fraction
         if signal.entry_price_cents >= self._risk.inverted_risk_threshold_cents:
             effective_kelly_fraction *= self._risk.inverted_risk_kelly_multiplier
 
