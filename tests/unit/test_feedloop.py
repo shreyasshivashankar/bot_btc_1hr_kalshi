@@ -149,6 +149,20 @@ def _kalshi_snapshot(seq: int, market_ticker: str = "KXBTC-TEST") -> bytes:
     })
 
 
+def _kalshi_delta(seq: int, market_ticker: str = "KXBTC-TEST") -> bytes:
+    """A YES-side delta. Used to drive seq-gap detection in L2Book."""
+    return orjson.dumps({
+        "type": "orderbook_delta",
+        "seq": seq,
+        "msg": {
+            "market_ticker": market_ticker,
+            "side": "yes",
+            "price": 40,
+            "delta": -10,
+        },
+    })
+
+
 def _build_app(clock: ManualClock) -> tuple[App, PaperBroker]:
     settings = load_settings("paper", config_dir=REPO_CONFIG, env={
         "BOT_BTC_1HR_KALSHI_WS_URL": "wss://example/ws",
@@ -285,6 +299,99 @@ async def test_feedloop_routes_book_updates_to_correct_book_by_market_id() -> No
     # Both books independently registered with the App.
     assert "KXBTC-ATM" in app.books
     assert "KXBTC-LOW" in app.books
+
+
+@pytest.mark.asyncio
+async def test_feedloop_force_reconnects_on_book_seq_gap() -> None:
+    """Hard rule #9 recovery path: when a delta arrives with a non-consecutive
+    seq, the L2Book invalidates with `seq_gap:...`. The feedloop must respond
+    by calling `kalshi_feed.force_reconnect()` so the WS drops, the
+    reconnect loop reopens with a fresh subscribe, and Kalshi emits a new
+    `orderbook_snapshot` that re-anchors the book. Without this hook the
+    book stayed INVALID until the WS happened to drop on its own — which
+    in production never did, leaving /readyz=503 no_valid_books for hours."""
+    start_ns = 1_800_000_000_000_000_000
+    settlement_ns = start_ns + 5_000_000_000
+    clock = ManualClock(start_ns)
+    app, broker = _build_app(clock)
+
+    sessions: list[FakeConn] = []
+
+    class _BlockingConn(FakeConn):
+        """Holds the iterator open after frames drain until close() fires
+        the stop event — mirrors how a real WS stays connected until the
+        server (or force_reconnect) drops it."""
+
+        def __init__(self, frames: list[bytes]) -> None:
+            super().__init__(frames)
+            self._stop = asyncio.Event()
+
+        async def _iter(self) -> AsyncIterator[bytes]:
+            for f in self._frames:
+                yield f
+            await self._stop.wait()
+
+        async def close(self) -> None:
+            await super().close()
+            self._stop.set()
+
+    async def connect(url: str) -> WSConnection:
+        if not sessions:
+            # Session 1: snapshot at seq=1, then a delta at seq=5 (gap).
+            # The delta marks the book INVALID, the feedloop should call
+            # force_reconnect, which closes this conn and unblocks the iter.
+            conn = _BlockingConn([_kalshi_snapshot(1), _kalshi_delta(5)])
+        else:
+            # Session 2: fresh snapshot re-anchors the book.
+            conn = _BlockingConn([_kalshi_snapshot(10)])
+        sessions.append(conn)
+        return conn  # type: ignore[return-value]
+
+    async def fast_sleep(_sec: float) -> None:
+        # Skip the real reconnect backoff so the test stays under 5s.
+        await asyncio.sleep(0)
+
+    kalshi_feed = KalshiFeed(
+        ws_url="ws://kalshi/test",
+        market_tickers=["KXBTC-TEST"],
+        clock=clock,
+        ws_connect=connect,
+        staleness=StalenessTracker(name="kalshi", clock=clock, threshold_ms=2000),
+        sleep=fast_sleep,
+        backoff_initial_sec=0.0,
+    )
+    oracle = StubOracle(clock)
+    oracle.push_primary(60_000.0)
+    features = FeatureEngine(
+        timeframes=["5m"], bollinger_period=20, bollinger_std_mult=2.0
+    )
+    book = L2Book("KXBTC-TEST")
+
+    loop = FeedLoop(
+        app=app, broker=broker, books={"KXBTC-TEST": book}, kalshi_feed=kalshi_feed,
+        spot_oracle=oracle,  # type: ignore[arg-type]
+        feature_engine=features,
+        market_id="KXBTC-TEST", strike_usd=60_000.0,
+        settlement_ts_ns=settlement_ns, clock=clock, grace_sec=0.1,
+    )
+
+    run_task = asyncio.create_task(loop.run())
+    # Wait long enough for: session1 → seq gap → force_reconnect →
+    # session2 opens → fresh snapshot delivered → book valid again.
+    for _ in range(50):
+        await asyncio.sleep(0.05)
+        if len(sessions) >= 2 and book.valid:
+            break
+    clock.set_ns(settlement_ns + 1_000_000_000)
+    await asyncio.wait_for(run_task, timeout=5.0)
+
+    assert len(sessions) == 2, "force_reconnect must have driven a second session"
+    assert sessions[0].closed, "force_reconnect must have closed the original conn"
+    assert book.valid, "fresh snapshot from session 2 must re-anchor the book"
+    assert book.last_seq == 10, "book seq must come from the new snapshot"
+    # Both sessions sent a subscribe frame — the second one is what brings
+    # the snapshot Kalshi guarantees on subscribe.
+    assert sessions[1].sent and b'"cmd":"subscribe"' in sessions[1].sent[0]
 
 
 @pytest.mark.asyncio

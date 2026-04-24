@@ -168,6 +168,31 @@ class KalshiFeed:
         self._sleep = sleep or _default_sleep
         self._on_reconnect = on_reconnect
         self._req_id = 0
+        # Tracks the connection of the currently-running session so callers
+        # outside the session generator (the feedloop) can request a forced
+        # reconnect on book invalidation. Cleared in `_session`'s finally.
+        self._active_conn: WSConnection | None = None
+
+    async def force_reconnect(self) -> None:
+        """Drop the active WS connection so the next `_session` iteration
+        reopens, re-subscribes, and receives a fresh `orderbook_snapshot`
+        (Kalshi sends one per ticker on every subscribe).
+
+        Why not REST snapshot the dead book in place: REST returns no seq
+        anchor that lines up with the WS delta stream, so reconciling
+        REST+WS state is fragile (you can re-apply a delta or skip one and
+        the book stays subtly wrong). Re-subscribing forces Kalshi to emit
+        a snapshot whose seq is the new authoritative anchor — there are
+        no in-flight deltas to reconcile because we just dropped the
+        socket. Crash-only is the only safe recovery here.
+        """
+        conn = self._active_conn
+        if conn is None:
+            return
+        try:
+            await conn.close()
+        except Exception as exc:  # pragma: no cover — best-effort drop
+            _log.warning("feed.kalshi.force_reconnect_close_error", error=str(exc))
 
     async def events(self) -> AsyncIterator[FeedEvent]:
         backoff = self._backoff_initial
@@ -197,6 +222,7 @@ class KalshiFeed:
             raise SessionEndedError(f"connect_failed:{exc}") from exc
 
         diag = _FeedDiagnostic(enabled=_diag_enabled(), clock=self._clock)
+        self._active_conn = conn
         try:
             self._req_id += 1
             await conn.send(build_subscribe(req_id=self._req_id, market_tickers=self._tickers))
@@ -224,6 +250,7 @@ class KalshiFeed:
                 self._staleness.mark_at(ev.ts_ns)
                 yield ev
         finally:
+            self._active_conn = None
             try:
                 await conn.close()
             except Exception as exc:

@@ -291,6 +291,25 @@ class FeedLoop:
                 )
                 return
             book.apply(event)
+            # Hard rule #9 recovery: a seq gap leaves the book INVALID and
+            # there is no in-band path back to VALID — Kalshi only ships an
+            # `orderbook_snapshot` on subscribe. Force the WS to drop so
+            # the existing reconnect+resubscribe loop pulls a fresh,
+            # seq-aligned snapshot. REST snapshot interleaving was rejected
+            # because there is no shared seq anchor between the REST body
+            # and the WS delta stream — see KalshiFeed.force_reconnect.
+            if (
+                not book.valid
+                and book.invalidation_reason is not None
+                and book.invalidation_reason.startswith("seq_gap")
+            ):
+                _log.warning(
+                    "feedloop.seq_gap_force_reconnect",
+                    market_id=event.market_id,
+                    reason=book.invalidation_reason,
+                )
+                await self._kalshi_feed.force_reconnect()
+                return
         elif isinstance(event, TradeEvent):
             # Paper-broker maker-match happens via book.apply crossings;
             # trade events do not directly produce fills in our model.
