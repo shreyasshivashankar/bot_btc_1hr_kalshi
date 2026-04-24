@@ -49,9 +49,16 @@ from bot_btc_1hr_kalshi.feedloop import (
     ws_connect_websockets,
 )
 from bot_btc_1hr_kalshi.market_data.bars import MultiTimeframeBus
+from bot_btc_1hr_kalshi.market_data.derivatives_oracle import DerivativesOracle
 from bot_btc_1hr_kalshi.market_data.feeds.coinglass import CoinglassPoller
 from bot_btc_1hr_kalshi.market_data.feeds.coinglass_heatmap import (
     CoinglassHeatmapPoller,
+)
+from bot_btc_1hr_kalshi.market_data.feeds.derivatives import DerivativesFeed
+from bot_btc_1hr_kalshi.market_data.feeds.hyperliquid import (
+    HYPERLIQUID_SOURCE,
+    build_hyperliquid_subscribe,
+    hyperliquid_parser,
 )
 from bot_btc_1hr_kalshi.market_data.feeds.kalshi import WSConnect
 from bot_btc_1hr_kalshi.market_data.feeds.spot import (
@@ -275,6 +282,7 @@ async def serve(app: App, *, admin_token: str, host: str, port: int) -> None:
     heatmap_client: httpx.AsyncClient | None = None
     whale_task: asyncio.Task[None] | None = None
     whale_client: httpx.AsyncClient | None = None
+    derivatives_oracle_task: asyncio.Task[None] | None = None
     rest_client: httpx.AsyncClient | None = None
 
     def _on_term() -> None:
@@ -293,6 +301,7 @@ async def serve(app: App, *, admin_token: str, host: str, port: int) -> None:
             coinglass_task,
             heatmap_task,
             whale_task,
+            derivatives_oracle_task,
         ):
             if t is not None:
                 t.cancel()
@@ -306,6 +315,7 @@ async def serve(app: App, *, admin_token: str, host: str, port: int) -> None:
     coinglass_task, coinglass_client = _start_coinglass_if_enabled(app, log)
     heatmap_task, heatmap_client = _start_coinglass_heatmap_if_enabled(app, log)
     whale_task, whale_client = _start_whale_alert_if_enabled(app, log)
+    derivatives_oracle_task = _start_derivatives_oracle_if_enabled(app, log)
 
     # Supervise the background tasks. If any dies unexpectedly (not via
     # cancellation), the container must restart — silently running without
@@ -363,6 +373,13 @@ async def serve(app: App, *, admin_token: str, host: str, port: int) -> None:
     # hiccup must not take the trading graph down.
     if whale_task is not None:
         whale_task.add_done_callback(_make_supervisor("whale-alert", halt_on_death=False))
+    # DerivativesOracle (PR-A: Hyperliquid OI). Observational alongside
+    # the Coinglass poller until parity is observed in soak — no trap
+    # gates on it yet, so a dropped WS must not halt the trading graph.
+    if derivatives_oracle_task is not None:
+        derivatives_oracle_task.add_done_callback(
+            _make_supervisor("derivatives-oracle", halt_on_death=False)
+        )
 
     log.info("boot.serving", mode=app.settings.mode, host=host, port=port)
     try:
@@ -377,6 +394,7 @@ async def serve(app: App, *, admin_token: str, host: str, port: int) -> None:
             ("coinglass-oi", coinglass_task),
             ("coinglass-heatmap", heatmap_task),
             ("whale-alert", whale_task),
+            ("derivatives-oracle", derivatives_oracle_task),
         ):
             if task is None:
                 continue
@@ -697,6 +715,80 @@ def _start_whale_alert_if_enabled(
         poll_interval_sec=settings.poll_interval_sec,
     )
     return task, client
+
+
+def _start_derivatives_oracle_if_enabled(
+    app: App,
+    log: Any,
+) -> asyncio.Task[None] | None:
+    """Spin up the persistent DerivativesOracle (PR-A: Hyperliquid OI).
+
+    Wires Hyperliquid (and later Bybit) public WS feeds into a single
+    `DerivativesOracle` that exposes a fail-closed `get_open_interest`
+    accessor and dispatches subscriber callbacks. Runs alongside the
+    existing Coinglass HTTP poller — both push into `App.latest_open_
+    interest`, with the most recent sample winning. Coinglass is removed
+    in PR-C once paper-soak shows OI tracking parity between sources.
+
+    Disabled by default (`feeds.hyperliquid.enabled=false`) so dev/test
+    boots without contacting an external venue. Same `MODES_WITH_FEED_
+    LOOP` gate as the other live feeds.
+    """
+    settings = app.settings.feeds.hyperliquid
+    if not settings.enabled:
+        log.info(
+            "boot.derivatives_oracle_disabled",
+            reason="feeds.hyperliquid.enabled=false",
+        )
+        # Still install an empty oracle so trap-side `app.derivatives_oracle`
+        # accesses don't have to None-guard everywhere.
+        app.derivatives_oracle = DerivativesOracle(feeds=(), clock=app.clock)
+        return None
+    if app.settings.mode not in MODES_WITH_FEED_LOOP:
+        log.info("boot.derivatives_oracle_skipped", mode=app.settings.mode)
+        app.derivatives_oracle = DerivativesOracle(feeds=(), clock=app.clock)
+        return None
+
+    hl_feed = DerivativesFeed(
+        name="hyperliquid",
+        ws_url=settings.ws_url,
+        ws_connect=ws_connect_websockets,
+        staleness=StalenessTracker(
+            name="hyperliquid",
+            clock=app.clock,
+            threshold_ms=settings.staleness_halt_ms,
+        ),
+        parse=hyperliquid_parser(asset=settings.asset, clock=app.clock),
+        subscribe=build_hyperliquid_subscribe(),
+    )
+    oracle = DerivativesOracle(feeds=(hl_feed,), clock=app.clock)
+    app.derivatives_oracle = oracle
+
+    def _on_oi(sample: OpenInterestSample) -> None:
+        # Both DerivativesOracle (push-based) and CoinglassPoller (HTTP poll)
+        # write here during the parity period. Most-recent wins by virtue
+        # of who set the slot last; a future "tagged source" model can land
+        # in PR-C once Coinglass is retired.
+        app.latest_open_interest = sample
+        log.info(
+            "derivatives_oracle.oi_sample",
+            source=sample.source,
+            symbol=sample.symbol,
+            total_oi_usd=sample.total_oi_usd,
+            ts_ns=sample.ts_ns,
+        )
+
+    oracle.subscribe_open_interest(_on_oi)
+
+    task = asyncio.create_task(oracle.run(), name="derivatives-oracle")
+    log.info(
+        "boot.derivatives_oracle_enabled",
+        sources=[HYPERLIQUID_SOURCE],
+        ws_url=settings.ws_url,
+        asset=settings.asset,
+        staleness_halt_ms=settings.staleness_halt_ms,
+    )
+    return task
 
 
 def _start_feed_loop_if_enabled(

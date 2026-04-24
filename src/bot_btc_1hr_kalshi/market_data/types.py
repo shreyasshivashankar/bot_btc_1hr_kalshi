@@ -12,7 +12,7 @@ from typing import Literal
 from bot_btc_1hr_kalshi.obs.money import MICROS_PER_USD, Micros
 from bot_btc_1hr_kalshi.obs.schemas import Side
 
-Venue = Literal["kalshi", "coinbase", "kraken"]
+Venue = Literal["kalshi", "coinbase", "kraken", "hyperliquid", "bybit"]
 AggressorSide = Literal["buy", "sell"]
 
 
