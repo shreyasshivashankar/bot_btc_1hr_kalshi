@@ -19,79 +19,6 @@ class FeedSettings(BaseModel):
     staleness_halt_ms: int = Field(gt=0, default=2000)
 
 
-class CoinglassSettings(BaseModel):
-    """Coinglass open-interest poller (Slice 11 P2 — shadow mode only).
-
-    Observational: sampled OI is logged for paper-soak telemetry and
-    optionally attached to `MarketSnapshot`, but traps do not gate on it
-    yet. `enabled: false` disables the polling task entirely — the API
-    key env var is read lazily only when `enabled: true`.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    enabled: bool = False
-    base_url: str = "https://open-api-v4.coinglass.com"
-    oi_path: str = "/api/futures/open-interest/aggregated-history"
-    symbol: str = "BTC"
-    interval: str = "5m"
-    poll_interval_sec: float = Field(gt=0.0, default=30.0)
-    # Env var name (not the key itself). The actual API key loads via
-    # Secret Manager in Cloud Run / env in dev. Empty key triggers the
-    # free-tier unkeyed path (stricter rate limits).
-    api_key_env: str = "BOT_BTC_1HR_KALSHI_COINGLASS_API_KEY"
-
-
-class CoinglassHeatmapSettings(BaseModel):
-    """Coinglass liquidation-heatmap poller (Slice 11 P3 — shadow only).
-
-    Same observational-only contract as `CoinglassSettings`. `enabled:
-    false` disables the polling task entirely. The heatmap endpoint is
-    generally keyed in production; the unkeyed path may return 401 on
-    paid-tier-only endpoints.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    enabled: bool = False
-    base_url: str = "https://open-api-v4.coinglass.com"
-    heatmap_path: str = "/api/futures/liquidation/aggregated-heatmap"
-    symbol: str = "BTC"
-    interval: str = "1h"
-    poll_interval_sec: float = Field(gt=0.0, default=60.0)
-    # Re-uses the same Coinglass API-key env var as the OI poller: a
-    # single key covers both endpoints, and splitting the binding would
-    # just double the operator secret-rotation work.
-    api_key_env: str = "BOT_BTC_1HR_KALSHI_COINGLASS_API_KEY"
-
-
-class WhaleAlertSettings(BaseModel):
-    """Whale Alert poller (Slice 11 P4 — shadow only).
-
-    Same observational-only contract as the two Coinglass pollers.
-    `enabled: false` disables the polling task entirely. Whale Alert
-    requires an API key (no free-tier unauthenticated path); if the
-    key env var is unset the boot wiring logs a warning and skips
-    starting the poller rather than crashing the process.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    enabled: bool = False
-    base_url: str = "https://api.whale-alert.io"
-    path: str = "/v1/transactions"
-    # Whale Alert uses lower-case currency codes in the v1 API.
-    symbol: str = "btc"
-    # Minimum transaction USD filter — narrower window = fewer rows
-    # per poll = lower log volume. $1M matches Whale Alert's public
-    # tier default; a paid tier can drop it further if useful.
-    min_value_usd: int = Field(gt=0, default=1_000_000)
-    poll_interval_sec: float = Field(gt=0.0, default=60.0)
-    # Env var name (not the key itself). The actual API key loads
-    # via Secret Manager in Cloud Run / env in dev.
-    api_key_env: str = "BOT_BTC_1HR_KALSHI_WHALE_ALERT_API_KEY"
-
-
 class HyperliquidSettings(BaseModel):
     """Hyperliquid public WS feed for BTC OI (PR-A: DerivativesOracle).
 
@@ -175,9 +102,6 @@ class FeedsSettings(BaseModel):
     kalshi: FeedSettings
     coinbase: FeedSettings
     kraken: FeedSettings
-    coinglass: CoinglassSettings = CoinglassSettings()
-    coinglass_heatmap: CoinglassHeatmapSettings = CoinglassHeatmapSettings()
-    whale_alert: WhaleAlertSettings = WhaleAlertSettings()
     hyperliquid: HyperliquidSettings = HyperliquidSettings()
     bybit: BybitSettings = BybitSettings()
     binance_backfill: BinanceBackfillSettings = BinanceBackfillSettings()
@@ -267,24 +191,35 @@ class SignalSettings(BaseModel):
     # relative to the inbound print and the "edge" is adverse selection.
     arb_basis_threshold_cents: int = Field(gt=0, default=15)
     arb_dead_spot_range_usd: float = Field(gt=0.0, default=20.0)
-    # Microstructure gating (Slice 11 P3 — shadow plumbing). When
+    # Microstructure gating (PR-C — shadow plumbing). When
     # `enable_microstructure_gating=False` (DEFAULT), the floor/ceiling
-    # traps evaluate the heatmap + OI checks below but only *tag* the
-    # outgoing signal's `features.shadow_veto_reason` — the trade still
-    # proceeds. The risk committee uses the tagged telemetry to pick
-    # empirical thresholds before flipping the switch. When True, any
-    # non-None shadow veto reason hard-rejects the trap. Hard rule #2's
-    # backtest → paper → shadow → live progression governs the flip:
-    # do not toggle this to True until the tuning loop has real soak
-    # data justifying the specific thresholds below.
+    # traps evaluate the liquidation-cascade + OI checks below but only
+    # *tag* the outgoing signal's `features.shadow_veto_reason` — the
+    # trade still proceeds. The risk committee uses the tagged telemetry
+    # to pick empirical thresholds before flipping the switch. When True,
+    # any non-None shadow veto reason hard-rejects the trap. Hard rule
+    # #2's backtest → paper → shadow → live progression governs the
+    # flip: do not toggle this to True until the tuning loop has real
+    # soak data justifying the specific thresholds below.
     enable_microstructure_gating: bool = False
-    # Heatmap adverse-cluster fraction. A trap rejects (or shadow-tags)
-    # when the peak liquidation cluster sits within this fraction of
-    # current spot on the *adverse* side of the trade — long trades
-    # fear a cluster below (stop-hunt down), short trades fear a cluster
-    # above. 0.005 = 0.5% — a placeholder starting point; the committee
-    # will tune against tagged paper-soak outcomes before promotion.
-    heatmap_adverse_cluster_pct: float = Field(gt=0.0, le=1.0, default=0.005)
+    # Liquidation-cascade window — fraction of spot above (for the
+    # ceiling trap) and below (for the floor trap) within which the
+    # snapshot builder accumulates recent liquidation USD into
+    # `LiquidationPressure`. 0.005 = 0.5% — narrow enough to filter out
+    # distant prints that have no microstructural bearing on the
+    # immediate decision. Read by `feedloop._build_snapshots` when
+    # populating `MarketSnapshot.liquidation_pressure`.
+    liquidation_window_pct: float = Field(gt=0.0, le=1.0, default=0.005)
+    # Lookback window (seconds) for the liquidation deque scan. 60s
+    # captures the burst horizon — most cascades unfold in the first
+    # 30-90 seconds — without including stale prints from prior regimes.
+    liquidation_lookback_sec: float = Field(gt=0.0, default=60.0)
+    # Liquidation cascade USD threshold. The trap rejects (or shadow-
+    # tags) when adverse-side liquidation USD inside the window above
+    # exceeds this value. 0.0 disables without removing the plumbing —
+    # the committee sets a real threshold once shadow-soak produces
+    # a distribution of liquidation pressure to anchor against.
+    liquidation_cascade_threshold_usd: float = Field(ge=0.0, default=0.0)
     # Open-interest compression floor (USD). When total aggregated BTC
     # futures OI drops below this level, the trap tags a compression
     # veto: very low OI often follows a liquidation cascade, and mean-

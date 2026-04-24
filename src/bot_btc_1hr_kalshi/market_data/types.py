@@ -89,31 +89,30 @@ class SpotTick:
 
 @dataclass(frozen=True, slots=True)
 class OpenInterestSample:
-    """Aggregated BTC-futures open-interest snapshot (Slice 11 P2 — shadow).
+    """Aggregated BTC-futures open-interest snapshot.
 
-    Sourced from Coinglass; *observed only* — not gating live signals yet.
-    Emitted as structured log records so a future promotion decision has
-    paper-soak data to lean on. Fields map directly onto the Coinglass v4
-    aggregated-open-interest payload so provenance is obvious in log
-    readers without round-tripping the raw response.
+    Sourced from `DerivativesOracle` (Hyperliquid `metaAndAssetCtxs` and
+    Bybit `tickers`, most-recent wins). Observational only — not gating
+    live signals yet. Emitted as structured log records so a future
+    promotion decision has paper-soak data to lean on.
     """
 
     ts_ns: int
     symbol: str
     total_oi_usd: float
     exchanges_count: int | None = None
-    source: str = "coinglass"
+    source: str = "derivatives_oracle"
 
 
 @dataclass(frozen=True, slots=True)
 class LiquidationEvent:
-    """A single liquidation print from a derivatives venue (PR-B).
+    """A single liquidation print from a derivatives venue.
 
-    Unlike `LiquidationHeatmapSample` (an aggregated snapshot), this is a
-    discrete event emitted every time the venue's liquidation engine
-    closes a position. Consumers accumulate these into a rolling deque
-    (PR-C: `FeatureEngine`) so floor/ceiling traps can read a live
-    "recent liquidation pressure" signal instead of a delayed heatmap.
+    Discrete event emitted every time the venue's liquidation engine
+    closes a position. The `FeatureEngine` accumulates these into a
+    rolling deque so floor/ceiling traps can read a live "recent
+    liquidation pressure" signal via `LiquidationPressure` aggregated
+    at snapshot construction time.
 
     `side` is the direction of the *order that got liquidated* — a
     `long` liquidation means a long position was force-closed (aggressor
@@ -132,76 +131,6 @@ class LiquidationEvent:
     price_usd: float
     size_usd: float
     source: str = "bybit"
-
-
-@dataclass(frozen=True, slots=True)
-class LiquidationHeatmapSample:
-    """Aggregated BTC liquidation-heatmap snapshot (Slice 11 P3 — shadow).
-
-    Sourced from the Coinglass liquidation-heatmap endpoint. Full heatmap
-    payloads are large 2D grids of (price, time, liquidation_usd); we
-    compress each poll to three summary stats that are cheap to log and
-    sufficient for the observational-only question we want to answer in
-    paper-soak: "where are the nearest liquidation clusters relative to
-    spot, and how dense are they?"
-
-    * `total_liquidation_usd` — sum over the grid (activity proxy).
-    * `peak_cluster_price_usd` — price coordinate of the densest bucket.
-    * `peak_cluster_liquidation_usd` — the density of that bucket.
-
-    Any future decision to gate trap entries on proximity to a cluster
-    (a microstructure change) would require risk-committee sign-off per
-    docs/RISK.md — same contract as `OpenInterestSample`.
-    """
-
-    ts_ns: int
-    symbol: str
-    total_liquidation_usd: float
-    peak_cluster_price_usd: float
-    peak_cluster_liquidation_usd: float
-    source: str = "coinglass"
-
-
-@dataclass(frozen=True, slots=True)
-class WhaleAlertSample:
-    """Rolling whale-alert summary (Slice 11 P4 — shadow only).
-
-    Sourced from the Whale Alert v1 `transactions` endpoint. Same
-    observational-only contract as `OpenInterestSample` /
-    `LiquidationHeatmapSample`: the poller emits samples onto the App
-    state and structured logs, but no trap gates on them until shadow-
-    soak justifies a specific threshold — docs/RISK.md sign-off path.
-
-    Compressed to four summary stats per poll window (the raw endpoint
-    returns a per-transaction list that would dominate the log budget if
-    emitted unshaped):
-
-    * `net_exchange_flow_usd` — sum over the window of (to-exchange USD)
-      minus (from-exchange USD). Positive = net whales *depositing* to
-      exchanges = a supply-to-sellers proxy (bearish prior). Negative =
-      net withdrawals = removal from trading venues (bullish prior).
-    * `largest_txn_usd` — biggest single whale-tagged transaction in
-      the window. Discrete shocks matter; a single $500M inflow prints
-      differently than ten $50M mid-tier moves.
-    * `txn_count` — number of whale-tagged transactions in the window.
-      A zero sample after a known large move means we're losing events
-      to rate limits or filter drift.
-    * `window_sec` — length of the polling window the summary was
-      accumulated over, so the log reader can normalize across a
-      future poll-cadence change without re-parsing history.
-
-    `source` is always `"whale_alert"` today; kept as a field so a
-    future multi-source aggregator can stamp provenance without a
-    schema migration.
-    """
-
-    ts_ns: int
-    symbol: str
-    net_exchange_flow_usd: float
-    largest_txn_usd: float
-    txn_count: int
-    window_sec: float
-    source: str = "whale_alert"
 
 
 FeedEvent = BookUpdate | TradeEvent | SpotTick

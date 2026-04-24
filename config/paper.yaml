@@ -26,48 +26,29 @@ feeds:
   kraken:
     ws_url: wss://ws.kraken.com/v2
     staleness_halt_ms: 5000
-  # Coinglass open-interest poller (Slice 11 P2 — SHADOW mode only).
-  # Observational: samples are logged and attached to MarketSnapshot but
-  # no trap gates on OI yet. Pending paper-soak data + risk-committee
-  # review before promotion to an entry gate. A dead poller does NOT
-  # halt the container (non-critical supervisor) — third-party API
-  # outage must not take the trading graph down with it.
-  coinglass:
+  # Hyperliquid public WS — BTC OI via `metaAndAssetCtxs`. Feeds
+  # `App.latest_open_interest` alongside Bybit (most-recent wins).
+  # Observational only: no trap gates on OI yet. DerivativesOracle's
+  # supervisor is non-critical, so a dropped socket does not halt the
+  # container.
+  hyperliquid:
     enabled: true
-    base_url: https://open-api-v4.coinglass.com
-    oi_path: /api/futures/open-interest/aggregated-history
-    symbol: BTC
-    interval: 5m
-    poll_interval_sec: 30.0
-    api_key_env: BOT_BTC_1HR_KALSHI_COINGLASS_API_KEY
+    ws_url: wss://api.hyperliquid.xyz/ws
+    asset: BTC
+    staleness_halt_ms: 30000
 
-  # Coinglass liquidation-heatmap poller (Slice 11 P3 — shadow). Same
-  # observational-only contract as the OI poller. Disabled by default;
-  # the heatmap endpoint is paid-tier-only on most Coinglass plans and
-  # unkeyed requests typically 401. Flip `enabled: true` once a key is
-  # provisioned into the BOT_BTC_1HR_KALSHI_COINGLASS_API_KEY secret.
-  coinglass_heatmap:
-    enabled: false
-    base_url: https://open-api-v4.coinglass.com
-    heatmap_path: /api/futures/liquidation/aggregated-heatmap
-    symbol: BTC
-    interval: 1h
-    poll_interval_sec: 60.0
-    api_key_env: BOT_BTC_1HR_KALSHI_COINGLASS_API_KEY
-
-  # Whale Alert poller (Slice 11 P4 — shadow only). Observational-only
-  # exchange-inflow / outflow summary; no trap reads it yet. Disabled
-  # by default; flip to true once BOT_BTC_1HR_KALSHI_WHALE_ALERT_API_KEY
-  # is provisioned — the endpoint has no free-tier path so the boot
-  # wiring refuses to start unkeyed (drops a warning in logs).
-  whale_alert:
-    enabled: false
-    base_url: https://api.whale-alert.io
-    path: /v1/transactions
-    symbol: btc
-    min_value_usd: 1000000
-    poll_interval_sec: 60.0
-    api_key_env: BOT_BTC_1HR_KALSHI_WHALE_ALERT_API_KEY
+  # Bybit V5 public WS — BTC OI (`tickers.BTCUSDT`) + liquidation events
+  # (`liquidation.BTCUSDT`). The liquidation stream feeds the
+  # `FeatureEngine` rolling deque that the floor/ceiling microstructure
+  # veto reads via `LiquidationPressure`. Shadow plumbing: gating is off
+  # by default; the tag lands on telemetry for paper-soak calibration.
+  bybit:
+    enabled: true
+    ws_url: wss://stream.bybit.com/v5/public/linear
+    symbol: BTCUSDT
+    subscribe_oi: true
+    subscribe_liquidations: true
+    staleness_halt_ms: 60000
 
 risk:
   # Sized for a $50 starter bankroll; bot restarts each session at $50 (see

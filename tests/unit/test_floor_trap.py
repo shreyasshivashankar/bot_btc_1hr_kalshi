@@ -3,12 +3,10 @@ from __future__ import annotations
 from typing import Literal
 
 from bot_btc_1hr_kalshi.market_data import BookLevel, BookUpdate, L2Book
-from bot_btc_1hr_kalshi.market_data.types import (
-    LiquidationHeatmapSample,
-    OpenInterestSample,
-)
+from bot_btc_1hr_kalshi.market_data.types import OpenInterestSample
 from bot_btc_1hr_kalshi.obs.schemas import Features, RegimeVol
 from bot_btc_1hr_kalshi.signal import MarketSnapshot, detect_floor_reversion
+from bot_btc_1hr_kalshi.signal.types import LiquidationPressure
 
 
 def _book(ask_price: int, *, valid: bool = True) -> L2Book:
@@ -58,7 +56,7 @@ def _snap(
     spot: float = 60_100.0,
     strike: float = 60_000.0,
     open_interest: OpenInterestSample | None = None,
-    liquidation_heatmap: LiquidationHeatmapSample | None = None,
+    liquidation_pressure: LiquidationPressure | None = None,
     **kwargs: object,
 ) -> MarketSnapshot:
     return MarketSnapshot(
@@ -69,17 +67,16 @@ def _snap(
         minutes_to_settlement=30.0,
         strike_usd=strike,
         open_interest=open_interest,
-        liquidation_heatmap=liquidation_heatmap,
+        liquidation_pressure=liquidation_pressure,
     )
 
 
-def _heatmap(peak_price: float, total: float = 1_000_000.0) -> LiquidationHeatmapSample:
-    return LiquidationHeatmapSample(
-        ts_ns=1,
-        symbol="BTCUSDT",
-        total_liquidation_usd=total,
-        peak_cluster_price_usd=peak_price,
-        peak_cluster_liquidation_usd=total,
+def _pressure(
+    long_below: float = 0.0, short_above: float = 0.0
+) -> LiquidationPressure:
+    return LiquidationPressure(
+        long_usd_below_spot=long_below,
+        short_usd_above_spot=short_above,
     )
 
 
@@ -276,63 +273,82 @@ def test_cvd_veto_does_not_block_on_positive_flow_of_equal_magnitude() -> None:
     assert sig is not None
 
 
-# ---- Microstructure shadow gate (Slice 11 P3) --------------------------------
+# ---- Microstructure shadow gate (liquidation cascade / OI compression) ------
 
 
 def test_microstructure_off_still_emits_signal_and_tags_reason() -> None:
-    # Spot 60_100, cluster at 59_800 → gap_frac = 300/60_100 ≈ 0.00499,
-    # which is <= default 0.005 → adverse cluster BELOW spot for the long.
-    # With gating OFF (default), the trap must still emit the signal but
-    # tag `shadow_veto_reason` on the features payload.
+    # 6M USD of long liquidations below spot >= 5M threshold → adverse
+    # cascade for the long (a falling-knife). Gating OFF (default): signal
+    # still emits but the shadow tag lands on features for paper-soak.
     sig = detect_floor_reversion(
         _snap(
             ask_price=20,
             pct_b=-0.9,
-            liquidation_heatmap=_heatmap(peak_price=59_800.0),
+            liquidation_pressure=_pressure(long_below=6_000_000.0),
         ),
         min_confidence=0.3,
+        liquidation_cascade_threshold_usd=5_000_000.0,
     )
     assert sig is not None
-    assert sig.features.shadow_veto_reason == "heatmap_adverse_cluster_below"
+    assert sig.features.shadow_veto_reason == "liquidation_cascade_below"
 
 
-def test_microstructure_on_rejects_when_cluster_below_spot() -> None:
+def test_microstructure_on_rejects_when_long_cascade_below_spot() -> None:
     sig = detect_floor_reversion(
         _snap(
             ask_price=20,
             pct_b=-0.9,
-            liquidation_heatmap=_heatmap(peak_price=59_800.0),
+            liquidation_pressure=_pressure(long_below=6_000_000.0),
         ),
         min_confidence=0.3,
         enable_microstructure_gating=True,
+        liquidation_cascade_threshold_usd=5_000_000.0,
     )
     assert sig is None
 
 
-def test_microstructure_ignores_cluster_above_spot_for_long() -> None:
-    # Cluster above spot is in our favor for a long bet — no veto,
-    # no tag, plain signal.
+def test_microstructure_ignores_short_cascade_above_spot_for_long() -> None:
+    # Only long-side liquidations BELOW spot indicate a cascade we would
+    # be long-diving into. Short squeezes above spot are in our favor.
     sig = detect_floor_reversion(
         _snap(
             ask_price=20,
             pct_b=-0.9,
-            liquidation_heatmap=_heatmap(peak_price=60_300.0),
+            liquidation_pressure=_pressure(short_above=10_000_000.0),
         ),
         min_confidence=0.3,
+        liquidation_cascade_threshold_usd=5_000_000.0,
     )
     assert sig is not None
     assert sig.features.shadow_veto_reason is None
 
 
-def test_microstructure_ignores_distant_cluster() -> None:
-    # Cluster 58_000 is > 0.5% below spot 60_100 — outside the adverse band.
+def test_microstructure_ignores_cascade_below_threshold() -> None:
+    # 3M below the 5M trigger — trap fires, no tag.
     sig = detect_floor_reversion(
         _snap(
             ask_price=20,
             pct_b=-0.9,
-            liquidation_heatmap=_heatmap(peak_price=58_000.0),
+            liquidation_pressure=_pressure(long_below=3_000_000.0),
         ),
         min_confidence=0.3,
+        liquidation_cascade_threshold_usd=5_000_000.0,
+    )
+    assert sig is not None
+    assert sig.features.shadow_veto_reason is None
+
+
+def test_microstructure_cascade_threshold_zero_is_disabled() -> None:
+    # Default threshold 0.0 disables the check entirely — even a large
+    # adverse pressure reading does not trigger the tag.
+    sig = detect_floor_reversion(
+        _snap(
+            ask_price=20,
+            pct_b=-0.9,
+            liquidation_pressure=_pressure(long_below=100_000_000.0),
+        ),
+        min_confidence=0.3,
+        enable_microstructure_gating=True,
     )
     assert sig is not None
     assert sig.features.shadow_veto_reason is None
@@ -372,7 +388,7 @@ def test_microstructure_oi_threshold_zero_is_disabled() -> None:
 
 
 def test_microstructure_absent_feeds_fail_open() -> None:
-    # No heatmap, no OI sample — matches pre-Coinglass behavior.
+    # No pressure, no OI sample — matches pre-microstructure behavior.
     sig = detect_floor_reversion(
         _snap(ask_price=20, pct_b=-0.9),
         min_confidence=0.3,

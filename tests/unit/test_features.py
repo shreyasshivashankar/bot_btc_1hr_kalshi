@@ -13,10 +13,13 @@ import math
 import pytest
 
 from bot_btc_1hr_kalshi.market_data.bars import MultiTimeframeBus
-from bot_btc_1hr_kalshi.market_data.types import SpotTick
+from bot_btc_1hr_kalshi.market_data.types import LiquidationEvent, SpotTick
 from bot_btc_1hr_kalshi.obs.money import usd_to_micros
 from bot_btc_1hr_kalshi.signal import FeatureEngine
-from bot_btc_1hr_kalshi.signal.features import MOVE_24H_WINDOW_BARS
+from bot_btc_1hr_kalshi.signal.features import (
+    LIQUIDATION_DEQUE_CAPACITY,
+    MOVE_24H_WINDOW_BARS,
+)
 
 
 def _engine(
@@ -417,3 +420,89 @@ def test_cvd_populates_from_bus_path() -> None:
         ))
     # After the 7th tick, 6 bars closed; last 5 all +$1k buy → CVD = +$5k.
     assert fe.cvd("1m", periods=5) == pytest.approx(5_000.0)
+
+
+# ---- Liquidation rolling deque (PR-C) ----------------------------------------
+
+
+def _liq(
+    *,
+    ts_ns: int,
+    side: str = "long",
+    price_usd: float = 60_000.0,
+    size_usd: float = 1_000_000.0,
+) -> LiquidationEvent:
+    assert side in ("long", "short")
+    return LiquidationEvent(
+        ts_ns=ts_ns,
+        symbol="BTC",
+        side=side,  # type: ignore[arg-type]
+        price_usd=price_usd,
+        size_usd=size_usd,
+    )
+
+
+def test_liquidation_window_sums_by_side() -> None:
+    fe = _engine()
+    t0 = 1_713_312_000_000_000_000
+    fe.ingest_liquidation(_liq(ts_ns=t0, side="long", size_usd=2_000_000.0))
+    fe.ingest_liquidation(_liq(ts_ns=t0 + 1_000_000_000, side="short", size_usd=3_000_000.0))
+    fe.ingest_liquidation(
+        _liq(ts_ns=t0 + 2_000_000_000, side="long", size_usd=500_000.0)
+    )
+
+    assert fe.liquidation_usd_in_window(
+        now_ns=t0 + 3_000_000_000, lookback_sec=60.0, side="long"
+    ) == pytest.approx(2_500_000.0)
+    assert fe.liquidation_usd_in_window(
+        now_ns=t0 + 3_000_000_000, lookback_sec=60.0, side="short"
+    ) == pytest.approx(3_000_000.0)
+
+
+def test_liquidation_window_drops_events_past_lookback() -> None:
+    fe = _engine()
+    t0 = 1_713_312_000_000_000_000
+    fe.ingest_liquidation(_liq(ts_ns=t0, side="long", size_usd=10_000_000.0))
+    # 120s later, lookback=60s → the old event is outside the window.
+    assert fe.liquidation_usd_in_window(
+        now_ns=t0 + 120_000_000_000, lookback_sec=60.0, side="long"
+    ) == 0.0
+
+
+def test_liquidation_window_filters_by_price_band() -> None:
+    fe = _engine()
+    t0 = 1_713_312_000_000_000_000
+    fe.ingest_liquidation(_liq(ts_ns=t0, side="long", price_usd=59_800.0, size_usd=1e6))
+    fe.ingest_liquidation(_liq(ts_ns=t0, side="long", price_usd=60_050.0, size_usd=1e6))
+    fe.ingest_liquidation(_liq(ts_ns=t0, side="long", price_usd=59_000.0, size_usd=1e6))
+    total = fe.liquidation_usd_in_window(
+        now_ns=t0 + 1,
+        lookback_sec=60.0,
+        side="long",
+        price_min=59_500.0,
+        price_max=60_000.0,
+    )
+    # Only the 59_800 event falls inside [59_500, 60_000].
+    assert total == pytest.approx(1_000_000.0)
+
+
+def test_liquidation_window_rejects_nonpositive_lookback() -> None:
+    fe = _engine()
+    with pytest.raises(ValueError):
+        fe.liquidation_usd_in_window(now_ns=0, lookback_sec=0.0, side="long")
+
+
+def test_liquidation_deque_bounded_by_capacity() -> None:
+    fe = _engine()
+    # Push CAPACITY+10 events; the oldest 10 should be evicted. Scanning
+    # the full lookback should see exactly CAPACITY events.
+    for i in range(LIQUIDATION_DEQUE_CAPACITY + 10):
+        fe.ingest_liquidation(_liq(ts_ns=i, side="long", size_usd=1.0))
+    # Now is just past the newest event; lookback big enough to cover the
+    # entire retained window.
+    total = fe.liquidation_usd_in_window(
+        now_ns=LIQUIDATION_DEQUE_CAPACITY + 10,
+        lookback_sec=1.0,
+        side="long",
+    )
+    assert total == pytest.approx(float(LIQUIDATION_DEQUE_CAPACITY))

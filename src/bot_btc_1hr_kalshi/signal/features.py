@@ -41,7 +41,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from bot_btc_1hr_kalshi.obs.schemas import RegimeTrend, RegimeVol
 from bot_btc_1hr_kalshi.signal.indicators import (
@@ -52,6 +52,7 @@ from bot_btc_1hr_kalshi.signal.indicators import (
 
 if TYPE_CHECKING:
     from bot_btc_1hr_kalshi.market_data.bars import Bar, MultiTimeframeBus
+    from bot_btc_1hr_kalshi.market_data.types import LiquidationEvent
 
 TF_LABEL_TO_SEC: dict[str, int] = {
     "1m": 60,
@@ -79,6 +80,15 @@ CVD_WINDOW_BARS = 10
 # replay). A separate constant from the deque capacity so a future settings
 # knob can surface this without touching the engine's internal capacity.
 CVD_ROLLING_PERIODS = 5
+
+# Liquidation deque capacity (PR-C). 10_000 entries at the Bybit cadence
+# (typically a few prints per minute even in calm regimes, hundreds per
+# minute during a cascade) covers ~hours of normal flow and ~tens of
+# minutes during the worst observed bursts. The window-query method
+# walks the deque from the right until it crosses the lookback boundary,
+# so capacity does not affect the per-call cost — it only bounds the
+# upper memory footprint.
+LIQUIDATION_DEQUE_CAPACITY = 10_000
 
 
 @dataclass(slots=True)
@@ -115,6 +125,7 @@ class FeatureEngine:
         "_atr_lo_threshold",
         "_bars_1h_closes_usd",
         "_bollinger_period",
+        "_liquidations",
         "_states",
     )
 
@@ -154,6 +165,15 @@ class FeatureEngine:
             for tf in timeframes
         }
         self._bars_1h_closes_usd: deque[float] = deque(maxlen=MOVE_24H_WINDOW_BARS)
+        # Rolling liquidation print stream (PR-C). Fed by
+        # `DerivativesOracle.subscribe_liquidations(feature_engine.ingest_liquidation)`
+        # at startup. Snapshot builders read `liquidation_usd_in_window` to
+        # pre-aggregate `LiquidationPressure`. Deque is monotonic in ts_ns
+        # within a single feed; cross-feed interleaving is currently
+        # impossible because only Bybit emits liquidation events.
+        self._liquidations: deque[LiquidationEvent] = deque(
+            maxlen=LIQUIDATION_DEQUE_CAPACITY
+        )
 
     @property
     def timeframes(self) -> tuple[str, ...]:
@@ -203,6 +223,18 @@ class FeatureEngine:
         state.last_close = close
         if tf == "1h":
             self._bars_1h_closes_usd.append(close)
+
+    def ingest_liquidation(self, event: LiquidationEvent) -> None:
+        """Append one liquidation print to the rolling deque (PR-C).
+
+        Called from `DerivativesOracle.subscribe_liquidations` at startup
+        (push-based, not bar-driven). Replays bypass this — they push
+        synthesized events through the same method when reconstructing
+        a session from archived ticks. Deque overflow drops the oldest
+        event; `liquidation_usd_in_window` walks from the right so the
+        stale-end loss is invisible to any reasonable lookback.
+        """
+        self._liquidations.append(event)
 
     def ingest_bar_flows(
         self, tf: str, *, buy_volume_usd: float, sell_volume_usd: float
@@ -330,6 +362,48 @@ class FeatureEngine:
         buy_total = sum(buy for buy, _ in recent)
         sell_total = sum(sell for _, sell in recent)
         return buy_total - sell_total
+
+    def liquidation_usd_in_window(
+        self,
+        *,
+        now_ns: int,
+        lookback_sec: float,
+        side: Literal["long", "short"],
+        price_min: float | None = None,
+        price_max: float | None = None,
+    ) -> float:
+        """Sum USD notional of liquidations in the trailing window (PR-C).
+
+        Filters by `side` (the liquidated position's direction) and an
+        optional `[price_min, price_max]` band — the snapshot builder
+        passes `(spot * (1 - window_pct), spot)` for "longs liquidated
+        below spot" and `(spot, spot * (1 + window_pct))` for "shorts
+        liquidated above spot".
+
+        Returns 0.0 on cold start (empty deque) — there is no warmup
+        notion here, since a freshly-empty window legitimately means
+        "no liquidation pressure in this band". Trap callers compare
+        against a positive USD threshold, so 0.0 fails the gate cleanly.
+
+        Walks the deque right-to-left, breaking out as soon as ts_ns
+        falls outside the lookback window. Cost is O(events_in_window)
+        rather than O(deque_capacity).
+        """
+        if lookback_sec <= 0.0:
+            raise ValueError(f"lookback_sec must be > 0, got {lookback_sec}")
+        cutoff_ns = now_ns - int(lookback_sec * 1_000_000_000)
+        total = 0.0
+        for event in reversed(self._liquidations):
+            if event.ts_ns < cutoff_ns:
+                break
+            if event.side != side:
+                continue
+            if price_min is not None and event.price_usd < price_min:
+                continue
+            if price_max is not None and event.price_usd > price_max:
+                continue
+            total += event.size_usd
+        return total
 
     # ---- cross-TF derivatives --------------------------------------------
 

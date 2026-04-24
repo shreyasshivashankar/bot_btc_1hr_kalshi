@@ -58,10 +58,6 @@ from bot_btc_1hr_kalshi.market_data.feeds.bybit import (
     bybit_tickers_parser,
     bybit_tickers_topic,
 )
-from bot_btc_1hr_kalshi.market_data.feeds.coinglass import CoinglassPoller
-from bot_btc_1hr_kalshi.market_data.feeds.coinglass_heatmap import (
-    CoinglassHeatmapPoller,
-)
 from bot_btc_1hr_kalshi.market_data.feeds.derivatives import DerivativesFeed
 from bot_btc_1hr_kalshi.market_data.feeds.hyperliquid import (
     HYPERLIQUID_SOURCE,
@@ -77,14 +73,11 @@ from bot_btc_1hr_kalshi.market_data.feeds.spot import (
     kraken_parser,
 )
 from bot_btc_1hr_kalshi.market_data.feeds.staleness import StalenessTracker
-from bot_btc_1hr_kalshi.market_data.feeds.whale_alert import WhaleAlertPoller
 from bot_btc_1hr_kalshi.market_data.kalshi_rest import kalshi_date_header_probe
 from bot_btc_1hr_kalshi.market_data.spot_oracle import SpotOracle
 from bot_btc_1hr_kalshi.market_data.types import (
     LiquidationEvent,
-    LiquidationHeatmapSample,
     OpenInterestSample,
-    WhaleAlertSample,
 )
 from bot_btc_1hr_kalshi.monitor.position_monitor import PositionMonitor
 from bot_btc_1hr_kalshi.obs.activity import ActivityTracker
@@ -285,12 +278,6 @@ async def serve(app: App, *, admin_token: str, host: str, port: int) -> None:
     calendar_task: asyncio.Task[None] | None = None
     ff_refresh_task: asyncio.Task[None] | None = None
     ff_client: httpx.AsyncClient | None = None
-    coinglass_task: asyncio.Task[None] | None = None
-    coinglass_client: httpx.AsyncClient | None = None
-    heatmap_task: asyncio.Task[None] | None = None
-    heatmap_client: httpx.AsyncClient | None = None
-    whale_task: asyncio.Task[None] | None = None
-    whale_client: httpx.AsyncClient | None = None
     derivatives_oracle_task: asyncio.Task[None] | None = None
     rest_client: httpx.AsyncClient | None = None
 
@@ -307,9 +294,6 @@ async def serve(app: App, *, admin_token: str, host: str, port: int) -> None:
             spot_task,
             calendar_task,
             ff_refresh_task,
-            coinglass_task,
-            heatmap_task,
-            whale_task,
             derivatives_oracle_task,
         ):
             if t is not None:
@@ -321,9 +305,6 @@ async def serve(app: App, *, admin_token: str, host: str, port: int) -> None:
 
     feed_task, drift_task, spot_task, rest_client = _start_feed_loop_if_enabled(app, log)
     calendar_task, ff_refresh_task, ff_client = _start_calendar_if_enabled(app, log)
-    coinglass_task, coinglass_client = _start_coinglass_if_enabled(app, log)
-    heatmap_task, heatmap_client = _start_coinglass_heatmap_if_enabled(app, log)
-    whale_task, whale_client = _start_whale_alert_if_enabled(app, log)
     derivatives_oracle_task = _start_derivatives_oracle_if_enabled(app, log)
 
     # Supervise the background tasks. If any dies unexpectedly (not via
@@ -367,24 +348,10 @@ async def serve(app: App, *, admin_token: str, host: str, port: int) -> None:
     ):
         if task is not None:
             task.add_done_callback(_make_supervisor(name))
-    # Non-critical: Coinglass OI is observational (Slice 11 P2 shadow).
-    # Logging its death is sufficient — traps don't gate on OI yet, so
-    # a dead poller must not force a container restart (that would let
-    # a third-party API outage take the trading graph down with it).
-    if coinglass_task is not None:
-        coinglass_task.add_done_callback(_make_supervisor("coinglass-oi", halt_on_death=False))
-    if heatmap_task is not None:
-        heatmap_task.add_done_callback(
-            _make_supervisor("coinglass-heatmap", halt_on_death=False)
-        )
-    # Whale Alert is observational-only (Slice 11 P4 shadow) — treat as
-    # non-critical for the same reason as Coinglass: a third-party API
-    # hiccup must not take the trading graph down.
-    if whale_task is not None:
-        whale_task.add_done_callback(_make_supervisor("whale-alert", halt_on_death=False))
-    # DerivativesOracle (PR-A: Hyperliquid OI). Observational alongside
-    # the Coinglass poller until parity is observed in soak — no trap
-    # gates on it yet, so a dropped WS must not halt the trading graph.
+    # DerivativesOracle (Hyperliquid OI + Bybit OI/liquidations). Feeds
+    # the FeatureEngine rolling-liquidation deque consumed by the floor/
+    # ceiling microstructure veto in shadow mode (PR-C). A dropped WS
+    # must not halt the trading graph — the veto fails-open by design.
     if derivatives_oracle_task is not None:
         derivatives_oracle_task.add_done_callback(
             _make_supervisor("derivatives-oracle", halt_on_death=False)
@@ -400,9 +367,6 @@ async def serve(app: App, *, admin_token: str, host: str, port: int) -> None:
             ("spot-oracle", spot_task),
             ("calendar-guard", calendar_task),
             ("forex-factory-refresh", ff_refresh_task),
-            ("coinglass-oi", coinglass_task),
-            ("coinglass-heatmap", heatmap_task),
-            ("whale-alert", whale_task),
             ("derivatives-oracle", derivatives_oracle_task),
         ):
             if task is None:
@@ -416,12 +380,6 @@ async def serve(app: App, *, admin_token: str, host: str, port: int) -> None:
                 log.warning("shutdown.task_error", task=name, error=str(exc))
         if ff_client is not None:
             await ff_client.aclose()
-        if coinglass_client is not None:
-            await coinglass_client.aclose()
-        if heatmap_client is not None:
-            await heatmap_client.aclose()
-        if whale_client is not None:
-            await whale_client.aclose()
         if rest_client is not None:
             await rest_client.aclose()
         if app.kalshi_rest_client is not None:
@@ -549,197 +507,19 @@ def _start_calendar_if_enabled(
     return calendar_task, ff_refresh_task, ff_client
 
 
-def _start_coinglass_if_enabled(
-    app: App,
-    log: Any,
-) -> tuple[asyncio.Task[None] | None, httpx.AsyncClient | None]:
-    """Spin up the Coinglass OI poller (Slice 11 P2 — shadow).
-
-    Observational only: each sample is logged and stashed on
-    `App.latest_open_interest`, but traps do not gate on it yet. Gated
-    on the same `MODES_WITH_FEED_LOOP` set as the other feeds — dev
-    mode stays offline by default. The task supervisor treats this
-    poller the same as any other background task: an unexpected death
-    halts the app and lets Cloud Run restart it.
-    """
-    settings = app.settings.feeds.coinglass
-    if not settings.enabled:
-        log.info("boot.coinglass_disabled", reason="feeds.coinglass.enabled=false")
-        return None, None
-    if app.settings.mode not in MODES_WITH_FEED_LOOP:
-        log.info("boot.coinglass_skipped", mode=app.settings.mode)
-        return None, None
-
-    api_key = os.getenv(settings.api_key_env) or None
-    if not api_key:
-        log.warning(
-            "boot.coinglass_unkeyed",
-            note=(
-                f"{settings.api_key_env} not set; using free-tier unkeyed path "
-                "(stricter rate limits, may fail on shared IP)"
-            ),
-        )
-
-    client = httpx.AsyncClient(timeout=10.0)
-
-    async def _on_sample(sample: OpenInterestSample) -> None:
-        app.latest_open_interest = sample
-
-    poller = CoinglassPoller(
-        client=client,
-        clock=app.clock,
-        on_sample=_on_sample,
-        base_url=settings.base_url,
-        oi_path=settings.oi_path,
-        symbol=settings.symbol,
-        interval=settings.interval,
-        api_key=api_key,
-        poll_interval_sec=settings.poll_interval_sec,
-    )
-    task = asyncio.create_task(poller.run(), name="coinglass-oi")
-    log.info(
-        "boot.coinglass_enabled",
-        base_url=settings.base_url,
-        path=settings.oi_path,
-        symbol=settings.symbol,
-        interval=settings.interval,
-        poll_interval_sec=settings.poll_interval_sec,
-        keyed=bool(api_key),
-    )
-    return task, client
-
-
-def _start_coinglass_heatmap_if_enabled(
-    app: App,
-    log: Any,
-) -> tuple[asyncio.Task[None] | None, httpx.AsyncClient | None]:
-    """Spin up the Coinglass liquidation-heatmap poller (Slice 11 P3 —
-    shadow). Same contract as `_start_coinglass_if_enabled`: observational
-    only, non-critical background task (death logged, not halting). Lives
-    on a separate httpx client so a stuck heatmap endpoint cannot share
-    connection-pool pressure with the OI poller."""
-    settings = app.settings.feeds.coinglass_heatmap
-    if not settings.enabled:
-        log.info(
-            "boot.coinglass_heatmap_disabled",
-            reason="feeds.coinglass_heatmap.enabled=false",
-        )
-        return None, None
-    if app.settings.mode not in MODES_WITH_FEED_LOOP:
-        log.info("boot.coinglass_heatmap_skipped", mode=app.settings.mode)
-        return None, None
-
-    api_key = os.getenv(settings.api_key_env) or None
-    if not api_key:
-        log.warning(
-            "boot.coinglass_heatmap_unkeyed",
-            note=(
-                f"{settings.api_key_env} not set; heatmap endpoint commonly "
-                "requires a paid-tier key and may 401 unkeyed"
-            ),
-        )
-
-    client = httpx.AsyncClient(timeout=10.0)
-
-    async def _on_sample(sample: LiquidationHeatmapSample) -> None:
-        app.latest_liquidation_heatmap = sample
-
-    poller = CoinglassHeatmapPoller(
-        client=client,
-        clock=app.clock,
-        on_sample=_on_sample,
-        base_url=settings.base_url,
-        heatmap_path=settings.heatmap_path,
-        symbol=settings.symbol,
-        interval=settings.interval,
-        api_key=api_key,
-        poll_interval_sec=settings.poll_interval_sec,
-    )
-    task = asyncio.create_task(poller.run(), name="coinglass-heatmap")
-    log.info(
-        "boot.coinglass_heatmap_enabled",
-        base_url=settings.base_url,
-        path=settings.heatmap_path,
-        symbol=settings.symbol,
-        interval=settings.interval,
-        poll_interval_sec=settings.poll_interval_sec,
-        keyed=bool(api_key),
-    )
-    return task, client
-
-
-def _start_whale_alert_if_enabled(
-    app: App,
-    log: Any,
-) -> tuple[asyncio.Task[None] | None, httpx.AsyncClient | None]:
-    """Spin up the Whale Alert poller (Slice 11 P4 — shadow).
-
-    Same contract as the Coinglass pollers: observational only, non-
-    critical. Unlike Coinglass, Whale Alert has no unauthenticated tier
-    — if the API-key env var is unset we log a warning and skip the
-    task entirely rather than fire 401s on every poll.
-    """
-    settings = app.settings.feeds.whale_alert
-    if not settings.enabled:
-        log.info("boot.whale_alert_disabled", reason="feeds.whale_alert.enabled=false")
-        return None, None
-    if app.settings.mode not in MODES_WITH_FEED_LOOP:
-        log.info("boot.whale_alert_skipped", mode=app.settings.mode)
-        return None, None
-
-    api_key = os.getenv(settings.api_key_env) or None
-    if not api_key:
-        log.warning(
-            "boot.whale_alert_missing_key",
-            note=(
-                f"{settings.api_key_env} not set; whale-alert poller will not start "
-                "(endpoint requires a paid subscription key)"
-            ),
-        )
-        return None, None
-
-    client = httpx.AsyncClient(timeout=10.0)
-
-    async def _on_sample(sample: WhaleAlertSample) -> None:
-        app.latest_whale_alert = sample
-
-    poller = WhaleAlertPoller(
-        client=client,
-        clock=app.clock,
-        on_sample=_on_sample,
-        api_key=api_key,
-        base_url=settings.base_url,
-        path=settings.path,
-        symbol=settings.symbol,
-        min_value_usd=settings.min_value_usd,
-        poll_interval_sec=settings.poll_interval_sec,
-    )
-    task = asyncio.create_task(poller.run(), name="whale-alert")
-    log.info(
-        "boot.whale_alert_enabled",
-        base_url=settings.base_url,
-        path=settings.path,
-        symbol=settings.symbol,
-        min_value_usd=settings.min_value_usd,
-        poll_interval_sec=settings.poll_interval_sec,
-    )
-    return task, client
-
-
 def _start_derivatives_oracle_if_enabled(
     app: App,
     log: Any,
 ) -> asyncio.Task[None] | None:
-    """Spin up the persistent DerivativesOracle (PR-A Hyperliquid + PR-B Bybit).
+    """Spin up the persistent DerivativesOracle (Hyperliquid + Bybit).
 
     Wires all enabled public-WS derivatives feeds into a single
     `DerivativesOracle` that exposes fail-closed accessors and
-    dispatches subscriber callbacks. OI updates still run alongside
-    the existing Coinglass HTTP poller — both push into
-    `App.latest_open_interest`, most-recent wins — until PR-C retires
-    Coinglass on paper-soak parity. Liquidation events are net-new
-    (no prior source); the FeatureEngine rolling deque consumes them
-    starting in PR-C.
+    dispatches subscriber callbacks. OI samples push into
+    `App.latest_open_interest` (sole source after the Coinglass
+    retirement in PR-C). Liquidation events feed the FeatureEngine
+    rolling deque, which the floor/ceiling microstructure veto reads
+    via `LiquidationPressure` aggregated at snapshot construction.
 
     Disabled when neither `feeds.hyperliquid` nor `feeds.bybit` is
     enabled, or when the mode is not in `MODES_WITH_FEED_LOOP`. In
@@ -831,10 +611,6 @@ def _start_derivatives_oracle_if_enabled(
     app.derivatives_oracle = oracle
 
     def _on_oi(sample: OpenInterestSample) -> None:
-        # Both DerivativesOracle (push-based) and CoinglassPoller (HTTP poll)
-        # write here during the parity period. Most-recent wins by virtue
-        # of who set the slot last; a future "tagged source" model can land
-        # in PR-C once Coinglass is retired.
         app.latest_open_interest = sample
         log.info(
             "derivatives_oracle.oi_sample",
@@ -844,23 +620,18 @@ def _start_derivatives_oracle_if_enabled(
             ts_ns=sample.ts_ns,
         )
 
-    def _on_liq(event: LiquidationEvent) -> None:
-        # Observational-only until PR-C wires the FeatureEngine rolling
-        # deque. Keeping the log emission means paper-soak has coverage
-        # of the stream cadence + side distribution before any trap
-        # gates on it.
-        log.info(
-            "derivatives_oracle.liquidation",
-            source=event.source,
-            symbol=event.symbol,
-            side=event.side,
-            price_usd=event.price_usd,
-            size_usd=event.size_usd,
-            ts_ns=event.ts_ns,
-        )
-
     oracle.subscribe_open_interest(_on_oi)
-    oracle.subscribe_liquidations(_on_liq)
+    # Liquidations stream into FeatureEngine's rolling deque; the floor/
+    # ceiling microstructure veto reads window aggregates via the
+    # snapshot's `LiquidationPressure` (built per-tick in the feed loop).
+    # FeatureEngine is created by `_start_feed_loop_if_enabled`, which
+    # runs in `serve()` before this function under the same mode gate.
+    if app.feature_engine is None:
+        raise RuntimeError(
+            "derivatives oracle started without FeatureEngine; "
+            "_start_feed_loop_if_enabled must run first"
+        )
+    oracle.subscribe_liquidations(app.feature_engine.ingest_liquidation)
 
     task = asyncio.create_task(oracle.run(), name="derivatives-oracle")
     log.info(

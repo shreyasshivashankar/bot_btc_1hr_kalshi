@@ -20,11 +20,7 @@ from bot_btc_1hr_kalshi.market_data.bars import MultiTimeframeBus
 from bot_btc_1hr_kalshi.market_data.book import L2Book
 from bot_btc_1hr_kalshi.market_data.derivatives_oracle import DerivativesOracle
 from bot_btc_1hr_kalshi.market_data.spot_oracle import SpotOracle
-from bot_btc_1hr_kalshi.market_data.types import (
-    LiquidationHeatmapSample,
-    OpenInterestSample,
-    WhaleAlertSample,
-)
+from bot_btc_1hr_kalshi.market_data.types import OpenInterestSample
 from bot_btc_1hr_kalshi.monitor.position_monitor import PositionMonitor
 from bot_btc_1hr_kalshi.obs.activity import ActivityTracker
 from bot_btc_1hr_kalshi.obs.clock import Clock
@@ -76,21 +72,13 @@ class App:
     # shutdown path in `__main__.serve()` can `aclose()` it alongside
     # other async resources. None in dev / paper / shadow modes.
     kalshi_rest_client: httpx.AsyncClient | None = None
-    # Latest Coinglass open-interest sample (Slice 11 P2 — shadow). Polled
-    # on cadence; attached to outbound `MarketSnapshot` for optional trap
-    # consumption. None during warmup or when the poller is disabled.
-    # Not currently gating any signal — observation only pending a
-    # risk-committee promotion decision.
+    # Latest aggregated BTC-futures open-interest sample. Pushed by
+    # `DerivativesOracle` from Hyperliquid `metaAndAssetCtxs` and Bybit
+    # `tickers` (most-recent wins). Attached to outbound `MarketSnapshot`
+    # for optional trap consumption — observational until risk-committee
+    # sign-off promotes it to an entry gate. None during warmup or when
+    # both derivatives feeds are disabled.
     latest_open_interest: OpenInterestSample | None = None
-    # Latest Coinglass liquidation-heatmap snapshot (Slice 11 P3 — shadow).
-    # Observation-only summary (total, peak cluster, peak price) polled
-    # on cadence. Same promotion contract as `latest_open_interest`:
-    # risk-committee sign-off required before any trap reads this.
-    latest_liquidation_heatmap: LiquidationHeatmapSample | None = None
-    # Latest Whale Alert rolling summary (Slice 11 P4 — shadow). Net
-    # exchange-flow USD over the polling window; observational only
-    # until shadow-soak + risk-committee sign-off justify a threshold.
-    latest_whale_alert: WhaleAlertSample | None = None
     books: dict[str, L2Book] = field(default_factory=dict)
     trading_halted: bool = False
     tier1_override_active: bool = False
