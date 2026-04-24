@@ -1,7 +1,9 @@
-"""Unit tests for DerivativesOracle (PR-A).
+"""Unit tests for DerivativesOracle (PR-A + PR-B).
 
 Mirrors the SpotOracle test suite — fail-closed accessor, subscriber
-delivery, cold-catch-up semantics, unsubscribe, multi-feed run().
+delivery, cold-catch-up semantics, unsubscribe, multi-feed run(). PR-B
+adds liquidation-stream coverage: subscriber dispatch, no-warm-start
+(discrete events, not snapshots), and concurrent OI+liq run().
 """
 
 from __future__ import annotations
@@ -16,7 +18,7 @@ from bot_btc_1hr_kalshi.market_data.derivatives_oracle import (
     DerivativesOracle,
     DerivativesStaleError,
 )
-from bot_btc_1hr_kalshi.market_data.types import OpenInterestSample
+from bot_btc_1hr_kalshi.market_data.types import LiquidationEvent, OpenInterestSample
 from bot_btc_1hr_kalshi.obs.clock import ManualClock
 
 
@@ -46,7 +48,7 @@ class FakeFeed:
 def _oracle(clock: ManualClock, *feed_samples: list[OpenInterestSample]) -> DerivativesOracle:
     feeds = tuple(FakeFeed(s) for s in feed_samples)
     # type: ignore[arg-type] — FakeFeed duck-types DerivativesFeed.events()
-    return DerivativesOracle(feeds=feeds, clock=clock)  # type: ignore[arg-type]
+    return DerivativesOracle(oi_feeds=feeds, clock=clock)  # type: ignore[arg-type]
 
 
 def test_get_open_interest_cold_start_raises() -> None:
@@ -160,7 +162,7 @@ async def test_unsubscribe_stops_delivery() -> None:
             await asyncio.Event().wait()
 
     feed = GatedFeed()
-    oracle = DerivativesOracle(feeds=(feed,), clock=clock)  # type: ignore[arg-type]
+    oracle = DerivativesOracle(oi_feeds=(feed,), clock=clock)  # type: ignore[arg-type]
     unsub = oracle.subscribe_open_interest(received.append)
     task = asyncio.create_task(oracle.run())
     try:
@@ -203,3 +205,114 @@ async def test_run_consumes_multiple_feeds_concurrently() -> None:
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError, Exception):
             await task
+
+
+# --- PR-B: liquidation-stream coverage --------------------------------------
+
+
+def _liq(ts_ns: int, *, side: str = "long", price: float = 70_000.0,
+         size_usd: float = 50_000.0) -> LiquidationEvent:
+    return LiquidationEvent(
+        ts_ns=ts_ns,
+        symbol="BTC",
+        side="long" if side == "long" else "short",
+        price_usd=price,
+        size_usd=size_usd,
+        source="bybit",
+    )
+
+
+class FakeLiqFeed:
+    def __init__(self, events: list[LiquidationEvent]) -> None:
+        self._events = list(events)
+
+    async def events(self) -> AsyncIterator[LiquidationEvent]:
+        for e in self._events:
+            yield e
+        await asyncio.Event().wait()
+
+
+@pytest.mark.asyncio
+async def test_subscribe_liquidations_delivers_each_event() -> None:
+    clock = ManualClock(0)
+    events = [_liq(1_000, side="long"), _liq(2_000, side="short")]
+    feed = FakeLiqFeed(events)
+    oracle = DerivativesOracle(liq_feeds=(feed,), clock=clock)  # type: ignore[arg-type]
+    received: list[LiquidationEvent] = []
+    oracle.subscribe_liquidations(received.append)
+    task = asyncio.create_task(oracle.run())
+    try:
+        await asyncio.sleep(0.05)
+        assert [(e.ts_ns, e.side) for e in received] == [(1_000, "long"), (2_000, "short")]
+        assert oracle.latest_liquidation is not None
+        assert oracle.latest_liquidation.ts_ns == 2_000
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await task
+
+
+@pytest.mark.asyncio
+async def test_liquidation_subscribe_does_not_warm_start() -> None:
+    """Liquidations are discrete events, not snapshots — a late
+    subscriber must NOT receive replays of pre-subscribe events. The
+    warm-start contract that applies to OI samples deliberately does
+    not apply here, otherwise the FeatureEngine deque would double-
+    count events on registration."""
+    clock = ManualClock(0)
+    feed = FakeLiqFeed([_liq(1_000), _liq(2_000)])
+    oracle = DerivativesOracle(liq_feeds=(feed,), clock=clock)  # type: ignore[arg-type]
+    task = asyncio.create_task(oracle.run())
+    try:
+        await asyncio.sleep(0.05)
+        late: list[LiquidationEvent] = []
+        oracle.subscribe_liquidations(late.append)
+        # No replay — late subscriber starts empty even though latest_liquidation is populated.
+        assert late == []
+        assert oracle.latest_liquidation is not None
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await task
+
+
+@pytest.mark.asyncio
+async def test_run_consumes_oi_and_liq_feeds_concurrently() -> None:
+    """The oracle runs OI feeds and liquidation feeds in the same
+    gather() — neither stream blocks the other."""
+    clock = ManualClock(0)
+    oi_feed = FakeFeed([_sample(1_000)])
+    liq_feed = FakeLiqFeed([_liq(2_000)])
+    oracle = DerivativesOracle(
+        oi_feeds=(oi_feed,),  # type: ignore[arg-type]
+        liq_feeds=(liq_feed,),  # type: ignore[arg-type]
+        clock=clock,
+    )
+    oi_received: list[OpenInterestSample] = []
+    liq_received: list[LiquidationEvent] = []
+    oracle.subscribe_open_interest(oi_received.append)
+    oracle.subscribe_liquidations(liq_received.append)
+    task = asyncio.create_task(oracle.run())
+    try:
+        await asyncio.sleep(0.05)
+        assert len(oi_received) == 1
+        assert len(liq_received) == 1
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await task
+
+
+def test_unsubscribe_liquidations_stops_delivery() -> None:
+    """Same unsubscribe contract as OI — returned callable removes the
+    handler."""
+    clock = ManualClock(0)
+    oracle = DerivativesOracle(clock=clock)
+    received: list[LiquidationEvent] = []
+    unsub = oracle.subscribe_liquidations(received.append)
+    # Manually fan out (no feed → no event loop needed).
+    oracle._liq_cbs[0](_liq(1_000))  # type: ignore[attr-defined]
+    unsub()
+    # After unsub, the callback list is empty.
+    assert oracle._liq_cbs == []  # type: ignore[attr-defined]
+    assert len(received) == 1

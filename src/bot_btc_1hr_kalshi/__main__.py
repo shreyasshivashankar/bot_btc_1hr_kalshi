@@ -50,6 +50,14 @@ from bot_btc_1hr_kalshi.feedloop import (
 )
 from bot_btc_1hr_kalshi.market_data.bars import MultiTimeframeBus
 from bot_btc_1hr_kalshi.market_data.derivatives_oracle import DerivativesOracle
+from bot_btc_1hr_kalshi.market_data.feeds.bybit import (
+    BYBIT_SOURCE,
+    build_bybit_subscribe,
+    bybit_liquidation_parser,
+    bybit_liquidation_topic,
+    bybit_tickers_parser,
+    bybit_tickers_topic,
+)
 from bot_btc_1hr_kalshi.market_data.feeds.coinglass import CoinglassPoller
 from bot_btc_1hr_kalshi.market_data.feeds.coinglass_heatmap import (
     CoinglassHeatmapPoller,
@@ -73,6 +81,7 @@ from bot_btc_1hr_kalshi.market_data.feeds.whale_alert import WhaleAlertPoller
 from bot_btc_1hr_kalshi.market_data.kalshi_rest import kalshi_date_header_probe
 from bot_btc_1hr_kalshi.market_data.spot_oracle import SpotOracle
 from bot_btc_1hr_kalshi.market_data.types import (
+    LiquidationEvent,
     LiquidationHeatmapSample,
     OpenInterestSample,
     WhaleAlertSample,
@@ -721,47 +730,104 @@ def _start_derivatives_oracle_if_enabled(
     app: App,
     log: Any,
 ) -> asyncio.Task[None] | None:
-    """Spin up the persistent DerivativesOracle (PR-A: Hyperliquid OI).
+    """Spin up the persistent DerivativesOracle (PR-A Hyperliquid + PR-B Bybit).
 
-    Wires Hyperliquid (and later Bybit) public WS feeds into a single
-    `DerivativesOracle` that exposes a fail-closed `get_open_interest`
-    accessor and dispatches subscriber callbacks. Runs alongside the
-    existing Coinglass HTTP poller — both push into `App.latest_open_
-    interest`, with the most recent sample winning. Coinglass is removed
-    in PR-C once paper-soak shows OI tracking parity between sources.
+    Wires all enabled public-WS derivatives feeds into a single
+    `DerivativesOracle` that exposes fail-closed accessors and
+    dispatches subscriber callbacks. OI updates still run alongside
+    the existing Coinglass HTTP poller — both push into
+    `App.latest_open_interest`, most-recent wins — until PR-C retires
+    Coinglass on paper-soak parity. Liquidation events are net-new
+    (no prior source); the FeatureEngine rolling deque consumes them
+    starting in PR-C.
 
-    Disabled by default (`feeds.hyperliquid.enabled=false`) so dev/test
-    boots without contacting an external venue. Same `MODES_WITH_FEED_
-    LOOP` gate as the other live feeds.
+    Disabled when neither `feeds.hyperliquid` nor `feeds.bybit` is
+    enabled, or when the mode is not in `MODES_WITH_FEED_LOOP`. In
+    either case we still install an empty oracle so consumers can
+    always dereference `app.derivatives_oracle` without None-guards.
     """
-    settings = app.settings.feeds.hyperliquid
-    if not settings.enabled:
+    hl_settings = app.settings.feeds.hyperliquid
+    by_settings = app.settings.feeds.bybit
+
+    if not hl_settings.enabled and not by_settings.enabled:
         log.info(
             "boot.derivatives_oracle_disabled",
-            reason="feeds.hyperliquid.enabled=false",
+            reason="no derivatives feeds enabled",
         )
-        # Still install an empty oracle so trap-side `app.derivatives_oracle`
-        # accesses don't have to None-guard everywhere.
-        app.derivatives_oracle = DerivativesOracle(feeds=(), clock=app.clock)
+        app.derivatives_oracle = DerivativesOracle(clock=app.clock)
         return None
     if app.settings.mode not in MODES_WITH_FEED_LOOP:
         log.info("boot.derivatives_oracle_skipped", mode=app.settings.mode)
-        app.derivatives_oracle = DerivativesOracle(feeds=(), clock=app.clock)
+        app.derivatives_oracle = DerivativesOracle(clock=app.clock)
         return None
 
-    hl_feed = DerivativesFeed(
-        name="hyperliquid",
-        ws_url=settings.ws_url,
-        ws_connect=ws_connect_websockets,
-        staleness=StalenessTracker(
-            name="hyperliquid",
-            clock=app.clock,
-            threshold_ms=settings.staleness_halt_ms,
-        ),
-        parse=hyperliquid_parser(asset=settings.asset, clock=app.clock),
-        subscribe=build_hyperliquid_subscribe(),
+    oi_feeds: list[DerivativesFeed[OpenInterestSample]] = []
+    liq_feeds: list[DerivativesFeed[LiquidationEvent]] = []
+    sources: list[str] = []
+
+    if hl_settings.enabled:
+        oi_feeds.append(
+            DerivativesFeed(
+                name="hyperliquid",
+                ws_url=hl_settings.ws_url,
+                ws_connect=ws_connect_websockets,
+                staleness=StalenessTracker(
+                    name="hyperliquid",
+                    clock=app.clock,
+                    threshold_ms=hl_settings.staleness_halt_ms,
+                ),
+                parse=hyperliquid_parser(asset=hl_settings.asset, clock=app.clock),
+                subscribe=build_hyperliquid_subscribe(),
+            )
+        )
+        sources.append(HYPERLIQUID_SOURCE)
+
+    if by_settings.enabled:
+        if by_settings.subscribe_oi:
+            oi_feeds.append(
+                DerivativesFeed(
+                    name="bybit",
+                    ws_url=by_settings.ws_url,
+                    ws_connect=ws_connect_websockets,
+                    staleness=StalenessTracker(
+                        name="bybit_oi",
+                        clock=app.clock,
+                        threshold_ms=by_settings.staleness_halt_ms,
+                    ),
+                    parse=bybit_tickers_parser(
+                        symbol=by_settings.symbol, clock=app.clock
+                    ),
+                    subscribe=build_bybit_subscribe(
+                        bybit_tickers_topic(by_settings.symbol)
+                    ),
+                )
+            )
+        if by_settings.subscribe_liquidations:
+            liq_feeds.append(
+                DerivativesFeed(
+                    name="bybit",
+                    ws_url=by_settings.ws_url,
+                    ws_connect=ws_connect_websockets,
+                    staleness=StalenessTracker(
+                        name="bybit_liq",
+                        clock=app.clock,
+                        threshold_ms=by_settings.staleness_halt_ms,
+                    ),
+                    parse=bybit_liquidation_parser(
+                        symbol=by_settings.symbol, clock=app.clock
+                    ),
+                    subscribe=build_bybit_subscribe(
+                        bybit_liquidation_topic(by_settings.symbol)
+                    ),
+                )
+            )
+        sources.append(BYBIT_SOURCE)
+
+    oracle = DerivativesOracle(
+        oi_feeds=tuple(oi_feeds),
+        liq_feeds=tuple(liq_feeds),
+        clock=app.clock,
     )
-    oracle = DerivativesOracle(feeds=(hl_feed,), clock=app.clock)
     app.derivatives_oracle = oracle
 
     def _on_oi(sample: OpenInterestSample) -> None:
@@ -778,15 +844,30 @@ def _start_derivatives_oracle_if_enabled(
             ts_ns=sample.ts_ns,
         )
 
+    def _on_liq(event: LiquidationEvent) -> None:
+        # Observational-only until PR-C wires the FeatureEngine rolling
+        # deque. Keeping the log emission means paper-soak has coverage
+        # of the stream cadence + side distribution before any trap
+        # gates on it.
+        log.info(
+            "derivatives_oracle.liquidation",
+            source=event.source,
+            symbol=event.symbol,
+            side=event.side,
+            price_usd=event.price_usd,
+            size_usd=event.size_usd,
+            ts_ns=event.ts_ns,
+        )
+
     oracle.subscribe_open_interest(_on_oi)
+    oracle.subscribe_liquidations(_on_liq)
 
     task = asyncio.create_task(oracle.run(), name="derivatives-oracle")
     log.info(
         "boot.derivatives_oracle_enabled",
-        sources=[HYPERLIQUID_SOURCE],
-        ws_url=settings.ws_url,
-        asset=settings.asset,
-        staleness_halt_ms=settings.staleness_halt_ms,
+        sources=sources,
+        oi_feed_count=len(oi_feeds),
+        liq_feed_count=len(liq_feeds),
     )
     return task
 

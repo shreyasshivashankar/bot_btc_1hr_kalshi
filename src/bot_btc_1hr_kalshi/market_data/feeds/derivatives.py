@@ -1,12 +1,15 @@
 """WS feed harness for derivatives venues (OI / liquidation streams).
 
 Sibling to `feeds/spot.py` — same connect / subscribe / iterate / backoff
-loop, but yields `OpenInterestSample` instead of `SpotTick`. We keep the
-two concrete (no shared generic base) because the parser signatures
-differ: spot is line-rate trade prints, derivatives is asset-context
-snapshots that may push at venue-specific cadences. A generic `Feed[T]`
-abstraction that swallowed both would obscure the per-stream pacing
-characteristics that operators reason about.
+loop, but yields venue-specific typed events. Parameterized by the
+payload type `T` so one class services both OI-snapshot streams
+(`OpenInterestSample`) and liquidation-print streams (`LiquidationEvent`)
+without duplicating the reconnect / staleness plumbing.
+
+The parser is injected; this class only owns the connect / subscribe /
+backoff lifecycle. Per-venue parse exceptions (subclasses of ValueError)
+are logged and skipped rather than tearing down the session — a single
+malformed frame is not a protocol break.
 """
 
 from __future__ import annotations
@@ -19,7 +22,7 @@ import structlog
 
 from bot_btc_1hr_kalshi.market_data.feeds.kalshi import SessionEndedError, WSConnect
 from bot_btc_1hr_kalshi.market_data.feeds.staleness import StalenessTracker
-from bot_btc_1hr_kalshi.market_data.types import OpenInterestSample, Venue
+from bot_btc_1hr_kalshi.market_data.types import Venue
 
 _log = structlog.get_logger("bot_btc_1hr_kalshi.feed.derivatives")
 
@@ -28,13 +31,14 @@ class DerivativesParseError(ValueError):
     """Malformed derivatives frame from any venue."""
 
 
-class DerivativesFeed:
-    """WS adapter for a derivatives venue OI stream.
+class DerivativesFeed[T]:
+    """WS adapter for a derivatives venue event stream.
 
-    Parser is injected (Hyperliquid `metaAndAssetCtxs`, Bybit `tickers`,
-    etc.); this class only owns the connect/subscribe/backoff lifecycle.
-    Mirrors `SpotFeed` exactly — same broad-except reconnect path, same
-    staleness tracker contract, same backoff curve.
+    Parameterized over the yielded event type `T` so one class carries
+    both `OpenInterestSample` streams (Hyperliquid `metaAndAssetCtxs`,
+    Bybit `tickers`) and `LiquidationEvent` streams (Bybit `liquidation`).
+    Mirrors `SpotFeed` — same broad-except reconnect path, same staleness
+    tracker contract, same backoff curve.
     """
 
     def __init__(
@@ -44,7 +48,7 @@ class DerivativesFeed:
         ws_url: str,
         ws_connect: WSConnect,
         staleness: StalenessTracker,
-        parse: Callable[[bytes | str], OpenInterestSample | None],
+        parse: Callable[[bytes | str], T | None],
         subscribe: bytes | Sequence[bytes] | None = None,
         backoff_initial_sec: float = 1.0,
         backoff_max_sec: float = 30.0,
@@ -65,13 +69,13 @@ class DerivativesFeed:
         self._backoff_max = backoff_max_sec
         self._sleep = sleep or _default_sleep
 
-    async def events(self) -> AsyncIterator[OpenInterestSample]:
+    async def events(self) -> AsyncIterator[T]:
         backoff = self._backoff_initial
         while True:
             try:
-                async for sample in self._session():
+                async for event in self._session():
                     backoff = self._backoff_initial
-                    yield sample
+                    yield event
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -84,7 +88,7 @@ class DerivativesFeed:
                 await self._sleep(backoff)
                 backoff = min(self._backoff_max, backoff * 2.0)
 
-    async def _session(self) -> AsyncIterator[OpenInterestSample]:
+    async def _session(self) -> AsyncIterator[T]:
         try:
             conn = await self._connect(self._url)
         except Exception as exc:
@@ -96,26 +100,25 @@ class DerivativesFeed:
             async for raw in conn:
                 self._staleness.mark()
                 try:
-                    sample = self._parse(raw)
+                    event = self._parse(raw)
                 except DerivativesParseError as exc:
                     _log.warning(
                         f"feed.{self._name}.parse_error", error=str(exc)
                     )
                     continue
                 except Exception as exc:
-                    # Per-venue parse exceptions (e.g. HyperliquidParseError)
-                    # subclass ValueError. Log + continue rather than tearing
-                    # down the session — a single malformed frame is not a
-                    # protocol break.
+                    # Per-venue parse exceptions subclass ValueError. Log +
+                    # continue rather than tearing down the session — a
+                    # single malformed frame is not a protocol break.
                     _log.warning(
                         f"feed.{self._name}.parse_error",
                         error=str(exc),
                         exc_type=type(exc).__name__,
                     )
                     continue
-                if sample is None:
+                if event is None:
                     continue
-                yield sample
+                yield event
         finally:
             try:
                 await conn.close()

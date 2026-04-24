@@ -116,6 +116,59 @@ class HyperliquidSettings(BaseModel):
     staleness_halt_ms: int = Field(gt=0, default=30_000)
 
 
+class BybitSettings(BaseModel):
+    """Bybit V5 public WS feed for BTC OI + liquidations (PR-B).
+
+    Two topics, two WS connections: `tickers.<symbol>` for OI snapshots
+    and `liquidation.<symbol>` for discrete liquidation prints. Each is
+    toggled independently — a mode can take OI-only or both — since
+    the liquidation stream is higher-cadence and a future mode may
+    want the OI confirmation without the liquidation deque feed.
+
+    Same disabled-by-default posture as `HyperliquidSettings`. Staleness
+    threshold applies to both streams; the liquidation stream is bursty
+    and may idle for minutes, so the default of 60s is double the OI
+    default to avoid spurious halts during quiet periods.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    ws_url: str = "wss://stream.bybit.com/v5/public/linear"
+    # Linear-perp symbol on Bybit V5 — `BTCUSDT`. The parser strips the
+    # USDT suffix for the emitted sample / event `symbol` field so
+    # downstream consumers see the same `BTC` key that Hyperliquid uses.
+    symbol: str = "BTCUSDT"
+    subscribe_oi: bool = True
+    subscribe_liquidations: bool = True
+    staleness_halt_ms: int = Field(gt=0, default=60_000)
+
+
+class BinanceBackfillSettings(BaseModel):
+    """Binance Public Data S3 backfill (PR-B).
+
+    Tool config, not a live feed: the backfill CLI
+    (`scripts/binance_public_data_backfill.py`) reads this block to
+    pick the dataset + symbol + output directory for each run. The
+    process itself does not consume this at boot; surfacing it in
+    `config/*.yaml` lets operators pin backfill params against the
+    same environment that the live feeds run in.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    base_url: str = "https://data.binance.vision"
+    # Binance public data tree: `data/futures/um/daily/<dataset>/<symbol>/...`.
+    # `metrics` carries historical OI + ratios; `liquidationSnapshot` is
+    # the daily liquidation-event dump. Operators pass either via CLI.
+    default_dataset: str = "metrics"
+    symbol: str = "BTCUSDT"
+    # Directory where the CLI lands extracted CSVs. DuckDB reads these
+    # natively (`read_csv_auto`), so the Parquet conversion step lives
+    # on the analytics side rather than in the backfill hot path.
+    output_dir: str = "data/binance_public"
+
+
 class FeedsSettings(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -126,6 +179,8 @@ class FeedsSettings(BaseModel):
     coinglass_heatmap: CoinglassHeatmapSettings = CoinglassHeatmapSettings()
     whale_alert: WhaleAlertSettings = WhaleAlertSettings()
     hyperliquid: HyperliquidSettings = HyperliquidSettings()
+    bybit: BybitSettings = BybitSettings()
+    binance_backfill: BinanceBackfillSettings = BinanceBackfillSettings()
 
 
 class RiskSettings(BaseModel):

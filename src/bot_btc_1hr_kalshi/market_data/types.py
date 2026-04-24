@@ -106,6 +106,35 @@ class OpenInterestSample:
 
 
 @dataclass(frozen=True, slots=True)
+class LiquidationEvent:
+    """A single liquidation print from a derivatives venue (PR-B).
+
+    Unlike `LiquidationHeatmapSample` (an aggregated snapshot), this is a
+    discrete event emitted every time the venue's liquidation engine
+    closes a position. Consumers accumulate these into a rolling deque
+    (PR-C: `FeatureEngine`) so floor/ceiling traps can read a live
+    "recent liquidation pressure" signal instead of a delayed heatmap.
+
+    `side` is the direction of the *order that got liquidated* — a
+    `long` liquidation means a long position was force-closed (aggressor
+    side of the closing fill was a sell). Venues report this as the
+    liquidated position's own direction, which is what traps want to
+    reason about ("how many longs just got wiped?").
+
+    `size_usd` is the USD notional, pre-computed at the parser layer
+    from quantity * price. Keeping it denormalized lets the rolling
+    deque sum without re-multiplying on every access.
+    """
+
+    ts_ns: int
+    symbol: str
+    side: Literal["long", "short"]
+    price_usd: float
+    size_usd: float
+    source: str = "bybit"
+
+
+@dataclass(frozen=True, slots=True)
 class LiquidationHeatmapSample:
     """Aggregated BTC liquidation-heatmap snapshot (Slice 11 P3 — shadow).
 
