@@ -163,3 +163,87 @@ def test_snapshot_after_invalidate_restores_validity() -> None:
     assert b.valid
     assert b.invalidation_reason is None
     assert b.best_bid == BookLevel(41, 55)
+
+
+def test_top_of_book_cache_matches_brute_force_under_mixed_deltas() -> None:
+    """The cached top-of-book must agree with `max(bids)` / `min(asks)` after
+    every mutation — promotions, in-place size changes, top-level depletion
+    forcing a rescan, and add-then-fill churn. This is the regression net for
+    the cache: if any branch in `apply()` forgets to update the pointer, the
+    final brute-force comparison surfaces it.
+
+    The book starts with a few resting levels then absorbs ~40 mixed deltas
+    spanning every code path (new tier inside the spread, partial fill of
+    the top, full clear of the top, refill of a cleared tier, lift through
+    multiple price points).
+    """
+    b = L2Book("BTC-1H")
+    b.apply(_snapshot(1, [(40, 100), (39, 50), (38, 25)], [(42, 80), (43, 30)]))
+
+    deltas: list[tuple[list[tuple[int, int]], list[tuple[int, int]]]] = [
+        ([(41, 20)], []),                # promote bid via new better tier
+        ([(41, 30)], []),                # add to current best (size grows)
+        ([(41, -50)], []),               # clear best → rescan to 40
+        ([(40, -100)], []),              # clear next best → rescan to 39
+        ([(39, -50)], []),               # clear → rescan to 38
+        ([(38, -25)], []),               # clear → no bids
+        ([(35, 10), (36, 20), (37, 30)], []),  # repopulate → best=37
+        ([], [(41, 5)]),                 # promote ask inside spread
+        ([], [(41, -5), (44, 60)]),      # clear top ask → rescan past 42 to itself
+        ([], [(42, -80)]),               # clear next ask → rescan to 43
+        ([(38, -1000)], []),             # delta below 0 — should pop, no error
+    ]
+    seq = 2
+    for bid_deltas, ask_deltas in deltas:
+        b.apply(_delta(seq, bid_deltas, ask_deltas))
+        seq += 1
+
+    # Cache must agree with a from-scratch recompute at every step's end.
+    expected_best_bid = (
+        BookLevel(max(b._bids), b._bids[max(b._bids)]) if b._bids else None  # type: ignore[attr-defined]
+    )
+    expected_best_ask = (
+        BookLevel(min(b._asks), b._asks[min(b._asks)]) if b._asks else None  # type: ignore[attr-defined]
+    )
+    assert b.best_bid == expected_best_bid
+    assert b.best_ask == expected_best_ask
+    if expected_best_bid is not None and expected_best_ask is not None:
+        assert b.spread_cents == expected_best_ask.price_cents - expected_best_bid.price_cents
+        assert b.mid_cents == (expected_best_bid.price_cents + expected_best_ask.price_cents) / 2.0
+
+
+def test_top_of_book_cache_consistent_after_each_intermediate_step() -> None:
+    """Stronger version: assert cache invariant after EVERY operation, not
+    just at the end. Catches a class of bugs where the cache drifts mid-
+    sequence but happens to be correct at the final state."""
+    b = L2Book("BTC-1H")
+    b.apply(_snapshot(1, [(40, 100), (39, 50)], [(42, 80), (43, 30)]))
+
+    def _check() -> None:
+        bids = b._bids  # type: ignore[attr-defined]
+        asks = b._asks  # type: ignore[attr-defined]
+        if bids:
+            assert b.best_bid == BookLevel(max(bids), bids[max(bids)])
+        else:
+            assert b.best_bid is None
+        if asks:
+            assert b.best_ask == BookLevel(min(asks), asks[min(asks)])
+        else:
+            assert b.best_ask is None
+
+    _check()
+    seq = 2
+    sequence: list[tuple[list[tuple[int, int]], list[tuple[int, int]]]] = [
+        ([(41, 20)], []),
+        ([(41, -10)], []),
+        ([(41, -10)], []),
+        ([(40, -100)], []),
+        ([], [(41, 5)]),
+        ([], [(41, -5)]),
+        ([], [(42, -80)]),
+        ([(45, 7)], [(46, 9)]),  # new bid above prior best, new ask
+    ]
+    for bd, ad in sequence:
+        b.apply(_delta(seq, bd, ad))
+        _check()
+        seq += 1
