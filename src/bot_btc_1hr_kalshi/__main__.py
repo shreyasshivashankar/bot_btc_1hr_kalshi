@@ -41,6 +41,13 @@ from bot_btc_1hr_kalshi.execution.broker.kalshi_signer import KalshiSigner
 from bot_btc_1hr_kalshi.execution.broker.paper import PaperBroker
 from bot_btc_1hr_kalshi.execution.broker.shadow import ShadowBroker
 from bot_btc_1hr_kalshi.execution.oms import OMS
+from bot_btc_1hr_kalshi.execution.ws import (
+    EXEC_CHANNELS,
+    ExecFillEvent,
+    ExecOrderUpdate,
+    ExecPositionSnapshot,
+    KalshiExecutionStream,
+)
 from bot_btc_1hr_kalshi.feedloop import (
     run_forever as run_feed_forever,
 )
@@ -279,6 +286,7 @@ async def serve(app: App, *, admin_token: str, host: str, port: int) -> None:
     ff_refresh_task: asyncio.Task[None] | None = None
     ff_client: httpx.AsyncClient | None = None
     derivatives_oracle_task: asyncio.Task[None] | None = None
+    exec_stream_task: asyncio.Task[None] | None = None
     rest_client: httpx.AsyncClient | None = None
 
     def _on_term() -> None:
@@ -295,6 +303,7 @@ async def serve(app: App, *, admin_token: str, host: str, port: int) -> None:
             calendar_task,
             ff_refresh_task,
             derivatives_oracle_task,
+            exec_stream_task,
         ):
             if t is not None:
                 t.cancel()
@@ -306,6 +315,7 @@ async def serve(app: App, *, admin_token: str, host: str, port: int) -> None:
     feed_task, drift_task, spot_task, rest_client = _start_feed_loop_if_enabled(app, log)
     calendar_task, ff_refresh_task, ff_client = _start_calendar_if_enabled(app, log)
     derivatives_oracle_task = _start_derivatives_oracle_if_enabled(app, log)
+    exec_stream_task = _start_kalshi_exec_stream_if_enabled(app, log)
 
     # Supervise the background tasks. If any dies unexpectedly (not via
     # cancellation), the container must restart — silently running without
@@ -356,6 +366,15 @@ async def serve(app: App, *, admin_token: str, host: str, port: int) -> None:
         derivatives_oracle_task.add_done_callback(
             _make_supervisor("derivatives-oracle", halt_on_death=False)
         )
+    # KalshiExecutionStream (#148): private-WS observation of fills /
+    # order updates / position snapshots. Initial wiring is telemetry-
+    # only — fills still land via the REST POST-body parse on submit().
+    # A dropped WS must NOT halt trading: the REST path is authoritative
+    # until the OMS pivot to fire-and-track ships in a follow-up.
+    if exec_stream_task is not None:
+        exec_stream_task.add_done_callback(
+            _make_supervisor("kalshi-exec-stream", halt_on_death=False)
+        )
 
     log.info("boot.serving", mode=app.settings.mode, host=host, port=port)
     try:
@@ -368,6 +387,7 @@ async def serve(app: App, *, admin_token: str, host: str, port: int) -> None:
             ("calendar-guard", calendar_task),
             ("forex-factory-refresh", ff_refresh_task),
             ("derivatives-oracle", derivatives_oracle_task),
+            ("kalshi-exec-stream", exec_stream_task),
         ):
             if task is None:
                 continue
@@ -639,6 +659,129 @@ def _start_derivatives_oracle_if_enabled(
         sources=sources,
         oi_feed_count=len(oi_feeds),
         liq_feed_count=len(liq_feeds),
+    )
+    return task
+
+
+def _start_kalshi_exec_stream_if_enabled(
+    app: App,
+    log: Any,
+) -> asyncio.Task[None] | None:
+    """Spin up the Kalshi private-channel WS observation stream (#148).
+
+    Subscribes to `fill` / `user_orders` / `market_positions` and routes
+    typed events to telemetry callbacks. This is the additive
+    observation layer — the OMS pivot to fire-and-track lands in a
+    follow-up once we've soaked the stream against real frames. Fills
+    and positions from this stream do NOT mutate Portfolio today: the
+    REST POST-body parse on `submit()` remains authoritative. Keeping
+    the wiring telemetry-only avoids dedupe/correlation bugs during
+    the paper soak.
+
+    Disabled when:
+      * mode not in `MODES_WITH_FEED_LOOP` — nothing to observe in dev/replay.
+      * Kalshi creds missing — private channels require the signed
+        handshake; an unsigned connect returns HTTP 401 and is noise.
+      * Kalshi WS URL not configured — same as the feed loop.
+    """
+    if app.settings.mode not in MODES_WITH_FEED_LOOP:
+        log.info("boot.exec_stream_disabled", mode=app.settings.mode)
+        return None
+
+    kalshi_ws = _resolve_feed_url(app.settings.feeds.kalshi)
+    if not kalshi_ws:
+        log.warning("boot.exec_stream_skipped", reason="kalshi.ws_url unset")
+        return None
+
+    api_key = os.getenv(KALSHI_API_KEY_ENV)
+    private_key_path = os.getenv(KALSHI_PRIVATE_KEY_PATH_ENV)
+    if not api_key or not private_key_path:
+        log.warning(
+            "boot.exec_stream_skipped",
+            reason="kalshi creds unset; private channels require signed handshake",
+        )
+        return None
+    try:
+        pem_bytes = Path(private_key_path).read_bytes()
+        signer = KalshiSigner(
+            api_key_id=api_key, private_key_pem=pem_bytes, clock=app.clock,
+        )
+    except OSError as exc:
+        log.error("boot.exec_stream_key_read_failed", path=private_key_path, error=str(exc))
+        return None
+    except ValueError as exc:
+        log.error("boot.exec_stream_signer_invalid", error=str(exc))
+        return None
+
+    ws_connect = ws_connect_kalshi_signed(signer)
+    # Staleness threshold here matches the Kalshi market-data WS (30s).
+    # The trading-API WS is legitimately quiet in paper — no orders flow
+    # through PaperBroker to Kalshi — so we don't halt trading on this
+    # tracker; it's logged via the stream dispatch path for diagnosis.
+    staleness = StalenessTracker(
+        name="kalshi_exec_ws",
+        clock=app.clock,
+        threshold_ms=app.settings.feeds.kalshi.staleness_halt_ms,
+    )
+
+    def _on_fill(ev: ExecFillEvent) -> None:
+        log.info(
+            "exec.ws.fill",
+            order_id=ev.order_id,
+            client_order_id=ev.client_order_id,
+            market_id=ev.market_id,
+            side=ev.side,
+            action=ev.action,
+            price_cents=ev.price_cents,
+            contracts=ev.contracts,
+            fees_usd=ev.fees_usd,
+            is_taker=ev.is_taker,
+            ts_ns=ev.ts_ns,
+        )
+
+    def _on_order(ev: ExecOrderUpdate) -> None:
+        log.info(
+            "exec.ws.order_update",
+            order_id=ev.order_id,
+            client_order_id=ev.client_order_id,
+            market_id=ev.market_id,
+            status=ev.status,
+            side=ev.side,
+            filled_contracts=ev.filled_contracts,
+            remaining_contracts=ev.remaining_contracts,
+            limit_price_cents=ev.limit_price_cents,
+            ts_ns=ev.ts_ns,
+        )
+
+    def _on_position(ev: ExecPositionSnapshot) -> None:
+        log.info(
+            "exec.ws.position",
+            market_id=ev.market_id,
+            side=ev.side,
+            contracts=ev.contracts,
+            avg_entry_price_cents=ev.avg_entry_price_cents,
+            realized_pnl_usd=ev.realized_pnl_usd,
+            fees_paid_usd=ev.fees_paid_usd,
+            ts_ns=ev.ts_ns,
+        )
+
+    stream = KalshiExecutionStream(
+        ws_url=kalshi_ws,
+        clock=app.clock,
+        ws_connect=ws_connect,
+        channels=EXEC_CHANNELS,
+        staleness=staleness,
+    )
+    stream.subscribe_fill(_on_fill)
+    stream.subscribe_order(_on_order)
+    stream.subscribe_position(_on_position)
+
+    task = asyncio.create_task(stream.run(), name="kalshi-exec-stream")
+    log.info(
+        "boot.exec_stream_enabled",
+        ws_url=kalshi_ws,
+        channels=list(EXEC_CHANNELS),
+        key_id=api_key[:8] + "…",
     )
     return task
 

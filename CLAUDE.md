@@ -83,6 +83,7 @@ make reconcile      # reconcile local OMS state vs Kalshi broker state
 - **Research skeletons (Slice 5 partial)** — `research/backtest.py` (Sharpe / maxDD / hit-rate math), `research/walkforward.py` (anchored walk-forward splits), `research/divergence.py` (decision-stream comparator), `research/replay.py` (tick orchestrator). The logic is tested; drivers are partial — see below.
 - **Tick archive** — writer/reader for hour-partitioned JSONL archive at `src/bot_btc_1hr_kalshi/archive/`; `make backtest` CLI exists in `research/backtest_cli.py`.
 - **Kalshi REST broker class** — `execution/broker/kalshi.py` implements the `Broker` protocol (signed orders/cancels/positions); tested via `httpx.MockTransport`.
+- **Kalshi private-WS observation layer (#148)** — `execution/ws/{types,parser,stream}.py` subscribes to `fill` / `user_orders` / `market_positions` via the signed handshake and dispatches typed events to callback subscribers. Wired as a non-critical supervisor target in `__main__` (dropped WS does not halt trading). Telemetry-only today: the REST POST-body fill path remains authoritative. The OMS pivot to fire-and-track using the WS as fill source of truth is a follow-up once paper-soak captures real private-channel frames.
 
 **Remaining work before `make live` can graduate past the paper/shadow gates:**
 
